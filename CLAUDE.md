@@ -506,6 +506,8 @@ MAX_JOBS=4 /root/.local/bin/uv pip install git+https://github.com/fla-org/flash-
 
 **`anyprecision_adamw` NaN with bf16** — This optimizer stores the second moment `v` in bf16; small gradients cause `v=0` in bf16, giving `update = m/eps` → NaN. Use `optimizer: adamw` (fp32 states) for training stability.
 
+**DCP checkpointer incompatible with QLoRA** — `ckpt_manager: dcp` cannot save QLoRA (PeftModel) state dicts. Use `ckpt_manager: bytecheckpoint` (requires ByteDance infra) or handle LoRA adapter saving separately via `peft` save methods. For local QLoRA training, set `save_steps: 0` and save LoRA adapters manually after training.
+
 **`repr_align_sub_sample_ratio: 0.25`** — Randomly samples 25% of token positions for cosine-sim alignment loss. Cuts alignment gradient memory ~4×. Required for 2× Blackwell at seq_len 2048 with ZeRO-3.
 
 ### Repr-Align memory reduction — subsampling knobs

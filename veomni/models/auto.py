@@ -79,9 +79,19 @@ def build_foundation_model(
 
     # ── QLoRA path: 4-bit NF4 + LoRA adapters (bypasses normal loading) ──
     if enable_qlorafy:
+        _qc = dict(qlorafy_config or {})
+        if _qc.pop("use_hf_native", False):
+            from .hf_mdm_qlora import build_hf_mdm_qlora
+
+            logger.info_rank0("Loading model via HF-native MDM QLoRA wrapper (Option A)")
+            return build_hf_mdm_qlora(
+                weights_path or config_path,
+                qlorafy_config=_qc,
+                device=_qc.get("device", "cuda:0"),
+            )
         from .qlorafy import QLoRAConfig, build_qlorafied_model
 
-        qcfg = QLoRAConfig(**(qlorafy_config or {}))
+        qcfg = QLoRAConfig(**_qc)
         logger.info_rank0(
             f"Loading model via QLoRA: NF4 base + LoRA (r={qcfg.r}, "
             f"targets={'/'.join(qcfg.target_modules or [])})"

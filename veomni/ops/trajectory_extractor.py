@@ -18,10 +18,26 @@ import os
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from veomni.models.auto import build_foundation_model
-from veomni.models.transformers.qwen2.generation_utils import mdm_generate
+
+
+def _set_bidirectional(model: nn.Module) -> list:
+    """Set is_causal=False on all attention layers and return originals for restore."""
+    originals = []
+    for mod in model.modules():
+        if hasattr(mod, "is_causal"):
+            originals.append((mod, mod.is_causal))
+            mod.is_causal = False
+    return originals
+
+
+def _restore_causal(originals: list) -> None:
+    """Restore original is_causal values."""
+    for mod, val in originals:
+        mod.is_causal = val
 
 
 @torch.no_grad()
@@ -49,7 +65,11 @@ def extract_trajectory(
     custom loop that records ``x`` at each step.
     """
     device = input_ids.device
-    pad_token_id = getattr(model.config, "pad_token_id", None)
+    # PeftModel wraps the base model — walk to config
+    _cfg = getattr(model, "config", None)
+    if _cfg is None:
+        _cfg = getattr(getattr(model, "base_model", None), "config", None)
+    pad_token_id = getattr(_cfg, "pad_token_id", None) if _cfg is not None else None
 
     x = F.pad(input_ids, (0, max_new_tokens), value=mask_token_id)
     gen_attention_mask = (
@@ -57,86 +77,93 @@ def extract_trajectory(
     )
     timesteps = torch.linspace(1, 1e-3, steps + 1, device=device)
 
+    # Force bidirectional attention for trajectory extraction
+    originals = _set_bidirectional(model)
+
     trajectory = []
-    for i in range(steps):
-        mask_index = x == mask_token_id
-        if not mask_index.any():
-            break
+    try:
+        for i in range(steps):
+            mask_index = x == mask_token_id
+            if not mask_index.any():
+                break
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs = model(
-                input_ids=x, attention_mask=gen_attention_mask, is_causal=False
-            )
-        logits = outputs.logits
-        logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                outputs = model(
+                    input_ids=x, attention_mask=gen_attention_mask, is_causal=False,
+                    use_cache=False,
+                )
+            logits = outputs.logits
+            logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
 
-        mask_logits = logits[mask_index]
-        t, s = timesteps[i], timesteps[i + 1]
+            mask_logits = logits[mask_index]
+            t, s = timesteps[i], timesteps[i + 1]
 
-        probs = torch.softmax(mask_logits.float(), dim=-1)
-        if temperature > 0:
-            probs = torch.softmax(mask_logits.float() / temperature, dim=-1)
+            probs = torch.softmax(mask_logits.float(), dim=-1)
+            if temperature > 0:
+                probs = torch.softmax(mask_logits.float() / temperature, dim=-1)
 
-        if top_k and top_k > 0:
-            top_k_val = min(top_k, probs.size(-1))
-            indices_to_remove = probs < torch.topk(probs, top_k_val)[0][
-                ..., -1, None
-            ]
-            probs = probs.masked_fill(indices_to_remove, 0.0)
-            probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+            if top_k and top_k > 0:
+                top_k_val = min(top_k, probs.size(-1))
+                indices_to_remove = probs < torch.topk(probs, top_k_val)[0][
+                    ..., -1, None
+                ]
+                probs = probs.masked_fill(indices_to_remove, 0.0)
+                probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-10)
 
-        if alg == "entropy":
-            log_probs = torch.log(probs.clamp(min=1e-10))
-            confidence = (probs * log_probs).sum(dim=-1)
-        else:
-            confidence = torch.gather(
-                probs, -1, probs.argmax(dim=-1, keepdim=True)
-            ).squeeze(-1)
+            if alg == "entropy":
+                log_probs = torch.log(probs.clamp(min=1e-10))
+                confidence = (probs * log_probs).sum(dim=-1)
+            else:
+                confidence = torch.gather(
+                    probs, -1, probs.argmax(dim=-1, keepdim=True)
+                ).squeeze(-1)
 
-        x0 = (
-            torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(
-                confidence.shape
-            )
-            if temperature > 0
-            else probs.argmax(dim=-1)
-        )
-
-        num_masked = mask_index.sum(dim=-1, keepdim=True)
-        gamma = 1 - s / t
-        num_to_unmask = (num_masked * gamma).long()
-
-        full_confidence = torch.full_like(
-            x, -float("inf"), device=device, dtype=confidence.dtype
-        )
-        full_confidence[mask_index] = confidence
-
-        if alg_temp and alg_temp > 0:
-            scaled_logits = full_confidence / alg_temp
-            uniform = torch.rand_like(scaled_logits).clamp_(
-                min=1e-20, max=1 - 1e-20
-            )
-            gumbel_noise = -torch.log(-torch.log(uniform))
-            scores = scaled_logits + gumbel_noise
-            _, unmask_indices = torch.topk(
-                scores, num_to_unmask.max(), dim=1
-            )
-        else:
-            _, unmask_indices = torch.topk(
-                full_confidence, num_to_unmask.max(), dim=1
+            x0 = (
+                torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(
+                    confidence.shape
+                )
+                if temperature > 0
+                else probs.argmax(dim=-1)
             )
 
-        rows = torch.arange(x.size(0), device=device).unsqueeze(1)
-        unmask_selection = torch.zeros_like(x, dtype=torch.bool)
-        unmask_selection[rows, unmask_indices] = True
-        unmask_selection = unmask_selection & (
-            torch.cumsum(unmask_selection.long(), dim=-1) <= num_to_unmask
-        )
+            num_masked = mask_index.sum(dim=-1, keepdim=True)
+            gamma = 1 - s / t
+            num_to_unmask = (num_masked * gamma).long()
 
-        proposals = torch.full_like(x, fill_value=mask_token_id)
-        proposals[mask_index] = x0
-        x[unmask_selection] = proposals[unmask_selection]
+            full_confidence = torch.full_like(
+                x, -float("inf"), device=device, dtype=confidence.dtype
+            )
+            full_confidence[mask_index] = confidence
 
-        trajectory.append(x[0].cpu().tolist())
+            if alg_temp and alg_temp > 0:
+                scaled_logits = full_confidence / alg_temp
+                uniform = torch.rand_like(scaled_logits).clamp_(
+                    min=1e-20, max=1 - 1e-20
+                )
+                gumbel_noise = -torch.log(-torch.log(uniform))
+                scores = scaled_logits + gumbel_noise
+                _, unmask_indices = torch.topk(
+                    scores, num_to_unmask.max(), dim=1
+                )
+            else:
+                _, unmask_indices = torch.topk(
+                    full_confidence, num_to_unmask.max(), dim=1
+                )
+
+            rows = torch.arange(x.size(0), device=device).unsqueeze(1)
+            unmask_selection = torch.zeros_like(x, dtype=torch.bool)
+            unmask_selection[rows, unmask_indices] = True
+            unmask_selection = unmask_selection & (
+                torch.cumsum(unmask_selection.long(), dim=-1) <= num_to_unmask
+            )
+
+            proposals = torch.full_like(x, fill_value=mask_token_id)
+            proposals[mask_index] = x0
+            x[unmask_selection] = proposals[unmask_selection]
+
+            trajectory.append(x[0].cpu().tolist())
+    finally:
+        _restore_causal(originals)
 
     return trajectory
 
@@ -150,21 +177,35 @@ def extract_and_save(
     steps: int = 64,
     max_examples: Optional[int] = None,
     batch_size: int = 1,
+    quantize: Optional[str] = None,
 ):
     """Run trajectory extraction over a dataset and save to disk.
 
     Output: one JSONL file, each line:
         {"idx": int, "trajectory": [[tok_id, ...], ...], "nfe": int}
+
+    Args:
+        quantize: If "4bit", load model via QLoRA (NF4 + LoRA adapters).
+                  Required for large models that don't fit in full bf16.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    model = build_foundation_model(
-        model_path,
-        weights_path=model_path,
-        torch_dtype="bfloat16",
-        attn_implementation="sdpa",
-    )
-    model.cuda().eval()
+    if quantize == "4bit":
+        from veomni.models.qlorafy import QLoRAConfig, build_qlorafied_model
+        model = build_qlorafied_model(
+            model_path,
+            config=QLoRAConfig(),
+        )
+        model.eval()
+        # QLoRA model is already on GPU via build_qlorafied_model
+    else:
+        model = build_foundation_model(
+            model_path,
+            weights_path=model_path,
+            torch_dtype="bfloat16",
+            attn_implementation="sdpa",
+        )
+        model.cuda().eval()
 
     from transformers import AutoTokenizer
 
@@ -225,6 +266,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--steps", type=int, default=64)
     parser.add_argument("--max_examples", type=int, default=None)
+    parser.add_argument("--quantize", type=str, default=None, choices=["4bit"],
+                        help="Quantization mode. '4bit' loads via QLoRA (NF4 + LoRA).")
     args = parser.parse_args()
 
     extract_and_save(
@@ -235,4 +278,5 @@ if __name__ == "__main__":
         max_new_tokens=args.max_new_tokens,
         steps=args.steps,
         max_examples=args.max_examples,
+        quantize=args.quantize,
     )

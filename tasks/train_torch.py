@@ -288,7 +288,7 @@ def main():
         trajectory_dataset = None
         trajectory_collator = None
         _traj_path = getattr(args.train, "trajectory_data_path", None)
-        if _traj_path and getattr(args.train, "repr_align_wt", 0) > 0:
+        if _traj_path:
             trajectory_dataset = TrajectoryDataset(_traj_path)
             logger.info_rank0(
                 f"Trajectory dataset loaded: {len(trajectory_dataset)} samples from {_traj_path}"

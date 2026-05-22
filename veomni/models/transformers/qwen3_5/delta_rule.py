@@ -51,7 +51,16 @@ def chunk_gated_delta_rule_pytorch(
         new_state: Tuple of (s, z) final recurrent states
     """
     B, H, L, D = q.shape
-    _, _, _, V = v.shape
+    _, Hv, _, V = v.shape
+
+    # Handle asymmetric GQA: expand q/k/beta/g to match value head count
+    if Hv != H:
+        n_rep = Hv // H
+        q = q[:, :, None, :, :].expand(B, H, n_rep, L, D).reshape(B, Hv, L, D)
+        k = k[:, :, None, :, :].expand(B, H, n_rep, L, D).reshape(B, Hv, L, D)
+        beta = beta[:, :, None, :, :].expand(B, H, n_rep, L, D).reshape(B, Hv, L, D)
+        g = g[:, :, None, :, :].expand(B, H, n_rep, L, D).reshape(B, Hv, L, D)
+        H = Hv
 
     # Pad sequence to multiple of chunk_size
     pad_len = (chunk_size - L % chunk_size) % chunk_size
@@ -153,7 +162,16 @@ def fused_recurrent_gated_delta_rule_pytorch(
         new_state: Tuple of (s, z) final recurrent states
     """
     B, H, L, D = q.shape
-    _, _, _, V = v.shape
+    _, Hv, _, V = v.shape
+
+    # Handle asymmetric GQA: expand q/k/beta/g to match value head count
+    if Hv != H:
+        n_rep = Hv // H
+        q = q[:, :, None, :, :].expand(B, H, n_rep, L, D).reshape(B, Hv, L, D)
+        k = k[:, :, None, :, :].expand(B, H, n_rep, L, D).reshape(B, Hv, L, D)
+        beta = beta[:, :, None, :, :].expand(B, H, n_rep, L, D).reshape(B, Hv, L, D)
+        g = g[:, :, None, :, :].expand(B, H, n_rep, L, D).reshape(B, Hv, L, D)
+        H = Hv
 
     if initial_state is None:
         s = torch.zeros(B, H, D, V, device=q.device, dtype=q.dtype)

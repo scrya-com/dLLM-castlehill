@@ -415,12 +415,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 g = torch.cat([kv_prod[2][:, :, :q_acc.shape[2]], g], dim=2)
                 beta = torch.cat([kv_prod[3][:, :, :q_acc.shape[2]], beta], dim=2)
 
-        # Apply delta rule
+        # Apply delta rule — ensure consistent bf16 dtype for FLA kernels
+        q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
+        beta, g = beta.bfloat16(), g.bfloat16()
+
         if self.use_fla:
             try:
                 from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_delta
                 output, new_state = fla_delta(q, k, v, beta, g)
-            except Exception:
+            except Exception as _fla_err:
+                print(f"[GatedDeltaNet] FLA kernel failed ({type(_fla_err).__name__}: {_fla_err}), falling back to pytorch")
                 output, new_state = chunk_gated_delta_rule_pytorch(q, k, v, beta, g)
         else:
             output, new_state = chunk_gated_delta_rule_pytorch(q, k, v, beta, g)
@@ -840,7 +844,8 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, MDMGenerationMixin, MultiBlockD
         if _r == 0:
             _cnt = getattr(self, "_fwd_cnt", 0) + 1
             self._fwd_cnt = _cnt
-            sys.stderr.write(f"[FWD#{_cnt}] labels={labels.shape if labels is not None else None} mask_ratio={mask_ratio.shape if mask_ratio is not None else None} liger={is_liger_kernel_available()}\n")
+            _mr_shape = mask_ratio.shape if isinstance(mask_ratio, torch.Tensor) else mask_ratio
+            sys.stderr.write(f"[FWD#{_cnt}] labels={labels.shape if labels is not None else None} mask_ratio={_mr_shape} liger={is_liger_kernel_available()}\n")
             sys.stderr.flush()
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1045,10 +1050,6 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, MDMGenerationMixin, MultiBlockD
             result.repr_align_teacher_states = None
 
         return result
-
-
-if is_liger_kernel_available():
-    Qwen3_5RMSNorm = LigerFusedLinearCrossEntropyLoss  # placeholder — liger doesn't have RMSNorm replacement for this variant
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3_5ForCausalLM):
