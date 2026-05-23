@@ -18,21 +18,21 @@ from veomni.models.transformers.qwen2.multi_block_generation import MultiBlockDe
 
 
 class FwdCounter:
-    """Counts forward passes of the underlying model via a hook-free wrapper."""
+    """Counts forward passes via an nn.Module hook (fires through PEFT wrapping)."""
     def __init__(self, model):
         self.model = model
         self.n = 0
-        self._orig = model.forward
+        self._h = None
 
     def __enter__(self):
-        def counting_forward(*a, **k):
+        def hook(mod, inp, out):
             self.n += 1
-            return self._orig(*a, **k)
-        self.model.forward = counting_forward
+        self._h = self.model.register_forward_hook(hook)
         return self
 
     def __exit__(self, *exc):
-        self.model.forward = self._orig
+        if self._h is not None:
+            self._h.remove()
 
 
 def main():

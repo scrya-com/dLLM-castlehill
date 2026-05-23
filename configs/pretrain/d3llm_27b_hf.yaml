@@ -20,9 +20,9 @@ data:
 
 train:
   output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_hf
-  save_hf_weights: false
+  save_hf_weights: true
   save_epochs: 0
-  save_steps: 0
+  save_steps: 10
   auto_resume: false
   num_train_epochs: 1
   max_steps: 10
