@@ -26,6 +26,8 @@ def _repr_align_loss(z1, z2, layer_weights=None, contrastive=False, contrastive_
     z1, z2: [N_tokens, N_layers, D]
     layer_weights: [N_layers] summing to 1, or None (uniform)
     """
+    if z1.size(0) == 0:
+        return z1.sum() * 0.0  # empty batch — return zero with grad
     z1n = F.normalize(z1, p=2, dim=-1)
     z2n = F.normalize(z2, p=2, dim=-1)
     if contrastive:
@@ -170,7 +172,7 @@ class MDMQLoRAWrapper(nn.Module):
                     loss = loss + repr_align_wt * align_loss
                 else:
                     loss = repr_align_wt * align_loss
-                comps["repr_align"] = float(align_loss)
+                comps["repr_align"] = align_loss.detach().item()
 
         return SimpleNamespace(loss=loss, logits=logits, loss_components=comps)
 
