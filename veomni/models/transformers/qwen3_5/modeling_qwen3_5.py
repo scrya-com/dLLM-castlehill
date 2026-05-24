@@ -82,9 +82,32 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def repr_align_loss_fn(z1, z2, layer_weights=None):
+def repr_align_loss_fn(z1, z2, layer_weights=None, contrastive=False, contrastive_temp=0.07):
+    """Repr-align loss: cosine (default) or InfoNCE contrastive.
+
+    z1, z2: [N_tokens, D] or [N_tokens, N_layers, D]
+    layer_weights: [N_layers] summing to 1 (exponential depth weighting)
+    contrastive: use InfoNCE with sequence-position negatives
+    """
     z1_norm = nn.functional.normalize(z1, p=2, dim=-1)
     z2_norm = nn.functional.normalize(z2, p=2, dim=-1)
+
+    if contrastive:
+        # Pool over layer dim [N, L, D] → [N, D] using layer_weights, then InfoNCE
+        if z1_norm.dim() == 3:
+            if layer_weights is not None:
+                z1_norm = (z1_norm * layer_weights.view(1, -1, 1)).sum(dim=1)
+                z2_norm = (z2_norm * layer_weights.view(1, -1, 1)).sum(dim=1)
+            else:
+                z1_norm = z1_norm.mean(dim=1)
+                z2_norm = z2_norm.mean(dim=1)
+            z1_norm = nn.functional.normalize(z1_norm, p=2, dim=-1)
+            z2_norm = nn.functional.normalize(z2_norm, p=2, dim=-1)
+        # [N, N] similarity matrix; diagonal = positives
+        logits = (z1_norm @ z2_norm.T) / contrastive_temp
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return nn.functional.cross_entropy(logits, labels)
+
     cosine_sim = (z1_norm * z2_norm).sum(dim=-1)
     if layer_weights is not None and cosine_sim.dim() == 2:
         # cosine_sim: [N_tokens, N_layers]; layer_weights: [N_layers] summing to 1
@@ -776,6 +799,8 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, MDMGenerationMixin, MultiBlockD
         self.repr_align_sub_sample_ratio: float = 1.0
         self.repr_align_num_sample_layers: Optional[int] = None
         self.repr_align_layer_exp: float = 0.0
+        self.repr_align_contrastive: bool = False
+        self.repr_align_contrastive_temp: float = 0.07
 
         self.post_init()
 
@@ -970,7 +995,12 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, MDMGenerationMixin, MultiBlockD
                     student_stacked = student_stacked[token_idx]
                     teacher_stacked = teacher_stacked[token_idx]
 
-                repr_align_loss = repr_align_loss_fn(student_stacked, teacher_stacked, layer_weights=layer_weights)
+                repr_align_loss = repr_align_loss_fn(
+                    student_stacked, teacher_stacked,
+                    layer_weights=layer_weights,
+                    contrastive=getattr(self, 'repr_align_contrastive', False),
+                    contrastive_temp=getattr(self, 'repr_align_contrastive_temp', 0.07),
+                )
 
         # Logits / loss computation
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep

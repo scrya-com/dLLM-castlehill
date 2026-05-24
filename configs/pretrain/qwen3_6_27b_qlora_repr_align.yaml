@@ -49,6 +49,12 @@ train:
   repr_align_wt: 10.0
   repr_align_wt_final: 1.0
   repr_align_layer_exp: 2.0
+  repr_align_contrastive: true
+  repr_align_contrastive_temp: 0.07
+  llrd_decay: 0.85
+  mdm_min_mask_ratio: 0.002
+  mdm_max_mask_ratio: 0.998
+  mdm_curriculum_steps: 200
   anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3.6-27b-smoke1000-1024
   align_layers: "16,32,48,64"
   repr_align_sub_sample_ratio: 0.25
@@ -64,4 +70,4 @@ train:
 
   use_wandb: true
   wandb_project: open-dllm-27b
-  wandb_name: repr-align-27b-qlora-lam10-layerexp2-cosine
+  wandb_name: repr-align-27b-qlora-contrastive-llrd-curriculum

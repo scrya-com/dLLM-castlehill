@@ -62,6 +62,8 @@ def build_foundation_model(
     repr_align_sub_sample_ratio: float = 1.0,
     repr_align_num_sample_layers: Optional[int] = None,
     repr_align_layer_exp: float = 0.0,
+    repr_align_contrastive: bool = False,
+    repr_align_contrastive_temp: float = 0.07,
     enable_nvfp4_qat: bool = False,
     enable_qlorafy: bool = False,
     qlorafy_config: Optional[Dict] = None,
@@ -93,6 +95,8 @@ def build_foundation_model(
                 anchor_cache_dir=anchor_cache_dir,
                 repr_align_sub_sample_ratio=repr_align_sub_sample_ratio,
                 repr_align_layer_exp=repr_align_layer_exp,
+                repr_align_contrastive=repr_align_contrastive,
+                repr_align_contrastive_temp=repr_align_contrastive_temp,
             )
         from .qlorafy import QLoRAConfig, build_qlorafied_model
 
@@ -186,6 +190,8 @@ def build_foundation_model(
         repr_align_sub_sample_ratio=repr_align_sub_sample_ratio,
         repr_align_num_sample_layers=repr_align_num_sample_layers,
         repr_align_layer_exp=repr_align_layer_exp,
+        repr_align_contrastive=repr_align_contrastive,
+        repr_align_contrastive_temp=repr_align_contrastive_temp,
     )
 
     if use_tropical:

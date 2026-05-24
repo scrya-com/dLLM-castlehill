@@ -54,9 +54,22 @@ _CHECKPOINT_FOR_DOC = "Qwen/Qwen3-8B"
 _CONFIG_FOR_DOC = "Qwen3Config"
 
 
-def repr_align_loss_fn(z1, z2, layer_weights=None):
+def repr_align_loss_fn(z1, z2, layer_weights=None, contrastive=False, contrastive_temp=0.07):
     z1_norm = nn.functional.normalize(z1, p=2, dim=-1)
     z2_norm = nn.functional.normalize(z2, p=2, dim=-1)
+    if contrastive:
+        if z1_norm.dim() == 3:
+            if layer_weights is not None:
+                z1_norm = (z1_norm * layer_weights.view(1, -1, 1)).sum(dim=1)
+                z2_norm = (z2_norm * layer_weights.view(1, -1, 1)).sum(dim=1)
+            else:
+                z1_norm = z1_norm.mean(dim=1)
+                z2_norm = z2_norm.mean(dim=1)
+            z1_norm = nn.functional.normalize(z1_norm, p=2, dim=-1)
+            z2_norm = nn.functional.normalize(z2_norm, p=2, dim=-1)
+        logits = (z1_norm @ z2_norm.T) / contrastive_temp
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return nn.functional.cross_entropy(logits, labels)
     cosine_sim = (z1_norm * z2_norm).sum(dim=-1)
     if layer_weights is not None and cosine_sim.dim() == 2:
         return ((1.0 - cosine_sim) * layer_weights.unsqueeze(0)).sum(dim=-1).mean()
@@ -843,6 +856,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, MDMGenerationMixin, MultiBlockDecod
         self.repr_align_sub_sample_ratio: float = 1.0
         self.repr_align_num_sample_layers: Optional[int] = None
         self.repr_align_layer_exp: float = 0.0
+        self.repr_align_contrastive: bool = False
+        self.repr_align_contrastive_temp: float = 0.07
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1060,7 +1075,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, MDMGenerationMixin, MultiBlockDecod
                     student_stacked = student_stacked[token_idx]
                     teacher_stacked = teacher_stacked[token_idx]
 
-                repr_align_loss = repr_align_loss_fn(student_stacked, teacher_stacked, layer_weights=layer_weights)
+                repr_align_loss = repr_align_loss_fn(
+                    student_stacked, teacher_stacked,
+                    layer_weights=layer_weights,
+                    contrastive=getattr(self, 'repr_align_contrastive', False),
+                    contrastive_temp=getattr(self, 'repr_align_contrastive_temp', 0.07),
+                )
 
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep

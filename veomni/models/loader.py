@@ -181,6 +181,14 @@ class CustomizedModelingLoader(BaseModelLoader):
                 else:
                     setattr(model, "repr_align_layer_exp", layer_exp)
 
+            # Contrastive (InfoNCE) mode for repr_align
+            contrastive = kwargs.get("repr_align_contrastive")
+            if contrastive is not None:
+                setattr(model, "repr_align_contrastive", bool(contrastive))
+            contrastive_temp = kwargs.get("repr_align_contrastive_temp")
+            if contrastive_temp is not None:
+                setattr(model, "repr_align_contrastive_temp", float(contrastive_temp))
+
             anchor_cache_dir = kwargs.get("anchor_cache_dir")
             if anchor_cache_dir:
                 # Precomputed-anchor path: skip the deepcopy entirely, save

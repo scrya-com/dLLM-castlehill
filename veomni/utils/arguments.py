@@ -326,6 +326,30 @@ class TrainingArguments:
         default=0.0,
         metadata={"help": "Exponential layer weighting exponent for repr_align cosine loss. 0=uniform average, 2=last layer ~7x first. Applied across align_layers depth ordering."},
     )
+    repr_align_contrastive: bool = field(
+        default=False,
+        metadata={"help": "Use InfoNCE contrastive loss instead of cosine for repr_align. Uses sequence positions as negatives (τ=repr_align_contrastive_temp). Stronger gradient signal than cosine."},
+    )
+    repr_align_contrastive_temp: float = field(
+        default=0.07,
+        metadata={"help": "Temperature τ for InfoNCE contrastive repr_align loss. Lower = sharper distribution. 0.07 is SimCLR default."},
+    )
+    llrd_decay: float = field(
+        default=0.0,
+        metadata={"help": "Layer-wise LR decay for LoRA adapters. lr * decay^(layer_depth_fraction). 0=disabled (flat LR). 0.85 is typical for NLP fine-tuning."},
+    )
+    mdm_min_mask_ratio: float = field(
+        default=0.002,
+        metadata={"help": "Lower bound for MDM random mask ratio at start of curriculum. Widens to full range over training."},
+    )
+    mdm_max_mask_ratio: float = field(
+        default=0.998,
+        metadata={"help": "Upper bound for MDM random mask ratio at start of curriculum. Narrows to full range over training."},
+    )
+    mdm_curriculum_steps: int = field(
+        default=0,
+        metadata={"help": "Steps over which to widen the MDM mask ratio range from [mdm_min+margin, mdm_max-margin] to full range. 0=no curriculum (fixed bounds)."},
+    )
     # ------------------------------------------------------------------
     # Replay buffer for Repr-Align — stores past batches and replays
     # alignment loss on old data to prevent catastrophic forgetting.

@@ -30,10 +30,10 @@ from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
-from veomni.optim import build_lr_scheduler, build_optimizer
+from veomni.optim import build_lr_scheduler, build_optimizer, build_llrd_param_groups
 from veomni.ops.replay_buffer import ReprAlignReplayBuffer
 from veomni.ops.trajectory_dataset import TrajectoryDataset
-from veomni.data.data_collator import DataCollatorWithTrajectoryMasking
+from veomni.data.data_collator import DataCollatorWithTrajectoryMasking, DataCollatorWithPositionIDsMasking
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.dist_utils import all_reduce
@@ -299,6 +299,7 @@ def main():
 
         trajectory_dataset = None
         trajectory_collator = None
+        mdm_collator = None
         _traj_path = getattr(args.train, "trajectory_data_path", None)
         if _traj_path:
             trajectory_dataset = TrajectoryDataset(_traj_path)
@@ -319,6 +320,16 @@ def main():
         else:
             _enable_masking = args.train.enable_masking
             _custom_collate = None
+            # Create MDM collator explicitly so we can apply mask-ratio curriculum.
+            mdm_collator = None
+            if _enable_masking and tokenizer.mask_token_id is not None:
+                mdm_collator = DataCollatorWithPositionIDsMasking(
+                    mask_token_id=tokenizer.mask_token_id,
+                    min_mask_ratio=getattr(args.train, "mdm_min_mask_ratio", 0.002),
+                    max_mask_ratio=getattr(args.train, "mdm_max_mask_ratio", 0.998),
+                )
+                _custom_collate = mdm_collator
+                _enable_masking = False  # build_dataloader won't create a second collator
 
         train_dataloader = build_dataloader(
             dataset=train_dataset,
@@ -409,6 +420,8 @@ def main():
         repr_align_sub_sample_ratio=getattr(args.train, "repr_align_sub_sample_ratio", 1.0),
         repr_align_num_sample_layers=getattr(args.train, "repr_align_num_sample_layers", None),
         repr_align_layer_exp=getattr(args.train, "repr_align_layer_exp", 0.0),
+        repr_align_contrastive=getattr(args.train, "repr_align_contrastive", False),
+        repr_align_contrastive_temp=getattr(args.train, "repr_align_contrastive_temp", 0.07),
         enable_nvfp4_qat=getattr(args.model, "enable_nvfp4_qat", False),
         enable_qlorafy=getattr(args.model, "enable_qlorafy", False),
         qlorafy_config=getattr(args.model, "qlorafy_config", None),
@@ -500,12 +513,19 @@ def main():
     )
 
 
+    _llrd_decay = getattr(args.train, "llrd_decay", 0.0)
+    _llrd_param_groups = None
+    if _llrd_decay > 0:
+        _llrd_param_groups = build_llrd_param_groups(
+            model, base_lr=args.train.lr, decay=_llrd_decay, weight_decay=args.train.weight_decay
+        )
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
         weight_decay=args.train.weight_decay,
         fused=True,
         optimizer_type=args.train.optimizer,
+        param_groups=_llrd_param_groups,
     )
     if get_optimizer_pre_hook is not None:
         optimizer_pre_hook = get_optimizer_pre_hook(model, model_config, args.train.data_parallel_mode)
@@ -658,6 +678,19 @@ def main():
                 if _traj_prog_blocks:
                     ep = min(epoch, len(_traj_prog_blocks) - 1)
                     trajectory_collator.current_block_size = _traj_prog_blocks[ep]
+
+            # MDM mask-ratio curriculum: widen [min, max] bounds over mdm_curriculum_steps
+            if mdm_collator is not None:
+                _mdm_cur_steps = getattr(args.train, "mdm_curriculum_steps", 0)
+                if _mdm_cur_steps > 0:
+                    _cur_prog = min(global_step / _mdm_cur_steps, 1.0)
+                    _lo_start = getattr(args.train, "mdm_min_mask_ratio", 0.002)
+                    _hi_start = getattr(args.train, "mdm_max_mask_ratio", 0.998)
+                    # Interpolate: narrow at step 0, full [0.002, 0.998] at step mdm_curriculum_steps
+                    _lo_narrow = _lo_start + (0.15 - _lo_start) * (1 - _cur_prog)
+                    _hi_narrow = _hi_start - (0.998 - 0.85) * (1 - _cur_prog)
+                    mdm_collator.min_mask_ratio = max(_lo_start, min(_lo_narrow, 0.15))
+                    mdm_collator.max_mask_ratio = min(_hi_start, max(_hi_narrow, 0.85))
 
             step_loss_components: Dict[str, float] = {}
 

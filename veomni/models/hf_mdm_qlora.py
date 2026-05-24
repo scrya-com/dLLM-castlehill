@@ -20,6 +20,33 @@ import torch.nn.functional as F
 from ..data.constants import IGNORE_INDEX
 
 
+def _repr_align_loss(z1, z2, layer_weights=None, contrastive=False, contrastive_temp=0.07):
+    """Cosine alignment or InfoNCE contrastive loss for repr-align.
+
+    z1, z2: [N_tokens, N_layers, D]
+    layer_weights: [N_layers] summing to 1, or None (uniform)
+    """
+    z1n = F.normalize(z1, p=2, dim=-1)
+    z2n = F.normalize(z2, p=2, dim=-1)
+    if contrastive:
+        # Pool over layers → [N, D], then InfoNCE with sequence-position negatives
+        if layer_weights is not None:
+            z1n = (z1n * layer_weights.view(1, -1, 1)).sum(dim=1)
+            z2n = (z2n * layer_weights.view(1, -1, 1)).sum(dim=1)
+        else:
+            z1n = z1n.mean(dim=1)
+            z2n = z2n.mean(dim=1)
+        z1n = F.normalize(z1n, p=2, dim=-1)
+        z2n = F.normalize(z2n, p=2, dim=-1)
+        logits = (z1n @ z2n.T) / contrastive_temp
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return F.cross_entropy(logits, labels)
+    cosine_sim = (z1n * z2n).sum(dim=-1)  # [N, L]
+    if layer_weights is not None:
+        return ((1.0 - cosine_sim) * layer_weights.unsqueeze(0)).sum(dim=-1).mean()
+    return 1.0 - cosine_sim.mean()
+
+
 def _mdm_loss(logits, labels):
     # Match veomni MDM loss: shift by one, per-token CE on masked positions
     # (labels != IGNORE_INDEX), plus a confidence-weighted path term.
@@ -47,6 +74,8 @@ class MDMQLoRAWrapper(nn.Module):
         self.align_layers = None
         self.repr_align_sub_sample_ratio = 1.0
         self.repr_align_layer_exp = 0.0
+        self.repr_align_contrastive = False
+        self.repr_align_contrastive_temp = 0.07
 
     def __getattr__(self, name):
         try:
@@ -95,38 +124,48 @@ class MDMQLoRAWrapper(nn.Module):
                 loss_mask = (labels_2d[:, 1:].reshape(-1) != IGNORE_INDEX)  # [L-1]
 
             # Exponential layer weights: later layers weighted more heavily.
-            # layer_exp=0 → uniform; layer_exp=2 → last layer ~7× first.
             _n_layers = len(self.align_layers)
-            if self.repr_align_layer_exp != 0.0 and _n_layers > 0:
-                _idx = torch.arange(_n_layers, dtype=torch.float32, device=input_ids.device)
-                _raw = torch.exp(self.repr_align_layer_exp * _idx / _n_layers)
-                _layer_w = (_raw / _raw.sum()).tolist()
+            _layer_exp = self.repr_align_layer_exp
+            if _layer_exp != 0.0 and _n_layers > 0:
+                _raw = torch.exp(_layer_exp * torch.arange(_n_layers, dtype=torch.float32, device=input_ids.device) / _n_layers)
+                _layer_weights_t = _raw / _raw.sum()
             else:
-                _layer_w = [1.0 / _n_layers] * _n_layers if _n_layers > 0 else []
+                _layer_weights_t = None
 
-            align_loss = 0.0
-            n_aligned = 0
-            for i, layer_idx in enumerate(self.align_layers):
-                # Shift by 1 to match the MDM label shift (h[i] predicts token i+1).
-                s_hid = student_hiddens[layer_idx][:, :-1, :].float().squeeze(0)  # [L-1, D]
-                t_hid = teacher_hiddens[layer_idx][:, :-1, :].float().squeeze(0)  # [L-1, D]
-                # Apply loss_mask: only align on labeled (MDM-masked) positions.
+            # Collect per-layer hiddens with a SHARED token permutation so stacking works.
+            # (Shared perm is required for contrastive mode; harmless for cosine mode.)
+            _s_layers, _t_layers = [], []
+            _shared_perm = None
+            for layer_idx in self.align_layers:
+                s = student_hiddens[layer_idx][:, :-1, :].float().squeeze(0)  # [L-1, D]
+                t = teacher_hiddens[layer_idx][:, :-1, :].float().squeeze(0)
                 if loss_mask is not None and loss_mask.any():
-                    s_hid = s_hid[loss_mask]
-                    t_hid = t_hid[loss_mask]
-                # Token sub-sampling over the valid positions.
+                    s = s[loss_mask]
+                    t = t[loss_mask]
                 if self.repr_align_sub_sample_ratio < 1.0:
-                    n = s_hid.size(0)
-                    n_sample = max(1, int(n * self.repr_align_sub_sample_ratio))
-                    perm = torch.randperm(n, device=s_hid.device)[:n_sample]
-                    s_hid = s_hid[perm]
-                    t_hid = t_hid[perm]
-                sim = F.cosine_similarity(s_hid, t_hid, dim=-1)
-                align_loss = align_loss + _layer_w[i] * (1 - sim).mean()
-                n_aligned += 1
+                    if _shared_perm is None:
+                        n_sample = max(1, int(s.size(0) * self.repr_align_sub_sample_ratio))
+                        _shared_perm = torch.randperm(s.size(0), device=s.device)[:n_sample]
+                    s = s[_shared_perm]
+                    t = t[_shared_perm]
+                _s_layers.append(s)
+                _t_layers.append(t)
+
+            n_aligned = len(_s_layers)
+            align_loss = torch.tensor(0.0, device=input_ids.device)
+            if n_aligned > 0:
+                # Stack to [N_tokens, N_layers, D] and call unified loss function
+                s_stacked = torch.stack(_s_layers, dim=1)
+                t_stacked = torch.stack(_t_layers, dim=1)
+                align_loss = _repr_align_loss(
+                    s_stacked, t_stacked,
+                    layer_weights=_layer_weights_t,
+                    contrastive=self.repr_align_contrastive,
+                    contrastive_temp=self.repr_align_contrastive_temp,
+                )
 
             if n_aligned > 0:
-                # align_loss is already a weighted average (weights sum to 1), no division needed
+                # align_loss is already normalized (cosine: weighted avg; contrastive: CE)
                 if loss is not None:
                     loss = loss + repr_align_wt * align_loss
                 else:
@@ -138,7 +177,8 @@ class MDMQLoRAWrapper(nn.Module):
 
 def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
                         align_layers=None, anchor_cache_dir=None,
-                        repr_align_sub_sample_ratio=1.0, repr_align_layer_exp=0.0, **kw):
+                        repr_align_sub_sample_ratio=1.0, repr_align_layer_exp=0.0,
+                        repr_align_contrastive=False, repr_align_contrastive_temp=0.07, **kw):
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 
@@ -172,6 +212,8 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
         wrapper.align_layers = sorted({int(x) for x in align_layers.split(",") if x.strip()})
     wrapper.repr_align_sub_sample_ratio = repr_align_sub_sample_ratio
     wrapper.repr_align_layer_exp = repr_align_layer_exp
+    wrapper.repr_align_contrastive = repr_align_contrastive
+    wrapper.repr_align_contrastive_temp = repr_align_contrastive_temp
     if anchor_cache_dir:
         from .cached_teacher import CachedTeacher
         # Qwen3_5Config stores hidden_size inside text_config
