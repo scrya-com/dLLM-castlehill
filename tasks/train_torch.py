@@ -591,6 +591,12 @@ def main():
 
     start_epoch, start_step, global_step = 0, 0, 0
     save_checkpoint_path = None
+    # MDM history buffer for mask-ratio × loss scatter visualization
+    try:
+        from veomni.models.repr_align_vis import MDMHistory
+        _mdm_history = MDMHistory(maxlen=400)
+    except ImportError:
+        _mdm_history = None
     environ_meter = helper.EnvironMeter(
         config=model_config,
         global_batch_size=args.train.global_batch_size,
@@ -742,6 +748,18 @@ def main():
                     loss_components = getattr(outputs, "loss_components", {})
                     for name, value in loss_components.items():
                         step_loss_components[name] = step_loss_components.get(name, 0.0) + value / len(micro_batches)
+
+                    # Track mask-ratio × mdm-loss for the diffusion scatter plot
+                    if _mdm_history is not None and "mdm" in loss_components:
+                        _mr = micro_batch.get("mask_ratio")
+                        if _mr is not None:
+                            _mdm_history.push(float(_mr.mean()), loss_components["mdm"])
+                    # Attach logits/labels to _vis_data for reconstruction panel
+                    if _do_vis and getattr(model, "_vis_data", None) is not None:
+                        model._vis_data["logits"] = outputs.logits[:1].detach().cpu()
+                        model._vis_data["labels"] = micro_batch.get("labels", micro_batch.get("input_ids"))[:1].detach().cpu()
+                        _mr = micro_batch.get("mask_ratio")
+                        model._vis_data["mask_ratio"] = float(_mr.mean()) if _mr is not None else 0.5
 
                     # Repr-Align replay buffer: push current batch, sample past batch,
                     # re-run student alignment on old data to prevent forgetting.
@@ -968,21 +986,34 @@ def main():
 
                     if args.model.enable_qlorafy and global_step % 100 == 0:
                         try:
+                            import time as _time
                             model.eval()
                             gen_prompts = ["The meaning of life is", "def fibonacci(n):"]
                             gen_samples = []
+                            ar_toks_total, ar_time_total = 0, 0.0
+                            diff_toks_total, diff_time_total = 0, 0.0
                             for gp in gen_prompts:
                                 enc = tokenizer(gp, return_tensors="pt")
                                 pids = enc.input_ids.to(model.device if hasattr(model, 'device') else next(model.parameters()).device)
                                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                    # AR generation
+                                    # AR generation — timed
+                                    _t0 = _time.perf_counter()
                                     ar_out = model.generate(pids, max_new_tokens=64, do_sample=True, temperature=0.7, top_k=200)
+                                    torch.cuda.synchronize()
+                                    ar_time_total += _time.perf_counter() - _t0
+                                    ar_new_toks = ar_out.shape[1] - pids.shape[1]
+                                    ar_toks_total += ar_new_toks
                                     ar_text = tokenizer.decode(ar_out[0][pids.shape[1]:], skip_special_tokens=True)
 
-                                    # Diffusion generation (masked, bidirectional)
+                                    # Diffusion generation — timed
                                     from veomni.models.transformers.qwen2.generation_utils import mdm_generate
                                     if tokenizer.mask_token_id is not None:
+                                        _t0 = _time.perf_counter()
                                         diff_ids = mdm_generate(model, pids, mask_token_id=tokenizer.mask_token_id, max_new_tokens=64, steps=16, temperature=0.7)
+                                        torch.cuda.synchronize()
+                                        diff_time_total += _time.perf_counter() - _t0
+                                        diff_new_toks = diff_ids.shape[1] - pids.shape[1]
+                                        diff_toks_total += diff_new_toks
                                         diff_text = tokenizer.decode(diff_ids[0][pids.shape[1]:], skip_special_tokens=True)
                                     else:
                                         diff_text = "(no mask token)"
@@ -992,19 +1023,22 @@ def main():
                                     f"<b>Diffusion (16-step):</b> {diff_text}"
                                 )
                             train_metrics["generation/sample"] = wandb.Html("<hr>".join(gen_samples))
+                            if ar_time_total > 0:
+                                train_metrics["inference/ar_tok_per_sec"] = ar_toks_total / ar_time_total
+                            if diff_time_total > 0:
+                                train_metrics["inference/diff_tok_per_sec"] = diff_toks_total / diff_time_total
                             model.train()
                         except Exception as e:
                             logger.warning_rank0(f"[step {global_step}] Generation probe failed: {e}")
 
-                    # Repr-align visualization (data captured in forward above)
+                    # Repr-align + diffusion visualization (data captured in forward above)
                     if _do_vis and getattr(model, "_vis_data", None) is not None:
                         try:
-                            from veomni.models.repr_align_vis import make_repr_align_vis
+                            from veomni.models.repr_align_vis import make_all_vis
                             import matplotlib.pyplot as plt
-                            fig = make_repr_align_vis(model, global_step)
-                            if fig is not None:
-                                train_metrics["repr_align/vis"] = wandb.Image(fig)
-                                plt.close(fig)
+                            for _vkey, _vfig in make_all_vis(model, global_step, _mdm_history).items():
+                                train_metrics[_vkey] = wandb.Image(_vfig)
+                                plt.close(_vfig)
                         except Exception as e:
                             logger.warning_rank0(f"[step {global_step}] repr_align vis failed: {e}")
 
