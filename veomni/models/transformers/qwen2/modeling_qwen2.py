@@ -74,10 +74,12 @@ class RepresentationAlignmentLoss(nn.Module):
         cosine_sim = (z1_norm * z2_norm).sum(dim=-1)  # (..., 1)
         return 1.0 - cosine_sim.mean()
 
-def repr_align_loss_fn(z1, z2):
+def repr_align_loss_fn(z1, z2, layer_weights=None):
     z1_norm = nn.functional.normalize(z1, p=2, dim=-1)
     z2_norm = nn.functional.normalize(z2, p=2, dim=-1)
-    cosine_sim = (z1_norm * z2_norm).sum(dim=-1)  # (..., 1)
+    cosine_sim = (z1_norm * z2_norm).sum(dim=-1)
+    if layer_weights is not None and cosine_sim.dim() == 2:
+        return ((1.0 - cosine_sim) * layer_weights.unsqueeze(0)).sum(dim=-1).mean()
     return 1.0 - cosine_sim.mean()
 
 if is_liger_kernel_available():

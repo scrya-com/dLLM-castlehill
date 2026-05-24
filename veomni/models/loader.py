@@ -172,6 +172,15 @@ class CustomizedModelingLoader(BaseModelLoader):
                 else:
                     setattr(model, "repr_align_num_sample_layers", num_sample_layers)
 
+            # Exponential layer weighting exponent for repr_align cosine loss
+            layer_exp = kwargs.get("repr_align_layer_exp")
+            if layer_exp is not None:
+                layer_exp = float(layer_exp)
+                if hasattr(model, "repr_align_layer_exp"):
+                    model.repr_align_layer_exp = layer_exp
+                else:
+                    setattr(model, "repr_align_layer_exp", layer_exp)
+
             anchor_cache_dir = kwargs.get("anchor_cache_dir")
             if anchor_cache_dir:
                 # Precomputed-anchor path: skip the deepcopy entirely, save

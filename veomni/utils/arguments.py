@@ -318,6 +318,14 @@ class TrainingArguments:
             )
         },
     )
+    repr_align_wt_final: float = field(
+        default=1.0,
+        metadata={"help": "Final repr_align weight for cosine decay schedule. Decays from repr_align_wt → repr_align_wt_final over training. Set equal to repr_align_wt to disable decay."},
+    )
+    repr_align_layer_exp: float = field(
+        default=0.0,
+        metadata={"help": "Exponential layer weighting exponent for repr_align cosine loss. 0=uniform average, 2=last layer ~7x first. Applied across align_layers depth ordering."},
+    )
     # ------------------------------------------------------------------
     # Replay buffer for Repr-Align — stores past batches and replays
     # alignment loss on old data to prevent catastrophic forgetting.

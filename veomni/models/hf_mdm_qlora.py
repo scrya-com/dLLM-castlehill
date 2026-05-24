@@ -46,6 +46,7 @@ class MDMQLoRAWrapper(nn.Module):
         self.teacher_model = None
         self.align_layers = None
         self.repr_align_sub_sample_ratio = 1.0
+        self.repr_align_layer_exp = 0.0
 
     def __getattr__(self, name):
         try:
@@ -93,9 +94,19 @@ class MDMQLoRAWrapper(nn.Module):
                 labels_2d = labels if labels.dim() == 2 else labels.view(input_ids.size(0), -1)
                 loss_mask = (labels_2d[:, 1:].reshape(-1) != IGNORE_INDEX)  # [L-1]
 
+            # Exponential layer weights: later layers weighted more heavily.
+            # layer_exp=0 → uniform; layer_exp=2 → last layer ~7× first.
+            _n_layers = len(self.align_layers)
+            if self.repr_align_layer_exp != 0.0 and _n_layers > 0:
+                _idx = torch.arange(_n_layers, dtype=torch.float32, device=input_ids.device)
+                _raw = torch.exp(self.repr_align_layer_exp * _idx / _n_layers)
+                _layer_w = (_raw / _raw.sum()).tolist()
+            else:
+                _layer_w = [1.0 / _n_layers] * _n_layers if _n_layers > 0 else []
+
             align_loss = 0.0
             n_aligned = 0
-            for layer_idx in self.align_layers:
+            for i, layer_idx in enumerate(self.align_layers):
                 # Shift by 1 to match the MDM label shift (h[i] predicts token i+1).
                 s_hid = student_hiddens[layer_idx][:, :-1, :].float().squeeze(0)  # [L-1, D]
                 t_hid = teacher_hiddens[layer_idx][:, :-1, :].float().squeeze(0)  # [L-1, D]
@@ -111,11 +122,11 @@ class MDMQLoRAWrapper(nn.Module):
                     s_hid = s_hid[perm]
                     t_hid = t_hid[perm]
                 sim = F.cosine_similarity(s_hid, t_hid, dim=-1)
-                align_loss = align_loss + (1 - sim).mean()
+                align_loss = align_loss + _layer_w[i] * (1 - sim).mean()
                 n_aligned += 1
 
             if n_aligned > 0:
-                align_loss = align_loss / n_aligned
+                # align_loss is already a weighted average (weights sum to 1), no division needed
                 if loss is not None:
                     loss = loss + repr_align_wt * align_loss
                 else:
@@ -127,7 +138,7 @@ class MDMQLoRAWrapper(nn.Module):
 
 def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
                         align_layers=None, anchor_cache_dir=None,
-                        repr_align_sub_sample_ratio=1.0, **kw):
+                        repr_align_sub_sample_ratio=1.0, repr_align_layer_exp=0.0, **kw):
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 
@@ -160,6 +171,7 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
     if align_layers is not None:
         wrapper.align_layers = sorted({int(x) for x in align_layers.split(",") if x.strip()})
     wrapper.repr_align_sub_sample_ratio = repr_align_sub_sample_ratio
+    wrapper.repr_align_layer_exp = repr_align_layer_exp
     if anchor_cache_dir:
         from .cached_teacher import CachedTeacher
         # Qwen3_5Config stores hidden_size inside text_config

@@ -179,6 +179,18 @@ def _prune_old_checkpoints(checkpoint_dir: str, keep: int) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _save_qlora_checkpoint(model, save_dir, model_assets, logger):
+    """Save QLoRA checkpoint (PEFT adapter + assets). Works with MDMQLoRAWrapper."""
+    from peft import PeftModel
+    peft_model = getattr(model, 'base', None)
+    if isinstance(peft_model, PeftModel):
+        peft_model.save_pretrained(save_dir)
+    else:
+        adapter_state = {n: p.data for n, p in model.named_parameters() if p.requires_grad}
+        save_model_weights(save_dir, adapter_state, model_assets=model_assets)
+    logger.info_rank0(f"QLoRA checkpoint saved at {save_dir}")
+
+
 def main():
     args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
@@ -396,6 +408,7 @@ def main():
         align_layers=getattr(args.train, "align_layers", None),
         repr_align_sub_sample_ratio=getattr(args.train, "repr_align_sub_sample_ratio", 1.0),
         repr_align_num_sample_layers=getattr(args.train, "repr_align_num_sample_layers", None),
+        repr_align_layer_exp=getattr(args.train, "repr_align_layer_exp", 0.0),
         enable_nvfp4_qat=getattr(args.model, "enable_nvfp4_qat", False),
         enable_qlorafy=getattr(args.model, "enable_qlorafy", False),
         qlorafy_config=getattr(args.model, "qlorafy_config", None),
@@ -670,6 +683,16 @@ def main():
                 if nan_params:
                     logger.warning_rank0(f"[step {global_step}] NaN/Inf in params before forward: {nan_params[:5]}")
 
+            # Cosine-decay schedule for repr_align weight: λ_start → λ_end over training.
+            _lam_start = args.train.repr_align_wt
+            _lam_end = getattr(args.train, 'repr_align_wt_final', _lam_start)
+            if _lam_start != _lam_end:
+                _total_steps = args.train.num_train_epochs * args.train.train_steps
+                _progress = min(global_step / max(_total_steps, 1), 1.0)
+                _current_repr_align_wt = _lam_end + (_lam_start - _lam_end) * 0.5 * (1 + math.cos(math.pi * _progress))
+            else:
+                _current_repr_align_wt = _lam_start
+
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
 
@@ -677,7 +700,7 @@ def main():
                     k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
                 }
                 with model_fwd_context:
-                    outputs = model(**micro_batch, use_cache=False, repr_align_wt=args.train.repr_align_wt)
+                    outputs = model(**micro_batch, use_cache=False, repr_align_wt=_current_repr_align_wt)
                     loss_tensor: "torch.Tensor" = outputs.loss.mean() / len(micro_batches)
                     loss_components = getattr(outputs, "loss_components", {})
                     for name, value in loss_components.items():
@@ -697,7 +720,7 @@ def main():
                             _replay_batch = replay_buffer.sample(loss_tensor.device)
                             if _replay_batch is not None:
                                 _replay_outputs = model(
-                                    **_replay_batch, use_cache=False, repr_align_wt=args.train.repr_align_wt
+                                    **_replay_batch, use_cache=False, repr_align_wt=_current_repr_align_wt
                                 )
                                 _replay_align = getattr(_replay_outputs, "loss_components", {}).get("repr_align", None)
                                 if _replay_align is not None and torch.isfinite(torch.tensor(_replay_align)):
@@ -1006,14 +1029,7 @@ def main():
                 if args.train.global_rank == 0 and args.train.save_hf_weights:
                     hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
                     if is_qlora:
-                        from peft import PeftModel
-                        if isinstance(model, PeftModel):
-                            model.save_pretrained(hf_weights_path)
-                            logger.info_rank0(f"PEFT adapter saved at {hf_weights_path}")
-                        else:
-                            adapter_state = {n: p.data for n, p in model.named_parameters() if p.requires_grad}
-                            save_model_weights(hf_weights_path, adapter_state, model_assets=model_assets)
-                            logger.info_rank0(f"Trainable weights saved at {hf_weights_path}")
+                        _save_qlora_checkpoint(model, hf_weights_path, model_assets, logger)
                     else:
                         logger.info(f"Converting checkpoint from {save_checkpoint_path} to HF format")
                         model_state_dict = ckpt_to_state_dict(
@@ -1118,13 +1134,8 @@ def main():
             # save model in huggingface's format
             if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
                 hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-                model_state_dict = ckpt_to_state_dict(
-                    save_checkpoint_path=save_checkpoint_path,
-                    output_dir=args.train.output_dir,
-                    ckpt_manager=args.train.ckpt_manager,
-                )
-                save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-                logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+                if getattr(args.model, 'enable_qlorafy', False):
+                    _save_qlora_checkpoint(model, hf_weights_path, model_assets, logger)
 
     torch.cuda.synchronize()
     # release memory
@@ -1133,13 +1144,8 @@ def main():
     # save model in huggingface's format
     if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        model_state_dict = ckpt_to_state_dict(
-            save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.output_dir,
-            ckpt_manager=args.train.ckpt_manager,
-        )
-        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-        logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+        if getattr(args.model, 'enable_qlorafy', False):
+            _save_qlora_checkpoint(model, hf_weights_path, model_assets, logger)
 
     dist.barrier()
     dist.destroy_process_group()
