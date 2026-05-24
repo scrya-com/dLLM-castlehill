@@ -49,16 +49,24 @@ def _repr_align_loss(z1, z2, layer_weights=None, contrastive=False, contrastive_
     return 1.0 - cosine_sim.mean()
 
 
-def _mdm_loss(logits, labels):
-    # Match veomni MDM loss: shift by one, per-token CE on masked positions
-    # (labels != IGNORE_INDEX), plus a confidence-weighted path term.
+def _mdm_loss(logits, labels, chunk_size=512):
+    # Chunked CE to avoid materialising [B, T, V] fp32 at long seq_len.
+    # At seq_len=4096, V=248320: full tensor = 4.1 GB fp32; chunks keep peak at 0.5 GB.
     logits_s = logits[:, :-1, :]
     labels_s = labels[:, 1:] if labels.dim() == 2 else labels.view(logits.size(0), -1)[:, 1:]
     L = min(logits_s.size(1), labels_s.size(1))
-    logits_s = logits_s[:, :L].reshape(-1, logits_s.size(-1)).float()
-    labels_s = labels_s[:, :L].reshape(-1)
-    token_loss = F.cross_entropy(logits_s, labels_s, ignore_index=IGNORE_INDEX, reduction="none")
-    loss_mask = (labels_s != IGNORE_INDEX).to(token_loss.dtype)
+    logits_flat = logits_s[:, :L].reshape(-1, logits_s.size(-1))  # [T, V] bf16
+    labels_flat = labels_s[:, :L].reshape(-1)                      # [T]
+
+    token_loss = torch.zeros(L, device=logits.device, dtype=torch.float32)
+    for i in range(0, L, chunk_size):
+        chunk_l = logits_flat[i:i + chunk_size].float()
+        chunk_y = labels_flat[i:i + chunk_size]
+        token_loss[i:i + chunk_size] = F.cross_entropy(
+            chunk_l, chunk_y, ignore_index=IGNORE_INDEX, reduction="none"
+        )
+
+    loss_mask = (labels_flat != IGNORE_INDEX).to(token_loss.dtype)
     denom = loss_mask.sum() + 1e-8
     mdm = (token_loss * loss_mask).sum() / denom
     path = ((-token_loss).exp().detach() * token_loss * loss_mask).sum() / denom

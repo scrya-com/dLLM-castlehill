@@ -15,6 +15,7 @@ model:
 data:
   train_path: /run/media/johndpope/12TB/open_dllm/ldlm_data/data_smoke_1000.jsonl
   train_size: 1000
+  eval_size: 50
   dataloader_type: native
   data_type: plaintext
   max_seq_len: 1024
@@ -30,6 +31,7 @@ train:
   save_optimizer_state: false
   save_epochs: 0
   save_steps: 500
+  eval_every: 200
   auto_resume: false
   num_train_epochs: 10
   max_steps: 1000

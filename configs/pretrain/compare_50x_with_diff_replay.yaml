@@ -34,7 +34,7 @@ train:
   anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3-1.7b-50x
   align_layers: "7,14,21,28"
   freeze_layers: ""
-  num_train_epochs: 100
+  num_train_epochs: 10
   optimizer: anyprecision_adamw
   lr: 1.0e-4
   lr_warmup_ratio: 0.01

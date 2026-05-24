@@ -1,3 +1,6 @@
+# Qwen3-1.7B Repr-Align + Cola DLM — 50-example comparison
+# Cola DLM: hierarchical Text VAE + block-causal DiT on top of Repr-Align.
+
 model:
   model_path: Qwen/Qwen3-1.7B
   attn_implementation: sdpa
@@ -15,31 +18,44 @@ data:
   prefetch_factor: 2
 
 train:
-  output_dir: /home/johndpope/ds_offload/checkpoints/compare-50x-with-trajectory
-  data_parallel_mode: ddp
+  output_dir: /home/johndpope/ds_offload/checkpoints/cola-1.7b-50
+  data_parallel_mode: deepspeed
+  ds_zero_stage: 2
+  ds_offload_optimizer: cpu
+  ds_overlap_comm: true
+  ds_contiguous_gradients: true
   ulysses_parallel_size: 1
   global_batch_size: 1
   micro_batch_size: 1
   rmpad: false
-  rmpad_with_pos_ids: true
+  rmpad_with_pos_ids: false
   bsz_warmup_ratio: 0.0
   dyn_bsz_margin: 0
   dyn_bsz_buffer_size: 50
+
+  # Repr-Align with subsampling
   enable_masking: true
   repr_align_wt: 1.0
-  # d3LLM trajectory-guided masking replaces random masking
-  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3-1.7b-50x/trajectories.jsonl
-  trajectory_min_mask_ratio: 0.0
-  trajectory_max_mask_ratio: 0.8
-  trajectory_progressive_block_sizes: "16,24,32"
-  trajectory_use_blockwise: true
-  trajectory_entropy_weight: 1.0
-  trajectory_temperature: 0.5
   anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3-1.7b-50x
   align_layers: "7,14,21,28"
-  freeze_layers: ""
-  num_train_epochs: 10
-  optimizer: anyprecision_adamw
+  repr_align_sub_sample_ratio: 0.25
+
+  # Cola DLM
+  cola_wt: 0.5
+  cola_variant: card
+  cola_lambda_tail: 0.6
+  cola_num_global: 16
+  cola_num_local: 64
+  cola_block_size: 16
+  cola_encoder_depth: 2
+  cola_diffusion_depth: 4
+  cola_heads: 8
+  cola_source_layer: -3
+  cola_detach_student: true
+  cola_log_hist_every: 200
+  cola_prediction: v
+
+  optimizer: adamw
   lr: 1.0e-4
   lr_warmup_ratio: 0.01
   lr_decay_style: cosine
@@ -47,21 +63,26 @@ train:
   lr_min: 1.0e-6
   weight_decay: 0.01
   max_grad_norm: 1.0
+  num_train_epochs: 10
+
+  data_parallel_mode: ddp
   enable_mixed_precision: true
   enable_gradient_checkpointing: true
   enable_full_shard: false
   enable_fsdp_offload: false
-  enable_activation_offload: true
+  enable_activation_offload: false
   init_device: cuda
   enable_full_determinism: false
   empty_cache_steps: 50
+
   ckpt_manager: dcp
   load_checkpoint_path: ""
-  save_steps: 1000000
+  save_steps: 25000
   save_epochs: 0
   save_hf_weights: false
   auto_resume: false
   save_time_interval_minutes: 0
+
   use_wandb: true
   wandb_project: open-dllm-compare
-  wandb_name: 1.7b-50x-with-trajectory
+  wandb_name: 1.7b-50x-cola

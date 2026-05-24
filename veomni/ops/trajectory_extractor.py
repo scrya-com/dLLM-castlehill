@@ -178,6 +178,7 @@ def extract_and_save(
     max_examples: Optional[int] = None,
     batch_size: int = 1,
     quantize: Optional[str] = None,
+    use_hf_native: bool = False,
 ):
     """Run trajectory extraction over a dataset and save to disk.
 
@@ -187,10 +188,17 @@ def extract_and_save(
     Args:
         quantize: If "4bit", load model via QLoRA (NF4 + LoRA adapters).
                   Required for large models that don't fit in full bf16.
+        use_hf_native: If True and quantize=='4bit', use build_hf_mdm_qlora
+                  (HF-native wrapper) instead of custom qlorafy path.
+                  Required for Gated DeltaNet models (Qwen3.6-27B).
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    if quantize == "4bit":
+    if quantize == "4bit" and use_hf_native:
+        from veomni.models.hf_mdm_qlora import build_hf_mdm_qlora
+        model = build_hf_mdm_qlora(model_path, device="cuda:0")
+        model.eval()
+    elif quantize == "4bit":
         from veomni.models.qlorafy import QLoRAConfig, build_qlorafied_model
         model = build_qlorafied_model(
             model_path,
@@ -268,6 +276,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_examples", type=int, default=None)
     parser.add_argument("--quantize", type=str, default=None, choices=["4bit"],
                         help="Quantization mode. '4bit' loads via QLoRA (NF4 + LoRA).")
+    parser.add_argument("--use_hf_native", action="store_true",
+                        help="Use HF-native QLoRA wrapper (build_hf_mdm_qlora) instead of custom qlorafy path. "
+                             "Required for Gated DeltaNet models like Qwen3.6-27B.")
     args = parser.parse_args()
 
     extract_and_save(
@@ -279,4 +290,5 @@ if __name__ == "__main__":
         steps=args.steps,
         max_examples=args.max_examples,
         quantize=args.quantize,
+        use_hf_native=args.use_hf_native,
     )

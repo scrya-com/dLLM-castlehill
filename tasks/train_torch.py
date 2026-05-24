@@ -367,12 +367,15 @@ def main():
                 if i >= max_batches:
                     break
                 batch = {k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                # Eval batches have no MDM masking — use input_ids as labels for AR PPL
+                if "labels" not in batch:
+                    batch["labels"] = batch["input_ids"].clone()
                 outputs = model(**batch, use_cache=False, repr_align_wt=0.0)
                 loss = outputs.loss
-                if torch.isfinite(loss):
-                    n_tokens = batch.get("attention_mask", batch.get("input_ids")).sum().item()
-                    total_loss += loss.item() * n_tokens
-                    total_tokens += n_tokens
+                if loss is not None and torch.isfinite(loss):
+                    n_tokens = (batch["labels"] != -100).sum().item()
+                    total_loss += loss.item() * max(n_tokens, 1)
+                    total_tokens += max(n_tokens, 1)
         model.train()
         if total_tokens == 0:
             return None, None
