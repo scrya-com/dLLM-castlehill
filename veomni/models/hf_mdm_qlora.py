@@ -63,9 +63,16 @@ class MDMQLoRAWrapper(nn.Module):
     def forward(self, input_ids=None, labels=None, attention_mask=None,
                 position_ids=None, mask_ratio=None, repr_align_wt=0.0,
                 casual_input_ids=None, use_cache=False, **kw):
+        _repr_align_active = (
+            repr_align_wt > 0
+            and self.teacher_model is not None
+            and self.align_layers is not None
+            and mask_ratio is not None  # only during MDM training, not AR / inference
+            and self.training
+        )
         out = self.base(input_ids=input_ids, attention_mask=attention_mask,
                         position_ids=position_ids, use_cache=False,
-                        output_hidden_states=True)
+                        output_hidden_states=_repr_align_active)
         logits = out.logits
         loss = None
         comps = {}
@@ -73,7 +80,7 @@ class MDMQLoRAWrapper(nn.Module):
             loss, mdm, path = _mdm_loss(logits, labels)
             comps = {"mdm": float(mdm), "path": float(path)}
 
-        if repr_align_wt > 0 and self.teacher_model is not None and self.align_layers:
+        if _repr_align_active:
             student_hiddens = out.hidden_states
             teacher_inputs = casual_input_ids if casual_input_ids is not None else input_ids
             teacher_out = self.teacher_model(input_ids=teacher_inputs, position_ids=position_ids)
