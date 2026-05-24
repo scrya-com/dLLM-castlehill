@@ -78,6 +78,9 @@ class MDMQLoRAWrapper(nn.Module):
         self.repr_align_layer_exp = 0.0
         self.repr_align_contrastive = False
         self.repr_align_contrastive_temp = 0.07
+        # Visualization: set _vis_step=True before a forward to capture tensors
+        self._vis_step = False
+        self._vis_data = None
 
     def __getattr__(self, name):
         try:
@@ -173,6 +176,13 @@ class MDMQLoRAWrapper(nn.Module):
                 else:
                     loss = repr_align_wt * align_loss
                 comps["repr_align"] = align_loss.detach().item()
+                if self._vis_step:
+                    self._vis_data = {
+                        "s_layers": [s.detach().cpu() for s in _s_layers],
+                        "t_layers": [t.detach().cpu() for t in _t_layers],
+                        "layer_indices": self.align_layers,
+                    }
+                    self._vis_step = False
 
         return SimpleNamespace(loss=loss, logits=logits, loss_components=comps)
 

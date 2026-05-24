@@ -732,6 +732,10 @@ def main():
                 micro_batch = {
                     k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
                 }
+                _do_vis = (args.train.use_wandb and args.train.global_rank == 0
+                           and global_step % 200 == 0 and hasattr(model, "_vis_step"))
+                if _do_vis:
+                    model._vis_step = True
                 with model_fwd_context:
                     outputs = model(**micro_batch, use_cache=False, repr_align_wt=_current_repr_align_wt)
                     loss_tensor: "torch.Tensor" = outputs.loss.mean() / len(micro_batches)
@@ -991,6 +995,18 @@ def main():
                             model.train()
                         except Exception as e:
                             logger.warning_rank0(f"[step {global_step}] Generation probe failed: {e}")
+
+                    # Repr-align visualization (data captured in forward above)
+                    if _do_vis and getattr(model, "_vis_data", None) is not None:
+                        try:
+                            from veomni.models.repr_align_vis import make_repr_align_vis
+                            import matplotlib.pyplot as plt
+                            fig = make_repr_align_vis(model, global_step)
+                            if fig is not None:
+                                train_metrics["repr_align/vis"] = wandb.Image(fig)
+                                plt.close(fig)
+                        except Exception as e:
+                            logger.warning_rank0(f"[step {global_step}] repr_align vis failed: {e}")
 
                     wandb.log(train_metrics, step=global_step)
 
