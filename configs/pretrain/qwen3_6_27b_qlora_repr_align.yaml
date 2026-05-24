@@ -46,11 +46,11 @@ train:
 
   # Repr-Align with cached teacher (4 layers, 25% subsampling)
   enable_masking: true
-  repr_align_wt: 10.0
-  repr_align_wt_final: 1.0
+  repr_align_wt: 3.0
+  repr_align_wt_final: 0.5
   repr_align_layer_exp: 2.0
   repr_align_contrastive: true
-  repr_align_contrastive_temp: 0.07
+  repr_align_contrastive_temp: 0.3
   llrd_decay: 0.85
   mdm_min_mask_ratio: 0.002
   mdm_max_mask_ratio: 0.998
@@ -66,8 +66,8 @@ train:
   enable_activation_offload: false
   init_device: cuda
   enable_full_determinism: false
-  empty_cache_steps: 50
+  empty_cache_steps: 10
 
   use_wandb: true
   wandb_project: open-dllm-27b
-  wandb_name: repr-align-27b-qlora-contrastive-llrd-curriculum
+  wandb_name: repr-align-27b-qlora-contrastive-tau03-lam3
