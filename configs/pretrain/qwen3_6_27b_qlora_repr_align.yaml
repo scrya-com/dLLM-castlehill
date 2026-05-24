@@ -1,0 +1,75 @@
+# 27B Repr-Align via QLoRA — RTX 5090 single GPU
+# HF-native QLoRA (NF4 + LoRA) + CachedTeacher alignment.
+# Fits in ~26 GB VRAM, ~1.2 it/s.
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+
+data:
+  train_path: /run/media/johndpope/12TB/open_dllm/ldlm_data/data_smoke_1000.jsonl
+  train_size: 1000
+  eval_size: 50
+  dataloader_type: native
+  data_type: plaintext
+  max_seq_len: 1024
+  text_keys: text
+  drop_last: true
+  datasets_type: mapping
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /run/media/johndpope/12TB/open_dllm/checkpoints/qwen3.6-27b-qlora-repr-align
+  save_hf_weights: true
+  save_optimizer_state: false
+  save_epochs: 0
+  save_steps: 500
+  eval_every: 200
+  auto_resume: false
+  num_train_epochs: 10
+  max_steps: 1000
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 1e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  rmpad_with_pos_ids: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  # Repr-Align with cached teacher (4 layers, 25% subsampling)
+  enable_masking: true
+  repr_align_wt: 3.0
+  repr_align_wt_final: 0.5
+  repr_align_layer_exp: 2.0
+  repr_align_contrastive: true
+  repr_align_contrastive_temp: 0.3
+  llrd_decay: 0.85
+  mdm_min_mask_ratio: 0.002
+  mdm_max_mask_ratio: 0.998
+  mdm_curriculum_steps: 200
+  anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3.6-27b-smoke1000-1024
+  align_layers: "16,32,48,64"
+  repr_align_sub_sample_ratio: 0.25
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: false
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: cuda
+  enable_full_determinism: false
+  empty_cache_steps: 10
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: repr-align-27b-qlora-contrastive-tau03-lam3

@@ -30,10 +30,10 @@ from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
-from veomni.optim import build_lr_scheduler, build_optimizer
+from veomni.optim import build_lr_scheduler, build_optimizer, build_llrd_param_groups
 from veomni.ops.replay_buffer import ReprAlignReplayBuffer
 from veomni.ops.trajectory_dataset import TrajectoryDataset
-from veomni.data.data_collator import DataCollatorWithTrajectoryMasking
+from veomni.data.data_collator import DataCollatorWithTrajectoryMasking, DataCollatorWithPositionIDsMasking
 from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.dist_utils import all_reduce
@@ -179,6 +179,18 @@ def _prune_old_checkpoints(checkpoint_dir: str, keep: int) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _save_qlora_checkpoint(model, save_dir, model_assets, logger):
+    """Save QLoRA checkpoint (PEFT adapter + assets). Works with MDMQLoRAWrapper."""
+    from peft import PeftModel
+    peft_model = getattr(model, 'base', None)
+    if isinstance(peft_model, PeftModel):
+        peft_model.save_pretrained(save_dir)
+    else:
+        adapter_state = {n: p.data for n, p in model.named_parameters() if p.requires_grad}
+        save_model_weights(save_dir, adapter_state, model_assets=model_assets)
+    logger.info_rank0(f"QLoRA checkpoint saved at {save_dir}")
+
+
 def main():
     args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
@@ -287,8 +299,9 @@ def main():
 
         trajectory_dataset = None
         trajectory_collator = None
+        mdm_collator = None
         _traj_path = getattr(args.train, "trajectory_data_path", None)
-        if _traj_path and getattr(args.train, "repr_align_wt", 0) > 0:
+        if _traj_path:
             trajectory_dataset = TrajectoryDataset(_traj_path)
             logger.info_rank0(
                 f"Trajectory dataset loaded: {len(trajectory_dataset)} samples from {_traj_path}"
@@ -307,6 +320,16 @@ def main():
         else:
             _enable_masking = args.train.enable_masking
             _custom_collate = None
+            # Create MDM collator explicitly so we can apply mask-ratio curriculum.
+            mdm_collator = None
+            if _enable_masking and tokenizer.mask_token_id is not None:
+                mdm_collator = DataCollatorWithPositionIDsMasking(
+                    mask_token_id=tokenizer.mask_token_id,
+                    min_mask_ratio=getattr(args.train, "mdm_min_mask_ratio", 0.002),
+                    max_mask_ratio=getattr(args.train, "mdm_max_mask_ratio", 0.998),
+                )
+                _custom_collate = mdm_collator
+                _enable_masking = False  # build_dataloader won't create a second collator
 
         train_dataloader = build_dataloader(
             dataset=train_dataset,
@@ -344,12 +367,15 @@ def main():
                 if i >= max_batches:
                     break
                 batch = {k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                # Eval batches have no MDM masking — use input_ids as labels for AR PPL
+                if "labels" not in batch:
+                    batch["labels"] = batch["input_ids"].clone()
                 outputs = model(**batch, use_cache=False, repr_align_wt=0.0)
                 loss = outputs.loss
-                if torch.isfinite(loss):
-                    n_tokens = batch.get("attention_mask", batch.get("input_ids")).sum().item()
-                    total_loss += loss.item() * n_tokens
-                    total_tokens += n_tokens
+                if loss is not None and torch.isfinite(loss):
+                    n_tokens = (batch["labels"] != -100).sum().item()
+                    total_loss += loss.item() * max(n_tokens, 1)
+                    total_tokens += max(n_tokens, 1)
         model.train()
         if total_tokens == 0:
             return None, None
@@ -396,6 +422,9 @@ def main():
         align_layers=getattr(args.train, "align_layers", None),
         repr_align_sub_sample_ratio=getattr(args.train, "repr_align_sub_sample_ratio", 1.0),
         repr_align_num_sample_layers=getattr(args.train, "repr_align_num_sample_layers", None),
+        repr_align_layer_exp=getattr(args.train, "repr_align_layer_exp", 0.0),
+        repr_align_contrastive=getattr(args.train, "repr_align_contrastive", False),
+        repr_align_contrastive_temp=getattr(args.train, "repr_align_contrastive_temp", 0.07),
         enable_nvfp4_qat=getattr(args.model, "enable_nvfp4_qat", False),
         enable_qlorafy=getattr(args.model, "enable_qlorafy", False),
         qlorafy_config=getattr(args.model, "qlorafy_config", None),
@@ -487,12 +516,19 @@ def main():
     )
 
 
+    _llrd_decay = getattr(args.train, "llrd_decay", 0.0)
+    _llrd_param_groups = None
+    if _llrd_decay > 0:
+        _llrd_param_groups = build_llrd_param_groups(
+            model, base_lr=args.train.lr, decay=_llrd_decay, weight_decay=args.train.weight_decay
+        )
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
         weight_decay=args.train.weight_decay,
         fused=True,
         optimizer_type=args.train.optimizer,
+        param_groups=_llrd_param_groups,
     )
     if get_optimizer_pre_hook is not None:
         optimizer_pre_hook = get_optimizer_pre_hook(model, model_config, args.train.data_parallel_mode)
@@ -558,6 +594,12 @@ def main():
 
     start_epoch, start_step, global_step = 0, 0, 0
     save_checkpoint_path = None
+    # MDM history buffer for mask-ratio × loss scatter visualization
+    try:
+        from veomni.models.repr_align_vis import MDMHistory
+        _mdm_history = MDMHistory(maxlen=400)
+    except ImportError:
+        _mdm_history = None
     environ_meter = helper.EnvironMeter(
         config=model_config,
         global_batch_size=args.train.global_batch_size,
@@ -646,6 +688,19 @@ def main():
                     ep = min(epoch, len(_traj_prog_blocks) - 1)
                     trajectory_collator.current_block_size = _traj_prog_blocks[ep]
 
+            # MDM mask-ratio curriculum: widen [min, max] bounds over mdm_curriculum_steps
+            if mdm_collator is not None:
+                _mdm_cur_steps = getattr(args.train, "mdm_curriculum_steps", 0)
+                if _mdm_cur_steps > 0:
+                    _cur_prog = min(global_step / _mdm_cur_steps, 1.0)
+                    _lo_start = getattr(args.train, "mdm_min_mask_ratio", 0.002)
+                    _hi_start = getattr(args.train, "mdm_max_mask_ratio", 0.998)
+                    # Interpolate: narrow at step 0, full [0.002, 0.998] at step mdm_curriculum_steps
+                    _lo_narrow = _lo_start + (0.15 - _lo_start) * (1 - _cur_prog)
+                    _hi_narrow = _hi_start - (0.998 - 0.85) * (1 - _cur_prog)
+                    mdm_collator.min_mask_ratio = max(_lo_start, min(_lo_narrow, 0.15))
+                    mdm_collator.max_mask_ratio = min(_hi_start, max(_hi_narrow, 0.85))
+
             step_loss_components: Dict[str, float] = {}
 
             try:
@@ -670,18 +725,44 @@ def main():
                 if nan_params:
                     logger.warning_rank0(f"[step {global_step}] NaN/Inf in params before forward: {nan_params[:5]}")
 
+            # Cosine-decay schedule for repr_align weight: λ_start → λ_end over training.
+            _lam_start = args.train.repr_align_wt
+            _lam_end = getattr(args.train, 'repr_align_wt_final', _lam_start)
+            if _lam_start != _lam_end:
+                _total_steps = args.train.num_train_epochs * args.train.train_steps
+                _progress = min(global_step / max(_total_steps, 1), 1.0)
+                _current_repr_align_wt = _lam_end + (_lam_start - _lam_end) * 0.5 * (1 + math.cos(math.pi * _progress))
+            else:
+                _current_repr_align_wt = _lam_start
+
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
 
                 micro_batch = {
                     k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
                 }
+                _do_vis = (args.train.use_wandb and args.train.global_rank == 0
+                           and global_step % 200 == 0 and hasattr(model, "_vis_step"))
+                if _do_vis:
+                    model._vis_step = True
                 with model_fwd_context:
-                    outputs = model(**micro_batch, use_cache=False, repr_align_wt=args.train.repr_align_wt)
+                    outputs = model(**micro_batch, use_cache=False, repr_align_wt=_current_repr_align_wt)
                     loss_tensor: "torch.Tensor" = outputs.loss.mean() / len(micro_batches)
                     loss_components = getattr(outputs, "loss_components", {})
                     for name, value in loss_components.items():
                         step_loss_components[name] = step_loss_components.get(name, 0.0) + value / len(micro_batches)
+
+                    # Track mask-ratio × mdm-loss for the diffusion scatter plot
+                    if _mdm_history is not None and "mdm" in loss_components:
+                        _mr = micro_batch.get("mask_ratio")
+                        if _mr is not None:
+                            _mdm_history.push(float(_mr.mean()), loss_components["mdm"])
+                    # Attach logits/labels to _vis_data for reconstruction panel
+                    if _do_vis and getattr(model, "_vis_data", None) is not None:
+                        model._vis_data["logits"] = outputs.logits[:1].detach().cpu()
+                        model._vis_data["labels"] = micro_batch.get("labels", micro_batch.get("input_ids"))[:1].detach().cpu()
+                        _mr = micro_batch.get("mask_ratio")
+                        model._vis_data["mask_ratio"] = float(_mr.mean()) if _mr is not None else 0.5
 
                     # Repr-Align replay buffer: push current batch, sample past batch,
                     # re-run student alignment on old data to prevent forgetting.
@@ -697,7 +778,7 @@ def main():
                             _replay_batch = replay_buffer.sample(loss_tensor.device)
                             if _replay_batch is not None:
                                 _replay_outputs = model(
-                                    **_replay_batch, use_cache=False, repr_align_wt=args.train.repr_align_wt
+                                    **_replay_batch, use_cache=False, repr_align_wt=_current_repr_align_wt
                                 )
                                 _replay_align = getattr(_replay_outputs, "loss_components", {}).get("repr_align", None)
                                 if _replay_align is not None and torch.isfinite(torch.tensor(_replay_align)):
@@ -908,21 +989,34 @@ def main():
 
                     if args.model.enable_qlorafy and global_step % 100 == 0:
                         try:
+                            import time as _time
                             model.eval()
                             gen_prompts = ["The meaning of life is", "def fibonacci(n):"]
                             gen_samples = []
+                            ar_toks_total, ar_time_total = 0, 0.0
+                            diff_toks_total, diff_time_total = 0, 0.0
                             for gp in gen_prompts:
                                 enc = tokenizer(gp, return_tensors="pt")
                                 pids = enc.input_ids.to(model.device if hasattr(model, 'device') else next(model.parameters()).device)
                                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                    # AR generation
+                                    # AR generation — timed
+                                    _t0 = _time.perf_counter()
                                     ar_out = model.generate(pids, max_new_tokens=64, do_sample=True, temperature=0.7, top_k=200)
+                                    torch.cuda.synchronize()
+                                    ar_time_total += _time.perf_counter() - _t0
+                                    ar_new_toks = ar_out.shape[1] - pids.shape[1]
+                                    ar_toks_total += ar_new_toks
                                     ar_text = tokenizer.decode(ar_out[0][pids.shape[1]:], skip_special_tokens=True)
 
-                                    # Diffusion generation (masked, bidirectional)
+                                    # Diffusion generation — timed
                                     from veomni.models.transformers.qwen2.generation_utils import mdm_generate
                                     if tokenizer.mask_token_id is not None:
+                                        _t0 = _time.perf_counter()
                                         diff_ids = mdm_generate(model, pids, mask_token_id=tokenizer.mask_token_id, max_new_tokens=64, steps=16, temperature=0.7)
+                                        torch.cuda.synchronize()
+                                        diff_time_total += _time.perf_counter() - _t0
+                                        diff_new_toks = diff_ids.shape[1] - pids.shape[1]
+                                        diff_toks_total += diff_new_toks
                                         diff_text = tokenizer.decode(diff_ids[0][pids.shape[1]:], skip_special_tokens=True)
                                     else:
                                         diff_text = "(no mask token)"
@@ -932,9 +1026,24 @@ def main():
                                     f"<b>Diffusion (16-step):</b> {diff_text}"
                                 )
                             train_metrics["generation/sample"] = wandb.Html("<hr>".join(gen_samples))
+                            if ar_time_total > 0:
+                                train_metrics["inference/ar_tok_per_sec"] = ar_toks_total / ar_time_total
+                            if diff_time_total > 0:
+                                train_metrics["inference/diff_tok_per_sec"] = diff_toks_total / diff_time_total
                             model.train()
                         except Exception as e:
                             logger.warning_rank0(f"[step {global_step}] Generation probe failed: {e}")
+
+                    # Repr-align + diffusion visualization (data captured in forward above)
+                    if _do_vis and getattr(model, "_vis_data", None) is not None:
+                        try:
+                            from veomni.models.repr_align_vis import make_all_vis
+                            import matplotlib.pyplot as plt
+                            for _vkey, _vfig in make_all_vis(model, global_step, _mdm_history).items():
+                                train_metrics[_vkey] = wandb.Image(_vfig)
+                                plt.close(_vfig)
+                        except Exception as e:
+                            logger.warning_rank0(f"[step {global_step}] repr_align vis failed: {e}")
 
                     wandb.log(train_metrics, step=global_step)
 
@@ -1006,14 +1115,7 @@ def main():
                 if args.train.global_rank == 0 and args.train.save_hf_weights:
                     hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
                     if is_qlora:
-                        from peft import PeftModel
-                        if isinstance(model, PeftModel):
-                            model.save_pretrained(hf_weights_path)
-                            logger.info_rank0(f"PEFT adapter saved at {hf_weights_path}")
-                        else:
-                            adapter_state = {n: p.data for n, p in model.named_parameters() if p.requires_grad}
-                            save_model_weights(hf_weights_path, adapter_state, model_assets=model_assets)
-                            logger.info_rank0(f"Trainable weights saved at {hf_weights_path}")
+                        _save_qlora_checkpoint(model, hf_weights_path, model_assets, logger)
                     else:
                         logger.info(f"Converting checkpoint from {save_checkpoint_path} to HF format")
                         model_state_dict = ckpt_to_state_dict(
@@ -1094,6 +1196,7 @@ def main():
 
         data_loader_tqdm.close()
         start_step = 0
+        helper.empty_cache()  # flush fragmented allocations between epochs
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
         if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
             helper.empty_cache()
@@ -1118,13 +1221,8 @@ def main():
             # save model in huggingface's format
             if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
                 hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-                model_state_dict = ckpt_to_state_dict(
-                    save_checkpoint_path=save_checkpoint_path,
-                    output_dir=args.train.output_dir,
-                    ckpt_manager=args.train.ckpt_manager,
-                )
-                save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-                logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+                if getattr(args.model, 'enable_qlorafy', False):
+                    _save_qlora_checkpoint(model, hf_weights_path, model_assets, logger)
 
     torch.cuda.synchronize()
     # release memory
@@ -1133,13 +1231,8 @@ def main():
     # save model in huggingface's format
     if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
         hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        model_state_dict = ckpt_to_state_dict(
-            save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.output_dir,
-            ckpt_manager=args.train.ckpt_manager,
-        )
-        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-        logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
+        if getattr(args.model, 'enable_qlorafy', False):
+            _save_qlora_checkpoint(model, hf_weights_path, model_assets, logger)
 
     dist.barrier()
     dist.destroy_process_group()

@@ -82,10 +82,36 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def repr_align_loss_fn(z1, z2):
+def repr_align_loss_fn(z1, z2, layer_weights=None, contrastive=False, contrastive_temp=0.07):
+    """Repr-align loss: cosine (default) or InfoNCE contrastive.
+
+    z1, z2: [N_tokens, D] or [N_tokens, N_layers, D]
+    layer_weights: [N_layers] summing to 1 (exponential depth weighting)
+    contrastive: use InfoNCE with sequence-position negatives
+    """
     z1_norm = nn.functional.normalize(z1, p=2, dim=-1)
     z2_norm = nn.functional.normalize(z2, p=2, dim=-1)
+
+    if contrastive:
+        # Pool over layer dim [N, L, D] → [N, D] using layer_weights, then InfoNCE
+        if z1_norm.dim() == 3:
+            if layer_weights is not None:
+                z1_norm = (z1_norm * layer_weights.view(1, -1, 1)).sum(dim=1)
+                z2_norm = (z2_norm * layer_weights.view(1, -1, 1)).sum(dim=1)
+            else:
+                z1_norm = z1_norm.mean(dim=1)
+                z2_norm = z2_norm.mean(dim=1)
+            z1_norm = nn.functional.normalize(z1_norm, p=2, dim=-1)
+            z2_norm = nn.functional.normalize(z2_norm, p=2, dim=-1)
+        # [N, N] similarity matrix; diagonal = positives
+        logits = (z1_norm @ z2_norm.T) / contrastive_temp
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return nn.functional.cross_entropy(logits, labels)
+
     cosine_sim = (z1_norm * z2_norm).sum(dim=-1)
+    if layer_weights is not None and cosine_sim.dim() == 2:
+        # cosine_sim: [N_tokens, N_layers]; layer_weights: [N_layers] summing to 1
+        return ((1.0 - cosine_sim) * layer_weights.unsqueeze(0)).sum(dim=-1).mean()
     return 1.0 - cosine_sim.mean()
 
 
@@ -415,12 +441,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 g = torch.cat([kv_prod[2][:, :, :q_acc.shape[2]], g], dim=2)
                 beta = torch.cat([kv_prod[3][:, :, :q_acc.shape[2]], beta], dim=2)
 
-        # Apply delta rule
+        # Apply delta rule — ensure consistent bf16 dtype for FLA kernels
+        q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
+        beta, g = beta.bfloat16(), g.bfloat16()
+
         if self.use_fla:
             try:
                 from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_delta
                 output, new_state = fla_delta(q, k, v, beta, g)
-            except Exception:
+            except Exception as _fla_err:
+                print(f"[GatedDeltaNet] FLA kernel failed ({type(_fla_err).__name__}: {_fla_err}), falling back to pytorch")
                 output, new_state = chunk_gated_delta_rule_pytorch(q, k, v, beta, g)
         else:
             output, new_state = chunk_gated_delta_rule_pytorch(q, k, v, beta, g)
@@ -768,6 +798,9 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, MDMGenerationMixin, MultiBlockD
         self.align_layers: Optional[list] = None
         self.repr_align_sub_sample_ratio: float = 1.0
         self.repr_align_num_sample_layers: Optional[int] = None
+        self.repr_align_layer_exp: float = 0.0
+        self.repr_align_contrastive: bool = False
+        self.repr_align_contrastive_temp: float = 0.07
 
         self.post_init()
 
@@ -840,7 +873,8 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, MDMGenerationMixin, MultiBlockD
         if _r == 0:
             _cnt = getattr(self, "_fwd_cnt", 0) + 1
             self._fwd_cnt = _cnt
-            sys.stderr.write(f"[FWD#{_cnt}] labels={labels.shape if labels is not None else None} mask_ratio={mask_ratio.shape if mask_ratio is not None else None} liger={is_liger_kernel_available()}\n")
+            _mr_shape = mask_ratio.shape if isinstance(mask_ratio, torch.Tensor) else mask_ratio
+            sys.stderr.write(f"[FWD#{_cnt}] labels={labels.shape if labels is not None else None} mask_ratio={_mr_shape} liger={is_liger_kernel_available()}\n")
             sys.stderr.flush()
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -933,6 +967,15 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, MDMGenerationMixin, MultiBlockD
                 teacher_stacked = torch.cat([h[..., :-1, :] for h in teacher_hidden_states], dim=0).permute(1, 0, 2)
                 teacher_stacked = teacher_stacked[loss_mask]
 
+                # Precompute exponential layer weights (depth-weighted: later layers matter more)
+                _layer_exp = getattr(self, 'repr_align_layer_exp', 0.0)
+                layer_weights = None
+                if _layer_exp != 0.0:
+                    n_full = student_stacked.size(1)
+                    _idx = torch.arange(n_full, device=student_stacked.device, dtype=torch.float32)
+                    _raw = torch.exp(_layer_exp * _idx / n_full)
+                    layer_weights = _raw / _raw.sum()
+
                 # Layer subsampling: randomly pick k of L layers each step
                 if self.repr_align_num_sample_layers is not None:
                     num_layers = student_stacked.size(1)
@@ -940,6 +983,9 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, MDMGenerationMixin, MultiBlockD
                     layer_idx = torch.randperm(num_layers, device=student_stacked.device)[:k]
                     student_stacked = student_stacked[:, layer_idx, :]
                     teacher_stacked = teacher_stacked[:, layer_idx, :]
+                    if layer_weights is not None:
+                        layer_weights = layer_weights[layer_idx]
+                        layer_weights = layer_weights / layer_weights.sum()
 
                 # Token subsampling: randomly pick fraction of V tokens each step
                 if self.repr_align_sub_sample_ratio < 1.0:
@@ -949,7 +995,12 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, MDMGenerationMixin, MultiBlockD
                     student_stacked = student_stacked[token_idx]
                     teacher_stacked = teacher_stacked[token_idx]
 
-                repr_align_loss = repr_align_loss_fn(student_stacked, teacher_stacked)
+                repr_align_loss = repr_align_loss_fn(
+                    student_stacked, teacher_stacked,
+                    layer_weights=layer_weights,
+                    contrastive=getattr(self, 'repr_align_contrastive', False),
+                    contrastive_temp=getattr(self, 'repr_align_contrastive_temp', 0.07),
+                )
 
         # Logits / loss computation
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1045,10 +1096,6 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, MDMGenerationMixin, MultiBlockD
             result.repr_align_teacher_states = None
 
         return result
-
-
-if is_liger_kernel_available():
-    Qwen3_5RMSNorm = LigerFusedLinearCrossEntropyLoss  # placeholder — liger doesn't have RMSNorm replacement for this variant
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3_5ForCausalLM):

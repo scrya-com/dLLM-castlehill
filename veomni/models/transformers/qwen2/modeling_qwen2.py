@@ -74,10 +74,25 @@ class RepresentationAlignmentLoss(nn.Module):
         cosine_sim = (z1_norm * z2_norm).sum(dim=-1)  # (..., 1)
         return 1.0 - cosine_sim.mean()
 
-def repr_align_loss_fn(z1, z2):
+def repr_align_loss_fn(z1, z2, layer_weights=None, contrastive=False, contrastive_temp=0.07):
     z1_norm = nn.functional.normalize(z1, p=2, dim=-1)
     z2_norm = nn.functional.normalize(z2, p=2, dim=-1)
-    cosine_sim = (z1_norm * z2_norm).sum(dim=-1)  # (..., 1)
+    if contrastive:
+        if z1_norm.dim() == 3:
+            if layer_weights is not None:
+                z1_norm = (z1_norm * layer_weights.view(1, -1, 1)).sum(dim=1)
+                z2_norm = (z2_norm * layer_weights.view(1, -1, 1)).sum(dim=1)
+            else:
+                z1_norm = z1_norm.mean(dim=1)
+                z2_norm = z2_norm.mean(dim=1)
+            z1_norm = nn.functional.normalize(z1_norm, p=2, dim=-1)
+            z2_norm = nn.functional.normalize(z2_norm, p=2, dim=-1)
+        logits = (z1_norm @ z2_norm.T) / contrastive_temp
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return nn.functional.cross_entropy(logits, labels)
+    cosine_sim = (z1_norm * z2_norm).sum(dim=-1)
+    if layer_weights is not None and cosine_sim.dim() == 2:
+        return ((1.0 - cosine_sim) * layer_weights.unsqueeze(0)).sum(dim=-1).mean()
     return 1.0 - cosine_sim.mean()
 
 if is_liger_kernel_available():

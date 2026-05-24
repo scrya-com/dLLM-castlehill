@@ -71,6 +71,39 @@ Most diffusion LLM repos (e.g., LLaDA, Dream) only release **inference scripts +
 
 ---
 
+## 📊 Empirical Results (RTX 5090 — Single GPU)
+
+### 1.7B Comparison Grid — Training + Inference Throughput
+
+All configs trained on 50 FineWeb examples, 10 epochs. Full reproduce guide in [`docs/reproduce.md`](docs/reproduce.md).
+
+| Config | Script | Trainable Params | Inference tok/s (8 steps, 128 tok) |
+|--------|--------|-----------------|-----------------------------------|
+| Random Masking (baseline) | `train_torch.py` | 1.7B | 1131 |
+| + Repr-Align (4 layers) | `train_torch.py` | 1.7B | 1147 |
+| + Repr-Align (all 28 layers) | `train_torch.py` | 1.7B | **1178** |
+| + Repr-Align + d3LLM Trajectory | `train_torch.py` | 1.7B | **1183** |
+| LDLM (Perceiver+DiT) | `train_ldlm.py` | ~200M | 951 |
+| VFM (noise adapter) | `train_vfm.py` | ~100M | 923 |
+
+**Key takeaway**: All Repr-Align paths have identical inference speed (same architecture). The benefit comes from **fewer denoising steps** needed after training — not from faster per-step execution.
+
+### 27B QLoRA Inference Throughput
+
+| Steps | tok/s (128 new tokens) | Total time |
+|-------|----------------------|------------|
+| 8 | **115** | 1.1s |
+| 16 | **57** | 2.2s |
+| 32 | **29** | 4.4s |
+| 64 | **14** | 8.9s |
+| 128 | **7** | 17.9s |
+
+Per-step cost: **~138ms** (model-bound, 27B NF4 QLoRA on RTX 5090).
+
+All metrics logged to [wandb.ai/snoozie/open-dllm-27b](https://wandb.ai/snoozie/open-dllm-27b) and [wandb.ai/snoozie/open-dllm-compare](https://wandb.ai/snoozie/open-dllm-compare).
+
+---
+
 ## 🔎 Transparency Comparison of Diffusion LLM Releases
 
 | Project                                                                 | Data | Training Code | Inference | Evaluation | Weights |

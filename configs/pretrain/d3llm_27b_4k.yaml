@@ -1,0 +1,68 @@
+# d3LLM 27B QLoRA — 1000 samples, seq_len=4096, no repr-align
+# Trajectories generating concurrently on GPU 0; starts pure MDM then adds traj guidance.
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+data:
+  train_path: /run/media/johndpope/12TB/open_dllm/ldlm_data/data_smoke_1000.jsonl
+  max_seq_len: 4096
+  train_size: 1000
+  eval_size: 50
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /run/media/johndpope/12TB/open_dllm/checkpoints/d3llm_27b_4k
+  save_hf_weights: false
+  save_optimizer_state: false
+  save_epochs: 0
+  save_steps: 200
+  eval_every: 200
+  auto_resume: false
+  num_train_epochs: 5
+  max_steps: 1000
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 2e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+  repr_align_wt: 0.0   # no repr-align — anchor cache is at seq_len=1024
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  init_device: cuda
+  empty_cache_steps: 10
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-4k-mdm

@@ -100,13 +100,30 @@ def _remap_vl_weights_into_lm_model(
     named_mods = dict(model.named_modules())
     named_params = dict(model.named_parameters())
 
+    # Build lookup for VL fused in_proj_qkv → split q/k/v
+    # VL model stores: model.language_model.layers.N.linear_attn.in_proj_qkv.weight [q_dim+k_dim+v_dim, hidden]
+    # Veomni model expects: model.layers.N.self_attn.{q_proj, k_proj, v_proj}.weight
+    vl_qkv_shards: dict = {}  # vl_key → (shard_file, split_info)
+    for vl_key, shard_file in weight_map.items():
+        # Match layers.N.linear_attn.in_proj_qkv.weight
+        if ".linear_attn.in_proj_qkv.weight" in vl_key:
+            layer_str = vl_key.split(".layers.")[1].split(".")[0]
+            veomni_layer_prefix = f"model.layers.{layer_str}.self_attn"
+            vl_qkv_shards[vl_key] = (shard_file, veomni_layer_prefix)
+
     # Map each model param to the shard that holds its VL-key counterpart
     shard_to_entries: dict = {}
+    fused_qkv_entries: dict = {}  # shard_file → [(vl_key, veomni_layer_prefix)]
+
     for pname in named_params:
         vl_key = to_vl_key(pname)
         if vl_key in weight_map:
             fname = weight_map[vl_key]
             shard_to_entries.setdefault(fname, []).append((pname, vl_key))
+
+    # Add fused QKV split entries
+    for vl_key, (shard_file, veomni_prefix) in vl_qkv_shards.items():
+        fused_qkv_entries.setdefault(shard_file, []).append((vl_key, veomni_prefix))
 
     try:
         import bitsandbytes as bnb
@@ -163,10 +180,69 @@ def _remap_vl_weights_into_lm_model(
     total = len(named_params)
     print(f"[qlorafy] VL remap: loaded {n_loaded}/{total} params from {model_path}")
 
+    # Split fused in_proj_qkv → q_proj + k_proj + v_proj for GatedDeltaNet layers
+    n_split = 0
+    for fname, entries in sorted(fused_qkv_entries.items()):
+        shard_path = os.path.join(model_path, fname)
+        with safe_open(shard_path, framework="pt", device="cpu") as sf:
+            for vl_key, veomni_prefix in entries:
+                if vl_key not in sf.keys():
+                    continue
+                fused = sf.get_tensor(vl_key)  # [q_dim + k_dim + v_dim, hidden]
+
+                # Get target projection sizes from the veomni model
+                q_pname = f"{veomni_prefix}.q_proj.weight"
+                k_pname = f"{veomni_prefix}.k_proj.weight"
+                v_pname = f"{veomni_prefix}.v_proj.weight"
+
+                q_param = named_params.get(q_pname)
+                k_param = named_params.get(k_pname)
+                v_param = named_params.get(v_pname)
+
+                if q_param is None or k_param is None or v_param is None:
+                    continue
+
+                q_dim = q_param.shape[0]
+                k_dim = k_param.shape[0]
+                v_dim = v_param.shape[0]
+
+                # Split: first q_dim rows → q, next k_dim → k, rest → v
+                q_w, k_w, v_w = fused.split([q_dim, k_dim, v_dim], dim=0)
+
+                for pname, weight in [(q_pname, q_w), (k_pname, k_w), (v_pname, v_w)]:
+                    param = named_params[pname]
+                    is_meta = param.device.type == "meta"
+                    dest = target_device if (is_meta and target_device) else str(param.device)
+
+                    parent_name = pname[: -len(".weight")]
+                    parent = named_mods.get(parent_name)
+
+                    if has_bnb and isinstance(parent, bnb.nn.Linear4bit):
+                        new_w = bnb.nn.Params4bit(
+                            weight.to(torch.bfloat16),
+                            requires_grad=False,
+                            quant_type="nf4",
+                        ).to(dest)
+                        parent.weight = new_w
+                    elif is_meta and has_set_module:
+                        set_module_tensor_to_device(model, pname, dest, value=weight.to(torch.bfloat16))
+                    else:
+                        try:
+                            param.data.copy_(weight.to(dtype=param.dtype, device=param.device))
+                        except Exception:
+                            pass
+                    n_split += 1
+
+    if n_split > 0:
+        print(f"[qlorafy] Split {n_split} fused QKV projections for GatedDeltaNet layers")
+
+    total = len(named_params)
+    print(f"[qlorafy] VL remap: loaded {n_loaded}/{total} params from {model_path}")
+
     if target_device:
-        # Materialise any remaining meta tensors (e.g. GatedDeltaNet params whose VL keys
-        # use a different fused layout — in_proj_qkv vs split q/k/v — so they can't be
-        # directly mapped). Initialise with small random values so forward passes work.
+        # Materialise any remaining meta tensors (e.g. GatedDeltaNet gate_proj / beta_proj
+        # whose VL equivalents use a different gating architecture).
+        # Zero-init gating params so sigmoid(0) ≈ 0.5 and beta ≈ 0 (stable defaults).
         still_meta = [(n, p) for n, p in model.named_parameters() if p.device.type == "meta"]
         if still_meta:
             print(f"[qlorafy] Initialising {len(still_meta)} unmapped meta params on {target_device}")
@@ -176,9 +252,15 @@ def _remap_vl_weights_into_lm_model(
                 child_attr = pname.rsplit(".", 1)[-1] if "." in pname else pname
                 parent = meta_mods.get(parent_name, model)
                 shape = param.shape  # meta tensors retain shape info
+                # Zero-init gate/beta projections for stable defaults
+                # (sigmoid(0) = 0.5, raw_beta(0) ≈ 0 → mostly retain old state)
+                is_gate_or_beta = "gate_proj" in pname or "beta_proj" in pname
                 if has_bnb and isinstance(parent, bnb.nn.Linear4bit) and child_attr == "weight":
-                    rand_data = torch.randn(shape, dtype=torch.bfloat16) * 0.02
-                    new_w = bnb.nn.Params4bit(rand_data, requires_grad=False, quant_type="nf4").to(target_device)
+                    if is_gate_or_beta:
+                        init_data = torch.zeros(shape, dtype=torch.bfloat16)
+                    else:
+                        init_data = torch.randn(shape, dtype=torch.bfloat16) * 0.02
+                    new_w = bnb.nn.Params4bit(init_data, requires_grad=False, quant_type="nf4").to(target_device)
                     parent.weight = new_w
                 elif has_set_module:
                     tgt_dtype = torch.bfloat16 if param.dtype in (torch.float16, torch.bfloat16) else torch.float32

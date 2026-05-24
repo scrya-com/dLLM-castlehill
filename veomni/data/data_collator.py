@@ -152,19 +152,21 @@ class DataCollatorWithPositionIDsMasking(DataCollator):
     - left_mask: positions to the left of masked tokens for representation alignment
     - mask_ratio: masking ratio for loss weighting
     """
-    def __init__(self, mask_token_id: int):
+    def __init__(self, mask_token_id: int, min_mask_ratio: float = 0.002, max_mask_ratio: float = 0.998):
         self.mask_token_id = mask_token_id
+        self.min_mask_ratio = min_mask_ratio
+        self.max_mask_ratio = max_mask_ratio
 
     def _random_masking(self, input_ids: "torch.Tensor") -> tuple:
         """
         Randomly mask input_ids and generate alignment masks.
-        
+
         Returns:
             masked_input_ids: input_ids with masked tokens
             mask_ratio: ratio of masked tokens
             left_mask: mask indicating positions to the left of masked tokens
         """
-        mask_ratio = torch.rand(1, device=input_ids.device).clamp(1/500, 1-1/500)
+        mask_ratio = torch.rand(1, device=input_ids.device).clamp(self.min_mask_ratio, self.max_mask_ratio)
         mask_indices = torch.rand_like(input_ids.float()) < mask_ratio
         
         # Create left_mask: positions to the left of masked tokens

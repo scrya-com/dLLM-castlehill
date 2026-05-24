@@ -474,6 +474,62 @@ def build_apollo_param_groups(
     return param_groups, lowrank_params, regular_params
 
 
+def build_llrd_param_groups(
+    model: nn.Module,
+    base_lr: float,
+    decay: float = 0.85,
+    weight_decay: float = 0.01,
+) -> List[Dict]:
+    """Layer-wise LR decay for LoRA adapters.
+
+    Groups trainable parameters by transformer layer index extracted from
+    the parameter name. Non-layer params (embeddings, norms) get base_lr.
+    Layer i gets: base_lr * decay^(1 - i/num_layers)
+
+    Works with PEFT LoRA naming:
+      base_model.model.model.layers.{i}.self_attn.q_proj.lora_A.weight
+    """
+    import re
+    layer_pattern = re.compile(r'(?:model\.)?layers?\.(\d+)\.')
+
+    # Pass 1: find total layer count
+    max_layer = -1
+    for name, _ in model.named_parameters():
+        m = layer_pattern.search(name)
+        if m:
+            max_layer = max(max_layer, int(m.group(1)))
+    num_layers = max_layer + 1 if max_layer >= 0 else 1
+
+    # Pass 2: group by layer
+    groups: Dict[int, List] = {}
+    no_layer: List = []
+    seen_ids = set()
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if id(p) in seen_ids:
+            continue
+        seen_ids.add(id(p))
+        m = layer_pattern.search(name)
+        if m:
+            idx = int(m.group(1))
+            groups.setdefault(idx, []).append(p)
+        else:
+            no_layer.append(p)
+
+    param_groups = []
+    for layer_idx in sorted(groups.keys()):
+        lr = base_lr * (decay ** (1.0 - layer_idx / max(num_layers - 1, 1)))
+        param_groups.append({"params": groups[layer_idx], "lr": lr, "weight_decay": weight_decay})
+    if no_layer:
+        param_groups.append({"params": no_layer, "lr": base_lr, "weight_decay": weight_decay})
+
+    total = sum(p.numel() for g in param_groups for p in g["params"])
+    print(f"[LLRD] {len(groups)} layer groups, decay={decay}, lr range "
+          f"[{base_lr * decay:.2e}, {base_lr:.2e}], {total:,} trainable params")
+    return param_groups
+
+
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,

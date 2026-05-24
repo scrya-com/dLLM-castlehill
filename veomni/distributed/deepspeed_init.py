@@ -103,7 +103,7 @@ def init_deepspeed_engine(
     # Monkey-patch pin_memory to no-op during engine init to avoid
     # CUDA OOM when pinning the 27 GB fp16 flat buffer on a small GPU.
     _orig_pin_memory = get_accelerator().pin_memory
-    get_accelerator().pin_memory = lambda x: x
+    get_accelerator().pin_memory = lambda x, **kwargs: x
 
     engine, ds_optimizer, _, ds_lr_scheduler = deepspeed.initialize(
         model=model,

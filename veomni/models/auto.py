@@ -61,6 +61,9 @@ def build_foundation_model(
     align_layers: Optional[str] = None,
     repr_align_sub_sample_ratio: float = 1.0,
     repr_align_num_sample_layers: Optional[int] = None,
+    repr_align_layer_exp: float = 0.0,
+    repr_align_contrastive: bool = False,
+    repr_align_contrastive_temp: float = 0.07,
     enable_nvfp4_qat: bool = False,
     enable_qlorafy: bool = False,
     qlorafy_config: Optional[Dict] = None,
@@ -79,9 +82,25 @@ def build_foundation_model(
 
     # ── QLoRA path: 4-bit NF4 + LoRA adapters (bypasses normal loading) ──
     if enable_qlorafy:
+        _qc = dict(qlorafy_config or {})
+        if _qc.pop("use_hf_native", False):
+            from .hf_mdm_qlora import build_hf_mdm_qlora
+
+            logger.info_rank0("Loading model via HF-native MDM QLoRA wrapper (Option A)")
+            return build_hf_mdm_qlora(
+                weights_path or config_path,
+                qlorafy_config=_qc,
+                device=_qc.get("device", "cuda:0"),
+                align_layers=align_layers,
+                anchor_cache_dir=anchor_cache_dir,
+                repr_align_sub_sample_ratio=repr_align_sub_sample_ratio,
+                repr_align_layer_exp=repr_align_layer_exp,
+                repr_align_contrastive=repr_align_contrastive,
+                repr_align_contrastive_temp=repr_align_contrastive_temp,
+            )
         from .qlorafy import QLoRAConfig, build_qlorafied_model
 
-        qcfg = QLoRAConfig(**(qlorafy_config or {}))
+        qcfg = QLoRAConfig(**_qc)
         logger.info_rank0(
             f"Loading model via QLoRA: NF4 base + LoRA (r={qcfg.r}, "
             f"targets={'/'.join(qcfg.target_modules or [])})"
@@ -108,6 +127,9 @@ def build_foundation_model(
 
         if repr_align_sub_sample_ratio < 1.0:
             _peft_base.repr_align_sub_sample_ratio = float(repr_align_sub_sample_ratio)
+
+        if repr_align_layer_exp != 0.0:
+            setattr(_peft_base, "repr_align_layer_exp", float(repr_align_layer_exp))
 
         if anchor_cache_dir:
             from .cached_teacher import CachedTeacher
@@ -167,6 +189,9 @@ def build_foundation_model(
         align_layers=align_layers,
         repr_align_sub_sample_ratio=repr_align_sub_sample_ratio,
         repr_align_num_sample_layers=repr_align_num_sample_layers,
+        repr_align_layer_exp=repr_align_layer_exp,
+        repr_align_contrastive=repr_align_contrastive,
+        repr_align_contrastive_temp=repr_align_contrastive_temp,
     )
 
     if use_tropical:
