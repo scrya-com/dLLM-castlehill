@@ -85,6 +85,7 @@ All configs trained on 50 FineWeb examples, 10 epochs. Full reproduce guide in [
 | + Repr-Align + d3LLM Trajectory | `train_torch.py` | 1.7B | **1183** |
 | LDLM (Perceiver+DiT) | `train_ldlm.py` | ~200M | 951 |
 | VFM (noise adapter) | `train_vfm.py` | ~100M | 923 |
+| Cola DLM (VAE+DiT head) | `train_torch.py` | 1.7B + ~50M | TBD |
 
 **Key takeaway**: All Repr-Align paths have identical inference speed (same architecture). The benefit comes from **fewer denoising steps** needed after training — not from faster per-step execution.
 
@@ -101,6 +102,73 @@ All configs trained on 50 FineWeb examples, 10 epochs. Full reproduce guide in [
 Per-step cost: **~138ms** (model-bound, 27B NF4 QLoRA on RTX 5090).
 
 All metrics logged to [wandb.ai/snoozie/open-dllm-27b](https://wandb.ai/snoozie/open-dllm-27b) and [wandb.ai/snoozie/open-dllm-compare](https://wandb.ai/snoozie/open-dllm-compare).
+
+---
+
+## 🗺️ File Map
+
+```
+Open-dLLM/
+├── tasks/                          # Training entry points
+│   ├── train_torch.py             # Standard / Repr-Align / Cola DLM training
+│   ├── train_ldlm.py              # LDLM (Perceiver encoder/decoder + DiT head)
+│   ├── benchmark_ldlm.py          # 27B LDLM inference benchmark
+│   ├── benchmark_ldlm_35b.py      # 35B-A3B LDLM inference benchmark
+│   ├── infer.py                   # Generation entry point
+│   └── sample.py                  # Interactive sampling
+│
+├── configs/pretrain/              # Training configs (YAML)
+│   ├── compare_50x_no_align.yaml  # Baseline: random masking
+│   ├── compare_50x_with_align.yaml# Repr-Align (4 layers)
+│   ├── compare_50x_with_align_all_layers.yaml  # Repr-Align (all layers)
+│   ├── compare_50x_with_trajectory.yaml  # Repr-Align + d3LLM trajectories
+│   ├── compare_50x_ldlm.yaml      # LDLM comparison
+│   ├── compare_50x_vfm.yaml       # VFM comparison
+│   ├── compare_50x_cola.yaml      # Cola DLM comparison
+│   ├── qwen3_6_27b_repr_align_100k.yaml  # 27B Repr-Align (100K, single 5090)
+│   ├── qwen3_6_27b_qlora_repr_align.yaml # 27B QLoRA Repr-Align
+│   ├── d3llm_27b_100_traj.yaml    # 27B d3LLM + trajectories (100 ex)
+│   └── d3llm_27b_4k.yaml          # 27B d3LLM, seq_len=4096
+│
+├── veomni/
+│   ├── models/
+│   │   ├── transformers/          # Model implementations
+│   │   │   ├── qwen2/             # Qwen2 / Open-dCoder
+│   │   │   ├── qwen3/             # Qwen3
+│   │   │   ├── qwen3_5/           # Qwen3.5/3.6 (Gated DeltaNet)
+│   │   │   └── qwen3_5_moe/       # Qwen3.5/3.6 MoE (256 experts)
+│   │   ├── ldlm/                  # LDLM autoencoder + diffusion head
+│   │   ├── hf_mdm_qlora.py        # HF-native QLoRA + MDM wrapper
+│   │   ├── cached_teacher.py      # CachedTeacher for Repr-Align
+│   │   └── auto.py                # Model dispatcher
+│   ├── distributed/               # Parallel strategies
+│   │   ├── deepspeed_init.py      # DeepSpeed ZeRO-3 + NVMe offload
+│   │   ├── moe/                   # Expert parallelism
+│   │   └── sequence_parallel/     # Ulysses sequence parallelism
+│   └── ops/
+│       ├── trajectory_extractor.py # d3LLM trajectory precomputation
+│       └── loss.py                # Fused cross-entropy
+│
+├── scripts/
+│   ├── benchmark_inference.py     # 27B inference throughput sweep
+│   ├── benchmark_inference_post.py# Post-training benchmark (wandb)
+│   ├── compare_step_quality.py    # Step count vs output quality
+│   ├── precompute_anchor.py       # Repr-Align teacher cache
+│   ├── precompute_trajectories.py # d3LLM trajectories (entropy + LR modes)
+│   └── run_comparison.sh          # Orchestrate full 7-config comparison
+│
+├── docs/
+│   ├── reproduce.md               # Full reproduce guide (this commit)
+│   ├── representation_alignment.md # Repr-Align tutorial
+│   ├── cloud_training.md          # Vast.ai setup guide
+│   ├── ldlm.md                    # LDLM architecture, training recipe, benchmarks
+│   ├── multi_block_decoder.md     # Multi-block decoder API + status
+│   └── hardware.md                # System requirements, hardware investigation
+│
+└── eval/
+    ├── eval_completion/           # HumanEval, MBPP
+    └── eval_infill/               # Code infilling
+```
 
 ---
 
@@ -612,279 +680,111 @@ train:
 
 ## ⚡ Multi-Block Decoder (d3LLM Inference)
 
-The **multi-block decoder** implements d3LLM's pipelined parallel decoding ([ICML 2026](https://arxiv.org/abs/2601.07568)) — the inference-side counterpart to trajectory-guided masking. Instead of denoising the full sequence in one block, it divides the generation region into blocks and processes them in a pipeline, achieving up to **~5× speedup over AR decoding**.
+Pipelined parallel decoding ([ICML 2026](https://arxiv.org/abs/2601.07568)) — inference-side counterpart to trajectory-guided masking. Up to **~5× speedup over AR decoding** via block-causal attention, entropy-thresholded token selection, and pipelined block progression.
 
-### How it works
+See [`docs/multi_block_decoder.md`](docs/multi_block_decoder.md) for full API, usage, and current status (KV-cache 🔴 blocked, trajectory-aware 📝 future).
 
-1. **Block-causal attention**: Each block attends to the prompt + all previous blocks + itself (bidirectional within block). Implemented in `create_block_causal_mask()`.
-2. **Block state machine**: Tracks each block's progress through 4 states: Inactive → Activated → Fully-Activated → Completed.
-   - `block_add_threshold` (0.5): new block added when last block is ≥50% decoded
-   - `decoded_token_threshold` (0.5): next block activated when previous is ≥50% decoded
-3. **Entropy-thresholded decoding**: Tokens with entropy < `entropy_threshold` get decoded each step. A forced-progress mechanism ensures at least 1 token per fully-activated block per step.
-4. **EOS early stopping**: Detects EOS and immediately marks all subsequent tokens as EOS (not mask), updating block states accordingly.
+## LDLM — Latent Diffusion Language Model
 
-### Code
+A Perceiver-based latent diffusion approach ([arXiv:2605.07933](https://arxiv.org/abs/2605.07933)) that jointly trains a latent encoder, diffusion model, and decoder on top of a frozen pre-trained LM.
 
-```
-veomni/models/transformers/qwen2/multi_block_generation.py
-```
-
-Key components:
-
-| Component | Description |
-|-----------|-------------|
-| `MultiBlockDecoderConfig` | Config with `block_size`, `entropy_threshold`, `block_add_threshold`, `decoded_token_threshold`, `early_stop` |
-| `MultiBlockDecoderMixin` | Mixin class with `generate_multi_block()` entry point |
-| `create_block_causal_mask()` | Full-sequence block-causal attention mask |
-| `_sample_multi_block()` | Pipelined parallel decoding loop |
-
-Mixed into:
-- `Qwen2ForCausalLM`
-- `Qwen3ForCausalLM`
-- `Qwen3_5ForCausalLM`
-- `Qwen3_5MoeForCausalLM`
-
-### Usage
-
-```python
-from veomni.models.transformers.qwen2.multi_block_generation import MultiBlockDecoderConfig
-
-gen_config = MultiBlockDecoderConfig(
-    mask_token_id=MASK_ID,
-    steps=64,
-    block_size=32,
-    entropy_threshold=0.9,
-    max_length=prompt_len + max_new_tokens,
-    temperature=0.0,
-    early_stop=True,
-    eos_token_id=tokenizer.eos_token_id,
-)
-result = model.generate_multi_block(input_ids, gen_config)
-```
-
-### Current status
-
-| Feature | Status |
-|---------|--------|
-| Pipelined parallel decoding | ✅ Working |
-| Block-causal attention mask | ✅ Working |
-| Entropy-thresholded token selection | ✅ Working |
-| Forced progress (≥1 token/block/step) | ✅ Working |
-| EOS early stopping | ✅ Working |
-| KV-cache optimization | 🔴 Blocked (HF cache incompatible with block-causal masks) |
-| Trajectory-aware decoding | 📝 Future |
+See [`docs/ldlm.md`](docs/ldlm.md) for architecture comparison table (paper vs 35B-A3B vs 27B), training recipe (MSE loss, warmup, adaptive timestep sampling), inference benchmarks (up to 6,500 tok/s on 35B-A3B), and step-by-step training instructions.
 
 ---
 
-Open-dLLM supports **LDLM** (Latent Diffusion Language Model, [arXiv:2605.07933](https://arxiv.org/abs/2605.07933)) — a Perceiver-based latent diffusion approach that jointly trains a latent encoder, diffusion model, and decoder on top of a frozen pre-trained LM. The key insight: reshaping the frozen encoder's hidden states into a diffusion-friendly latent space via a trainable Perceiver, yielding latents that are easy to both denoise and decode into tokens.
+## 🧭 Flywheel — Research Synthesis & Directions
 
-#### Architecture Comparison: Paper vs. Our Implementation
+### Dependency Graph
 
-The paper trains on GPT-2 small (dim=768) with 4–64× A100s. We adapt LDLM to Qwen3.6 models (dim=2048–5120) on 2 consumer GPUs, requiring significant depth compression.
-
-| Component | Paper (GPT-2, dim=768) | Ours 35B-A3B (dim=2048) | Ours 27B (dim=5120) |
-|-----------|------------------------|------------------------|---------------------|
-| Frozen encoder | GPT-2 small (124M), layer -3 | Qwen3.6-35B-A3B MoE (3B active), layer -3 | Qwen3.6-27B dense, layer -3 |
-| Latent encoder (Perceiver) | 6 layers, 12 heads (~50M) | **4 layers**, 8 heads | **4 layers**, 8 heads |
-| Latent decoder (Perceiver) | 6 layers, 12 heads (~50M) | **4 layers**, 8 heads | **4 layers**, 8 heads |
-| Token decoder (Transformer) | 3 layers (~66M) | **2 layers** | **2 layers** |
-| Diffusion model (DiT) | 12 layers, 12 heads (~132M) | **3 layers**, 8 heads | **4 layers**, 8 heads |
-| Latent dim | 768 (matches GPT-2) | **2048** (matches Qwen3.6-35B) | **5120** (matches Qwen3.6-27B) |
-| Trainable params (total) | ~300M | ~1.39B | ~6.75B |
-| σ_dec | 3.0 | 3.0 | 3.0 |
-| Self-conditioning | 50% | 50% | 50% |
-| Warmup schedule | Sigmoid (k=10, c=0.8) | Sigmoid (k=10, c=0.8) | Sigmoid (k=10, c=0.8) |
-| Noise schedule | Tangent (d=3) | Tangent (d=3) | Tangent (d=3) |
-
-> **Key differences**: Our latent dim is 2.7–6.7× larger than the paper's (dictated by the Qwen3.6 encoder's hidden size), but our Perceiver/DiT depths are 2–4× shallower (dictated by GPU memory). The paper uses ~300M trainable params on 4–64× A100s; we use 1.39B–6.75B on 2 consumer GPUs. The larger latent dim means each layer is more expensive (parameters scale as dim²), but fewer layers partially compensates. The `latent_dim` parameter in `LDLMAutoencoder` could be set to a smaller value (e.g., 768) to add a projection bottleneck — this is not yet explored.
-
-#### Training Recipe (from the paper)
-
-The paper identifies 4 critical components for successful joint training (ablations show each substantially impacts generation quality):
-
-1. **MSE decoder loss** (L_h, Eq. 2): MSE between hidden states h and decoder output h_hat, with decoder-input noise σ_dec·ε. MSE is preferred over CE because it doesn't force latents to be well-separated — it allows nearby latents to map to averaged hidden states, producing a smoother latent geometry for diffusion.
-
-2. **Diffusion-to-encoder warmup** (Eq. 29-30): At training start, L_diff and L_h pull the latent space in opposite directions. The warmup multiplies L_diff gradients to the encoder by γ(s), which increases from ~0 to 1 via a sigmoid schedule over S_wu steps. The encoder first learns to reconstruct, then the diffusion objective gradually shapes the latent space.
-
-3. **Adaptive timestep sampling** (Eq. 5): Dynamically adjusts the noise schedule so that the denoising loss grows linearly with the sampled timestep — all timesteps contribute equally to training. A running EMA of loss per timestep bin is maintained and used to compute sampling probabilities proportional to dL/du.
-
-4. **Decoder-input noise** (σ_dec = 3.0): Gaussian noise injected into the decoder input during training (only training, not inference). Three roles: (a) prevents unused latent dimensions from consuming capacity, (b) makes the decoder robust to diffusion model errors, (c) normalizes input variance across timesteps for better diffusion parameterization.
-
-**Total objective**: `L = L_diff · γ(s) + L_h + L_w`, where L_w is the token CE loss with stop-gradient on h_hat (so it doesn't affect the latent encoder).
-
-#### Recreating the Benchmarks
-
-```bash
-# 1. Install dependencies (see Install section above)
-pip install -e .
-
-# 2. Download the encoder model (only needed for training; benchmark downloads automatically)
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen3.6-35B-A3B')   # ~22GB download
-# snapshot_download('Qwen/Qwen3.6-27B')     # ~54GB download
-"
-
-# 3. Run inference benchmark on a single GPU
-CUDA_VISIBLE_DEVICES=0 python tasks/benchmark_ldlm_35b.py    # Qwen3.6-35B-A3B
-CUDA_VISIBLE_DEVICES=0 python tasks/benchmark_ldlm.py        # Qwen3.6-27B
+```
+┌──────────────────────────────────┐
+│  AR Foundation Models            │
+│  (Qwen2 / Qwen3 / Qwen3.5       │
+│   Gated DeltaNet / MoE)         │
+└───────────┬──────────────────────┘
+            │ frozen anchor
+            ▼
+┌──────────────────────────────────┐
+│  CachedTeacher                   │
+│  precompute_anchor.py            │
+│  4-64 layers, up to 160K ctx    │
+│  (2.7 TB for 100K @ 4 layers)   │
+└────┬──────────┬──────────┬───────┘
+     │          │          │
+     ▼          ▼          ▼
+┌──────────┐ ┌──────────┐ ┌──────────┐
+│ Repr-    │ │ LDLM     │ │ VFM      │
+│ Align    │ │ train_   │ │ train_   │
+│ train_   │ │ ldlm.py  │ │ vfm.py   │
+│ torch.py │ │ 1.39-    │ │ ~100M    │
+│ 0 new    │ │ 6.75B    │ │ adapter  │
+│ params   │ │ new      │ │          │
+│ (1147    │ │ params   │ │ (923     │
+│  tok/s)  │ │ (951     │ │  tok/s)  │
+│          │ │  tok/s)  │ │          │
+└────┬─────┘ └────┬─────┘ └────┬─────┘
+     │            │            │
+     ├────────────┼────────────┤
+     │            │            │
+     ▼            ▼            ▼
+┌─────────────────────────────────────┐
+│  d3LLM Trajectory Guidance          │
+│  trajectory_extractor.py            │
+│  (entropy + LR modes, 16-256 steps) │
+│  1.7B: +4.6% tok/s (1183)          │
+└────────────────┬────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────┐
+│  Inference: mdm_generate            │
+│  + multi_block_generation.py        │
+│  1.7B: 1131-1183 tok/s (8 steps)   │
+│  27B: 115 tok/s (8 steps, NF4)     │
+│  Per-step: ~138ms (27B NF4 5090) │
+└─────────────────────────────────────┘
 ```
 
-> **Hardware used**: NVIDIA RTX 5090 (32GB VRAM), 96GB system RAM, Python 3.11, PyTorch 2.12+, CUDA 12.9.
+### Flywheel Node
 
-#### Inference Throughput (Qwen3.6 LDLM, untrained, RTX 5090 32GB)
+**Parent Nodes**: Repr-Align paper, d3LLM ICML 2026, LDLM paper, Cola DLM
 
-| Model | Dim | Trainable Params | Diffusion Steps | Throughput |
-|-------|-----|-------------------|-----------------|------------|
-| Qwen3.6-35B-A3B | 2048 | 1.39B | 10 | **3,238 tok/s** |
-| Qwen3.6-35B-A3B | 2048 | 1.39B | 4 | **~6,500 tok/s** |
-| Qwen3.6-27B | 5120 | 6.75B | 10 | **745 tok/s** |
-| Qwen3.6-27B | 5120 | 6.75B | 4 | **~1,500 tok/s** |
+**New Node Type**: Synthesis — Comparison Grid + Infrastructure Maturation
 
-> For comparison, autoregressive generation on the same hardware achieves ~30-50 tok/s for a 27B model.
+**Claim**: The systematic comparison grid (7 configs, 50 examples, wandb-logged) establishes which diffusion path wins for given hardware/quality budgets. Repr-Align dominates for speed+quality; d3LLM trajectories add marginal (~4.6%) inference speedup on 1.7B; LDLM/VFM trade throughput for architectural flexibility. The chunked CE fix unlocks 4096-seq-len training.
 
-#### Assumptions & Caveats
+**Validation Plan**: Run the full comparison at 27B scale (blocked on compute — see L2).
 
-- **Untrained weights**: These benchmarks use randomly initialized Perceiver/decoder/diffusion-head weights. A trained model will have identical throughput but produce coherent output. Quality benchmarks (perplexity, HumanEval) will be published after training completes.
-- **No encoder in the loop**: The frozen Qwen3.6 encoder is **not used during generation** — it's only needed for training (to produce latent targets). At inference, the diffusion head denoises random noise, then the Perceiver decoder maps latents to tokens. The encoder is deleted before benchmarking (`del autoencoder.token_encoder`).
-- **Seq len = 64**: The benchmark uses a short sequence length (64 tokens). Longer sequences will reduce throughput proportionally. The 4-step throughput numbers are linear extrapolations from the 10-step measurements.
-- **Batch size = 1**: Single-sequence generation only. Throughput scales near-linearly with batch size for the 35B-A3B (dim=2048 fits easily in VRAM), less so for the 27B (dim=5120).
-- **CPU RAM requirement**: While the encoder is not used at inference, it **must** fit in system RAM during training (~54GB for 27B, ~22GB for 35B-A3B in bf16). The Qwen3.6 architecture uses Triton kernels (flash-linear-attention) that cannot run on CPU, so the encoder forward pass during training requires GPU offloading — a multi-GPU setup is recommended for training.
-- **Qwen3.6 requires `trust_remote_code=True`**: The model uses custom architecture code (`Qwen3_5ForConditionalGeneration`) that is not in standard transformers releases. Ensure your `transformers` version supports it (>=4.54).
-- **35B-A3B is MoE**: Only 3B of its 35B parameters are active per token, giving it a much smaller hidden dim (2048) than the 27B dense model (5120). This is why the LDLM trainable components are 5x smaller and 4x faster.
-- **Not an apples-to-apples comparison with AR models**: The diffusion model generates all tokens in parallel across N diffusion steps, while AR generates one token at a time. The "tok/s" metric favors diffusion for short sequences but does not reflect output quality, which depends on training convergence.
-- **Architecture depth vs. paper**: Our Perceiver/DiT depths are 2–4× shallower than the paper's (4 vs. 6 Perceiver layers, 3–4 vs. 12 DiT layers). This is a memory constraint, not a design choice. The latent dim (2048/5120) is 2.7–6.7× larger than the paper's 768, meaning each layer has ~7–44× more parameters. Future work could add a projection bottleneck (`latent_dim=768`) to reduce this and enable deeper architectures.
+### Directions — Ranked by Expected Leverage
 
-#### How to Train a Qwen3.6 LDLM
+| # | Direction | Target Metric | Status | Rationale |
+|---|-----------|--------------|--------|-----------|
+| L1 | **Reduce per-step cost** (KV-cache, fused kernels) | ≥2× tok/s (27B: 115→230) | 🟢 active | ~138ms/step is model-bound; KV-cache or fused DeltaNet attention could halve it. Highest single-lever gain. |
+| L2 | **27B comparison grid** (reproduce 1.7B findings at scale) | ppl ≤ 2.0, ≥0.7× baseline throughput | 🟡 blocked (compute) | The 1.7B findings need verification at 27B. Requires 2× Blackwell or cloud rental. |
+| L3 | **d3LLM trajectory training at 27B** (4K ctx, QLoRA) | ppl vs random-mask baseline | 🟢 active | Configs `d3llm_27b_4k.yaml` and `d3llm_27b_100_traj.yaml` exist. Trajectories precomputable via `precompute_trajectories.py --mode entropy --quantize 4bit`. |
+| L4 | **Chunked cross-entropy for long context** (seq_len > 2K) | Stable training at 4K+ ctx | ✅ done | Landed in `hf_mdm_qlora.py:_mdm_loss()`. Enables 4096-seq-len training without OOM. |
+| L5 | **Cola DLM training + eval** | ppl, tok/s vs Repr-Align baseline | 🟡 blocked (need results) | `configs/pretrain/compare_50x_cola.yaml` exists. Hierarchical VAE+DiT head on Repr-Align. No benchmark results yet. |
+| L6 | **Full 64-layer alignment on 27B** (verify 60× memory ratio) | Expected: 21 MB vs 1.3 GB alignment activations | 🟡 blocked (compute) | Verified on 1.7B (zero VRAM difference). Ratio calculated, not measured. Requires 27B run. |
+| L7 | **VFM training convergence** | ppl vs Repr-Align at equal step count | 🟡 blocked (need results) | `compare_50x_vfm.yaml` exists. Noise adapter approach. No convergence data yet. |
+| L8 | **Multi-block KV-cache** | Unblock multi-block path (currently blocked) | 🔴 blocked | HF cache API incompatible with block-causal masks. Requires custom cache implementation. |
 
-1. **Download the base model** (27B dense or 35B-A3B MoE):
-```bash
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen3.6-27B', local_dir='./qwen36_27b_local')
-# or for MoE:
-# snapshot_download('Qwen/Qwen3.6-35B-A3B', local_dir='./qwen36_35b_a3b_local')
-"
-```
+**Overall Confidence**: 0.75
 
-2. **Prepare training data** (e.g., FineWeb):
-```bash
-python -c "
-from datasets import load_dataset
-import json
-ds = load_dataset('HuggingFaceFW/fineweb', name='sample-10BT', split='train', streaming=True)
-with open('data.jsonl', 'w') as f:
-    for i, ex in enumerate(ds):
-        if i >= 100000: break
-        f.write(json.dumps({'text': ex['text']}) + '\n')
-"
-```
+**Weakest Link**: L2 (27B comparison grid) — all other directions are blocked until compute is available for at-scale validation. The 1.7B findings are credible but limited in scope.
 
-3. **Run the benchmark** (verify setup before training):
-```bash
-# 27B
-CUDA_VISIBLE_DEVICES=0 python tasks/benchmark_ldlm.py
-# 35B-A3B MoE
-CUDA_VISIBLE_DEVICES=0 python tasks/benchmark_ldlm_35b.py
-```
-
-4. **Start training** (single GPU):
-```bash
-# 27B — single GPU (encoder on CPU, trainable on GPU 0)
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 tasks/train_ldlm.py \
-  configs/pretrain/qwen3_6_27b_ldlm.yaml
-# 35B-A3B MoE — single GPU
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 tasks/train_ldlm.py \
-  configs/pretrain/qwen3_6_35b_a3b_ldlm.yaml
-```
-
-5. **Start training** (2 GPUs, e.g. RTX 5090 + RTX 4000):
-```bash
-# 35B-A3B MoE — frozen encoder on GPU 0, trainable components on GPU 1
-torchrun --nproc_per_node=1 tasks/train_ldlm.py \
-  configs/pretrain/qwen3_6_35b_a3b_ldlm.yaml
-```
-
-> **Note**: Use `--nproc_per_node=1` always — the script handles multi-GPU placement internally (encoder on GPU 0 via `device_map="auto"`, trainable Perceiver/diffusion head on GPU 1). Do NOT use `--nproc_per_node=2` or both processes will collide on GPU 1.
->
-> **GPU Memory**: With 2 GPUs, the frozen encoder runs on GPU 0 (~22GB VRAM for 35B-A3B, ~54GB for 27B) and trainable components run on GPU 1. With 1 GPU, the encoder stays on CPU and only trainable components use GPU VRAM. The 35B-A3B MoE variant has a smaller hidden dim (2048 vs 5120), making it significantly faster and more memory-efficient — ideal for consumer GPUs.
+**To increase confidence**: Run L3 (d3LLM 27B training) as the next active step — it uses existing configs and QLoRA fits on single 5090. Results would validate trajectory guidance at scale.
 
 ---
 
-## 💻 System Requirements
+## 💻 System Requirements & Hardware
 
-### Minimum (for 0.5B–1.7B models)
+See [`docs/hardware.md`](docs/hardware.md) for:
 
-| Component | Requirement |
-|-----------|-------------|
-| GPU | 1× GPU with ≥8GB VRAM (e.g., RTX 3060) |
-| RAM | 16 GB |
-| Storage | 50 GB free |
-| CUDA | 12.x+ |
-
-### Recommended (for 7B–27B Repr-Align)
-
-| Component | Requirement |
-|-----------|-------------|
-| GPU | 1× RTX 3090/4090/5090 (≥24GB VRAM) |
-| RAM | **192 GB** (27B ZeRO-3 with CPU offload peaks at ~170GB during init) |
-| Storage | 200 GB NVMe (for model weights + anchor cache + DS swap) |
-| CUDA | 12.9+ (for Blackwell/RTX 5090) |
-
-### Cloud alternative (for 27B+)
-
-| Provider | Instance | VRAM | Cost | Notes |
-|----------|----------|------|------|-------|
-| Lambda Labs | 8×H100 80GB | 640 GB | ~$30-50/hr | Full 27B train in <1 hr |
-| RunPod | 4×A100 80GB | 320 GB | ~$12-20/hr | Sufficient with ZeRO-3 |
-| Vast.ai | 2×A6000 48GB | 96 GB | ~$2-4/hr | Budget option, needs NVMe offload |
-
-### RAM budget for 27B Repr-Align (DeepSpeed ZeRO-3)
-
-| Component | Size | Device |
-|-----------|------|--------|
-| Model params (bf16) | ~54 GB | CPU (offloaded) |
-| Optimizer states (bf16) | ~108 GB | NVMe (offloaded) |
-| DeepSpeed buffers | ~10-20 GB | RAM |
-| **Peak during init** | **~170 GB** | RAM (before swap-out) |
-
-> **Key insight**: The bottleneck for local 27B training is **system RAM, not GPU VRAM**. DeepSpeed ZeRO-3 + NVMe offload handles the GPU side, but `deepspeed.initialize()` materializes the full model + optimizer in RAM before swapping to NVMe. 96GB RAM is insufficient; 128GB is marginal; 192GB is comfortable.
-
----
-
-## 🔬 Hardware Investigation Notes
-
-### What works
-
-- **Qwen3-1.7B Repr-Align**: Passes on single RTX 5090 with DeepSpeed ZeRO-3 + CPU offload (~4.8GB VRAM, ~15s/step). Full wandb logging. Anchor precompute takes ~30s for 1000 examples.
-- **Qwen3.6-27B anchor precompute**: Works across both GPUs (RTX 5090 + RTX 4000) with `device_map=auto` + CPU overflow. 1000 examples × 4 layers = 27GB cache in ~20 min.
-- **DeepSpeed ZeRO-3 + NVMe optimizer offload**: Successfully writes ~180GB of optimizer/param state to NVMe. The init completes; the RAM peak is the bottleneck.
-
-### What doesn't work (yet)
-
-- **27B full-layer Repr-Align on 96GB RAM**: OOM killed during `deepspeed.initialize()`. The init peak (~170GB) exceeds available RAM + swap (104GB total). Two investigation paths remain open:
-  1. **Upgrade to 192GB RAM**: Replace 2×16GB sticks with 2×64GB. Cost: ~$2,000 AUD. Should comfortably fit the init peak.
-  2. **Lazy init with `init_device: meta`**: Skip materializing params in RAM during model construction. DeepSpeed's `zero.Init` context + `remote_device="cpu"` still allocates params on CPU. A true meta-device init would defer allocation until DeepSpeed can partition + swap directly, never holding the full model in RAM. This requires changes to the weight loading path in `veomni/models/loader.py`.
-
-- **2-GPU ZeRO-3 with 96GB RAM**: Each rank holds a partition (~27GB params), totaling 54GB in RAM. Optimizer adds another ~108GB. Total exceeds RAM even before considering DeepSpeed buffers.
-
-### Hobby RAM vs Cloud H100 — cost comparison
-
-| Approach | Upfront Cost | Per-run Cost | Time for 10 steps | Notes |
-|----------|-------------|-------------|-------------------|-------|
-| **RAM upgrade** (96→192GB) | ~$2,000 AUD | $0 (electricity) | ~15-30 min | One-time, reusable for future models |
-| **Rent 8×H100** (Lambda) | $0 | ~$30-50/hr | <5 min | Faster, but per-experiment cost adds up |
-| **Rent 4×A100** (RunPod) | $0 | ~$12-20/hr | <10 min | Sweet spot for 27B |
-| **Rent 2×A6000** (Vast.ai) | $0 | ~$2-4/hr | ~20 min | Cheapest cloud option |
-
-> **Break-even**: At $2,000 AUD for RAM vs ~$30/hr for H100s, the RAM upgrade pays for itself after ~65 hours of training. If you're iterating frequently (hyperparameter sweeps, multiple models), the RAM upgrade is more economical. If you only need a few one-off runs, cloud is cheaper.
-
-### DeepSpeed NVMe offload gotchas
-
-- **`DS_SKIP_CUDA_CHECK=1`**: Required when system CUDA toolkit (13.1) doesn't match PyTorch's compiled CUDA (13.0). Without it, DeepSpeed can't compile async_io extensions needed for NVMe offload.
-- **`buffer_size`**: Must exceed the largest combined partition size. Default 100M elements is too small for 27B (622M for embed_tokens alone). Set to 2B elements: `offload["buffer_size"] = 2_000_000_000`.
-- **Pre-build async_io**: Run `DS_SKIP_CUDA_CHECK=1 python -c "import deepspeed.ops.op_builder as b; b.AsyncIOBuilder().load()"` once before training.
-- **`torch.empty` on `"nvme"` device**: DeepSpeed's `_post_init` patch in `veomni/distributed/deepspeed_init.py` must allocate on `"cpu"` not `"nvme"` — PyTorch doesn't recognize `nvme` as a device. The async_io swapper handles the NVMe transfer separately.
+- Minimum / recommended / cloud hardware specs
+- RAM budget breakdown for 27B ZeRO-3 (~170 GB peak during init)
+- Verified working setups (1.7B Repr-Align on 5090, 27B anchor precompute across 2 GPUs)
+- Known blockers (27B on 96GB RAM, 2-GPU ZeRO-3 RAM ceiling)
+- Hobby RAM vs Cloud H100 cost comparison (break-even at ~65 hrs)
+- DeepSpeed NVMe offload gotchas (buffer_size, async_io build, pin_memory patch)
 
 ---
 
