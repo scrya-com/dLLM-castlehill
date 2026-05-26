@@ -105,6 +105,91 @@ All metrics logged to [wandb.ai/snoozie/open-dllm-27b](https://wandb.ai/snoozie/
 
 ---
 
+## 🎯 d3LLM Trajectory Training (27B Qwen3.6)
+
+End-to-end recipe to train Qwen3.6-27B with entropy-based trajectory-guided masking.
+
+### 1. Get the Data
+
+Download the Qwen3.6-Plus reasoning dataset (500 examples, ~7 MB):
+
+```python
+from datasets import load_dataset
+import json
+
+ds = load_dataset("khazarai/qwen3.6-plus-high-reasoning-500x", split="train")
+with open("train.jsonl", "w") as f:
+    for i in range(len(ds)):
+        msg = ds[i]["messages"]
+        f.write(json.dumps({
+            "idx": i,
+            "prompt": msg[0]["content"],
+            "response": msg[1]["content"]
+        }) + "\n")
+```
+
+Each example has a user prompt (63-105 tokens) + a rich assistant reasoning response (2,300-4,100 tokens) — ideal for trajectory distillation.
+
+### 2. Precompute Entropy-Based Trajectories
+
+Generate the unmasking order by running the 27B model in entropy-threshold decode mode over each response:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/gen_trajectories_reasoning.py \
+    --data_path /path/to/train.jsonl \
+    --output_dir /path/to/trajectories/ \
+    --model_path /path/to/Qwen3.6-27B \
+    --num_steps 32 \
+    --max_seq_len 2048
+```
+
+Output: `trajectories.jsonl` — one entry per example with `idx`, `trajectory` (list of token-ID sequences at each decode step), and `nfe` (number of steps).
+
+Each trajectory step records which positions are still mask tokens. The collator uses these to determine training-time masking positions. Step 0 has all response tokens masked; final step has all unmasked.
+
+### 3. Train with QLoRA (Fits RTX 5090 32 GB)
+
+Use the prepared config `configs/pretrain/d3llm_27b_reasoning.yaml`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python tasks/train_torch.py configs/pretrain/d3llm_27b_reasoning.yaml
+```
+
+The config wraps Qwen3.6-27B in NF4 QLoRA (r=4) with `use_hf_native: true` for Gated DeltaNet compatibility. Trajectory-guided masking is active via `DataCollatorWithTrajectoryMasking` — every 200 steps, three wandb panels log to `wandb.ai/snoozie/open-dllm-27b`:
+
+| Panel | Key | What it shows |
+|-------|-----|---------------|
+| Trajectory ordering | `d3llm/trajectory` | Mask heatmap (rows=decode steps, cols=positions) + entropy bars |
+| Prediction quality | `d3llm/prediction` | RGB strip (green=correct, red=wrong, grey=unmasked) + confidence |
+| Training history | `d3llm/history` | Mask-ratio × CE-loss scatter + loss curves |
+
+### 4. Config reference
+
+```yaml
+# d3llm_27b_reasoning.yaml highlights
+model:
+  model_path: /path/to/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true           # Required for Gated DeltaNet
+    r: 4                          # r=4 fits better on 32 GB
+
+train:
+  max_seq_len: 512                # Reduce to 1024 if VRAM allows
+  enable_masking: true
+  repr_align_wt: 0.0              # Pure d3LLM, no repr-align
+
+  trajectory_data_path: /path/to/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.1
+  trajectory_max_mask_ratio: 0.5
+  trajectory_entropy_weight: 0.1
+```
+
+---
+
 ## 🗺️ File Map
 
 ```
@@ -253,126 +338,11 @@ python sample.py
 
 ---
 
-## 📊 Benchmarking
-
-We release a fully open-source **evaluation suite** for diffusion-based LLMs (dLLMs), covering both **standard code generation tasks** and **code infilling tasks**.
-
-Benchmarks include: **HumanEval / HumanEval+**, **MBPP / MBPP+**, **HumanEval-Infill**, **SantaCoder-FIM**.
-
 ---
 
-#### Standard Code Generation
+## 🏋️ Training Reference
 
-| Method                       | HumanEval |          | HumanEval+ |          | MBPP     |          | MBPP+    |          |
-| ---------------------------- | --------- | -------- | ---------- | -------- | -------- | -------- | -------- | -------- |
-|                              | Pass\@1   | Pass\@10 | Pass\@1    | Pass\@10 | Pass\@1  | Pass\@10 | Pass\@1  | Pass\@10 |
-| LLaDA (8B)                   | 35.4      | 50.0     | 30.5       | 43.3     | 38.8     | 53.4        | 52.6     | 69.1        |
-| Dream (7B)                   | 56.7      | 59.2     | 50.0       | 53.7     | 55.4     | 56.2        | 71.5     | 72.5        |
-| Mask DFM (1.3B)              | 9.1       | 17.6     | 7.9        | 13.4     | 6.2      | 25.0     | –        | –        |
-| Edit Flow (1.3B)             | 12.8      | 24.3     | 10.4       | 20.7     | 10.0     | 36.4     | –        | –        |
-| **Open-dCoder (0.5B, Ours)** | **20.8**  | **38.4** | **17.6**   | **35.2** | **16.7** | **38.4** | **23.9** | **53.6** |
-
-> *Despite being only 0.5B parameters, Open-dCoder competes with much larger dLLMs in code completion tasks.*
-
----
-
-#### Code Infilling
-
-| Method                                | HumanEval Infill Pass@1 | SantaCoder Exact Match |
-| ------------------------------------- | ----------------------: | ---------------------: |
-| LLaDA-8B                              |                    48.3 |                  35.1  |
-| Dream-7B                              |                    39.4 |                  40.7  |
-| DiffuCoder-7B                         |                    54.8 |                  38.8  |
-| Dream-Coder-7B                        |                    55.3 |                  40.0  |
-| **Open-dCoder (0.5B, Ours)**          |                    32.5 |                  29.6  |
-| **Open-dCoder (0.5B, Ours)** Oracle Length |               77.4 |                  56.4  |
-
-> *We followed the average fixed length evaluation setting in [DreamOn](https://hkunlp.github.io/blog/2025/dreamon/) to get the results.*
-
----
-
-## 🧪 Evaluation
-
-Install evaluation packages:
-
-```bash
-pip install -e lm-evaluation-harness human-eval-infilling
-```
-
-#### Code Completion (HumanEval, MBPP)
-
-```bash
-cd eval/eval_completion
-bash run_eval.sh
-```
-
-#### Code Infilling
-
-```bash
-cd eval/eval_infill
-bash run_eval.sh
-```
-
----
-
-## 🏋️ Pretraining
-
-* **Data**: Concise, high-quality code corpus [**FineCode**](https://huggingface.co/datasets/fredzzp/fine_code), hosted on Hugging Face.
-* **Initialization**: Following *Dream*, continued pretraining from **Qwen2.5-Coder**, adapting it into the diffusion framework.
-* **Loss**: Masked Diffusion Model (MDM) objective — masking ratios uniformly sampled from `[0,1]`, reconstructed with cross-entropy loss.
-
-### Download Data
-
-```bash
-python3 scripts/download_hf_data.py --repo_id fredzzp/fine_code --local_dir ./data
-```
-
-### Training
-
-```bash
-export TOKENIZERS_PARALLELISM=false
-NNODES=1
-NPROC_PER_NODE=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-NODE_RANK=${NODE_RANK:=0}
-MASTER_ADDR=${MASTER_ADDR:=0.0.0.0}
-MASTER_PORT=${MASTER_PORT:=12345}
-
-
-
-torchrun --nnodes=$NNODES --nproc-per-node $NPROC_PER_NODE --node-rank $NODE_RANK \
-  --master-addr=$MASTER_ADDR --master-port=$MASTER_PORT tasks/train_torch.py \
-  configs/pretrain/qwen2_5_coder_500M.yaml \
-  --data.train_path=data/data \
-  --train.ckpt_manager=dcp \
-  --train.micro_batch_size=16 \
-  --train.global_batch_size=512 \
-  --train.output_dir=logs/Qwen2.5-Coder-0.5B_mdm \
-  --train.save_steps=10000
-```
-example of multi-node training with repr alignment loss:
-```bash
-
-export TOKENIZERS_PARALLELISM=false
-
-NNODES=${NNODES:=1}
-NPROC_PER_NODE=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-NODE_RANK=${NODE_RANK:=0}
-MASTER_ADDR=${MASTER_ADDR:=0.0.0.0}
-MASTER_PORT=${MASTER_PORT:=12345}
-torchrun --nnodes=$NNODES --nproc-per-node $NPROC_PER_NODE --node-rank $NODE_RANK   --master-addr=$MASTER_ADDR --master-port=$MASTER_PORT  tasks/train_torch.py \
-configs/pretrain/qwen2_5_coder_500M.yaml --data.train_path=data/data \
---data.num_workers=0 \
---data.prefetch_factor=1 \
---train.ckpt_manager=dcp \
---train.micro_batch_size=3 \
---train.global_batch_size=240 \
---train.repr_align_wt=10.0 \
---model.model_path=Qwen/Qwen2.5-Coder-3B-Instruct \
---train.save_steps=10000 \
---train.output_dir=logs/Qwen2.5-Coder-3B-Instruct_mdm_repr_align-10
-```
-
-### QLoRA Repr-Align (27B on a single 32 GB GPU)
+### QLoRA Training (27B on a single 32 GB GPU)
 
 For 27B+ models that don't fit in GPU memory at full precision, use **QLoRA Repr-Align**: NF4 quantized base (frozen) + LoRA adapters (trainable). Fits in ~25 GB VRAM with r=32.
 
@@ -488,26 +458,17 @@ train:
 >
 > **Wandb metrics logged**: `training/loss`, `training/grad_norm`, `training/lr`, `qlora/grad_norm`, `qlora/param_norm`, `qlora/grad_to_param_ratio`, `eval/loss`, `eval/perplexity`, `flops_achieved(T)`, `flops_promised(T)`, `mfu`, `tokens_per_second`, `system/vram_allocated_gb`, `system/vram_reserved_gb`. Generation probe every 100 steps via `generation/sample`.
 
-### Uploading Checkpoints to Hugging Face
-
-```python
-from huggingface_hub import HfApi
-
-REPO_ID = "fredzzp/open-dcoder-0.5B"
-LOCAL_DIR = "logs/Qwen2.5-Coder-0.5B_mdm/checkpoints/global_step_370000/hf_ckpt"
-
-api = HfApi()
-api.create_repo(repo_id=REPO_ID, repo_type="model", exist_ok=True)
-api.upload_folder(repo_id=REPO_ID, repo_type="model", folder_path=LOCAL_DIR)
-```
-
 ---
 
-## 🔄 Two Paths to Diffusion: Repr-Align vs. LDLM
+## 🔄 Diffusion Paths: Repr-Align vs. LDLM vs. d3LLM
 
-Open-dLLM supports **two approaches** for converting an autoregressive LM into a diffusion LM. Which one you choose depends on your compute budget and goals.
+Open-dLLM supports three approaches for converting an autoregressive LM into a diffusion LM.
 
-### Recommended: Representation Alignment (Light)
+### Recommended: d3LLM Trajectory Distillation
+
+Uses pre-computed entropy trajectories from the model itself to guide training-time masking. Trains faster and with better convergence than random masking. See [d3LLM Training section](#-d3llm-trajectory-training-27b-qwen36) for the full recipe using Qwen3.6-27B with QLoRA.
+
+### Representation Alignment (Light)
 
 **Paper**: [Don't Retrain—Align: Adapting AR LMs to Diffusion LMs via Representation Alignment](https://arxiv.org/html/2605.06885v1)
 
@@ -640,41 +601,14 @@ See the full LDLM section below for details.
 
 ### d3LLM-Style Trajectory Distillation (Masking Curriculum)
 
-Open-dLLM implements [**d3LLM**](https://arxiv.org/abs/2601.07568) (ICML 2026) trajectory-guided masking for Repr-Align training. Instead of random masking, the unmasking order from a teacher diffusion generation run determines the training-time mask pattern. Tokens that the teacher unmasked early are predicted first; tokens unmasked late are predicted later.
+Open-dLLM implements [**d3LLM**](https://arxiv.org/abs/2601.07568) (ICML 2026) trajectory-guided masking for MDM training. Instead of uniformly random masks, the pre-computed unmasking order from the teacher model determines which tokens are masked at each training step — aligning training-time masking with inference-time decoding behavior.
 
-**The problem with random masking**: Standard Repr-Align uses uniformly random masks during training. Random masks give the student model no signal about *which* tokens can be safely predicted with limited context — every position is equally likely to be masked, regardless of its predictability.
-
-**d3LLM's fix**: Pre-compute a *decoding trajectory* (the order in which tokens are unmasked during inference) by running `diffusion_generate()` on each training sample. During training, mask according to the trajectory step closest to the target mask ratio. This aligns training-time masking with inference-time decoding behavior.
-
-**Pipeline**:
-
-1. **Extract trajectories** (one-time pre-processing):
-```bash
-python -m veomni.ops.trajectory_extractor \
-    --model_path Qwen/Qwen3-1.7B \
-    --data_path /path/to/train.jsonl \
-    --output_dir /path/to/trajectories \
-    --max_seq_len 2048 \
-    --steps 256
-```
-
-2. **Train with trajectory-guided masking**:
-```yaml
-train:
-  enable_masking: true
-  repr_align_wt: 1.0
-  trajectory_data_path: /path/to/trajectories/trajectories.jsonl
-  trajectory_min_mask_ratio: 0.0
-  trajectory_max_mask_ratio: 0.8
-  trajectory_progressive_block_sizes: "16,24,32"
-  trajectory_use_blockwise: true
-  trajectory_entropy_weight: 1.0
-```
+**Key insight**: The trajectory captures which response tokens the model is confident about first (lowest entropy). Those tokens are decoded early during inference and should be predicted first during training. See [d3LLM Training section](#-d3llm-trajectory-training-27b-qwen36) for the full end-to-end recipe.
 
 **Key differences from the replay buffer**:
 - Replay buffer stores **past batches** to prevent forgetting (uniform sampling)
 - Trajectory distillation uses the **teacher's inference-time unmasking order** to guide masking (curriculum learning)
-- They are **complementary** — both can be enabled simultaneously (the replay buffer replays alignment loss, while trajectory distillation changes the masking pattern)
+- They are **complementary** — both can be enabled simultaneously
 
 ---
 
