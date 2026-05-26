@@ -600,6 +600,16 @@ def main():
         _mdm_history = MDMHistory(maxlen=400)
     except ImportError:
         _mdm_history = None
+
+    # d3LLM trajectory visualization history buffer
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../d3LLM"))
+        from d3llm.d3llm_vis import D3LLMHistory, make_all_vis as make_d3llm_vis
+        _d3llm_history = D3LLMHistory(maxlen=400)
+        _has_d3llm_vis = True
+    except Exception:
+        _d3llm_history = None
+        _has_d3llm_vis = False
     environ_meter = helper.EnvironMeter(
         config=model_config,
         global_batch_size=args.train.global_batch_size,
@@ -757,6 +767,13 @@ def main():
                         _mr = micro_batch.get("mask_ratio")
                         if _mr is not None:
                             _mdm_history.push(float(_mr.mean()), loss_components["mdm"])
+
+                    # d3LLM trajectory history: track mask_ratio × mdm loss per step
+                    if _d3llm_history is not None and "mdm" in loss_components:
+                        _mr = micro_batch.get("mask_ratio")
+                        if _mr is not None:
+                            _d3llm_history.push(float(_mr.mean()), loss_components["mdm"])
+
                     # Attach logits/labels to _vis_data for reconstruction panel
                     if _do_vis and getattr(model, "_vis_data", None) is not None:
                         model._vis_data["logits"] = outputs.logits[:1].detach().cpu()
@@ -1045,6 +1062,36 @@ def main():
                         except Exception as e:
                             logger.warning_rank0(f"[step {global_step}] repr_align vis failed: {e}")
 
+                    # d3LLM trajectory visualization
+                    if _do_vis and _has_d3llm_vis:
+                        try:
+                            _mask_id = tokenizer.mask_token_id or 248077
+                            _mi = (micro_batch.get("input_ids") == _mask_id)
+                            _logits = outputs.logits[:1].detach().cpu()
+                            _labels = micro_batch.get("labels", micro_batch.get("input_ids"))[:1].detach().cpu()
+                            _probs = torch.nn.functional.softmax(_logits.float(), dim=-1)
+                            _pred = _probs.argmax(dim=-1)
+                            _correct = (_pred == _labels)
+                            _entropy = -(_probs * (_probs + 1e-12).log()).sum(dim=-1)
+                            _vis_data = {
+                                "logits": _logits[:1],
+                                "input_ids": micro_batch.get("input_ids", micro_batch.get("casual_input_ids"))[:1].detach().cpu(),
+                                "masked_indices": _mi[:1].detach().cpu(),
+                                "H_tok": _entropy[:1].detach().cpu(),
+                                "correct_mask": _correct[:1].detach().cpu(),
+                                "trajectory": None,
+                                "prompt_length": 0,
+                                "mask_token_id": tokenizer.mask_token_id or 248077,
+                                "mask_ratio": float(micro_batch.get("mask_ratio", [0.5])[0].item()),
+                            }
+                            import matplotlib
+                            matplotlib.use("Agg")
+                            for _vkey, _vfig in make_d3llm_vis(_vis_data, global_step, _d3llm_history).items():
+                                train_metrics[_vkey] = wandb.Image(_vfig)
+                                plt.close(_vfig)
+                        except Exception as e:
+                            logger.warning_rank0(f"[step {global_step}] d3llm vis failed: {e}")
+
                     wandb.log(train_metrics, step=global_step)
 
                 if eval_dataloader is not None and args.train.eval_every > 0 and global_step % args.train.eval_every == 0 and global_step > 0:
@@ -1103,7 +1150,10 @@ def main():
                     logger.info_rank0(f"Checkpoint saved to {save_checkpoint_path}")
                 else:
                     os.makedirs(save_checkpoint_path, exist_ok=True)
-                    logger.info_rank0("Skipping DCP checkpoint (QLoRA/Params4bit or save_optimizer_state=False); adapter weights only.")
+                    if is_qlora:
+                        _save_qlora_checkpoint(model, save_checkpoint_path, model_assets, logger)
+                    else:
+                        logger.info_rank0("Skipping DCP checkpoint (save_optimizer_state=False); adapter weights only.")
 
                 if args.train.global_rank == 0 and args.train.save_total_limit > 0:
                     _prune_old_checkpoints(args.train.save_checkpoint_path, args.train.save_total_limit)

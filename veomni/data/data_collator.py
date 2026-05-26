@@ -314,7 +314,15 @@ class DataCollatorWithTrajectoryMasking(DataCollator):
 
     def __call__(self, features):
         batch = {}
-        sample_indices = None
+
+        # Extract sample_idx first (before input_ids processing needs it)
+        if "sample_idx" in features[0]:
+            sample_indices = torch.tensor(
+                [f["sample_idx"] for f in features], dtype=torch.long
+            )
+            batch["sample_idx"] = sample_indices
+        else:
+            sample_indices = None
 
         for input_name in features[0].keys():
             if input_name == "input_ids":
@@ -338,15 +346,11 @@ class DataCollatorWithTrajectoryMasking(DataCollator):
                 for j in range(1, input_ids.size(-1)):
                     batch["left_mask"][..., j - 1] = mask_idx[..., j].float()
 
-            elif input_name in ("attention_mask", "labels", "position_ids"):
-                batch[input_name] = torch.cat(
-                    [f[input_name] for f in features], dim=-1
-                ).unsqueeze(0)
-            elif input_name == "sample_idx":
-                sample_indices = torch.tensor(
-                    [f[input_name] for f in features], dtype=torch.long
-                )
-                batch[input_name] = sample_indices
+            elif input_name in ("attention_mask", "labels", "position_ids", "sample_idx"):
+                if input_name not in batch:
+                    batch[input_name] = torch.cat(
+                        [f[input_name] for f in features], dim=-1
+                    ).unsqueeze(0)
             else:
                 batch[input_name] = default_collate(
                     [f[input_name] for f in features]

@@ -72,8 +72,10 @@ class TrajectoryDataset:
         if not trajectory:
             return None
 
-        block_length = block_end - block_start
-        num_unmasked = int((1 - mask_ratio) * block_length)
-        target_idx = block_start + num_unmasked
-        target_idx = min(target_idx, len(trajectory) - 1)
+        num_steps = len(trajectory)
+        # Map mask_ratio to trajectory step proportionally
+        # mask_ratio=0.9 → early step (mostly masked)
+        # mask_ratio=0.1 → late step (mostly unmasked)  
+        target_idx = int((1 - mask_ratio) * (num_steps - 1))
+        target_idx = max(0, min(target_idx, num_steps - 1))
         return trajectory[target_idx]
