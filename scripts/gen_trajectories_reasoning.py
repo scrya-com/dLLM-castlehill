@@ -6,6 +6,7 @@ Launches on CUDA device 0 (RTX PRO 4000) or device 1 (RTX 5090).
 """
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 import torch
@@ -39,49 +40,58 @@ def load_model(model_path, quantize, device):
     print(f"[traj] Model loaded. mask_id={MASK_ID}")
     return model, tok
 
-def entropy_trajectory(model, tok, prompt_text, response_text, num_steps, max_seq_len, device):
-    """Run entropy-threshold decoding on the response portion only."""
+def scheduled_trajectory(model, tok, prompt_text, response_text, num_steps, max_seq_len, device):
+    """Scheduled decode: at each step, fill the K lowest-entropy masked positions
+    with ground-truth tokens, where K = ceil(n_resp / num_steps).
+
+    Yields a strictly decreasing mask-count progression from n_resp -> 0 across
+    num_steps+1 entries (step 0 is the fully-masked initial state).
+    """
     p_ids = tok.encode(prompt_text, add_special_tokens=False)
     r_ids = tok.encode(response_text, add_special_tokens=False)
-    # Truncate to max_seq_len
     if len(p_ids) + len(r_ids) > max_seq_len:
-        r_ids = r_ids[:max_seq_len - len(p_ids)]
+        r_ids = r_ids[: max_seq_len - len(p_ids)]
     prompt_len = len(p_ids)
-    total_len = prompt_len + len(r_ids)
-    # Build input: prompt + mask tokens for response
-    x = torch.tensor([p_ids + [MASK_ID] * len(r_ids)], dtype=torch.long, device=device)
+    n_resp = len(r_ids)
+    x = torch.tensor([p_ids + [MASK_ID] * n_resp], dtype=torch.long, device=device)
     ground_truth = torch.tensor([p_ids + r_ids], dtype=torch.long, device=device)
-    trajectory = []
+    trajectory = [x[0].cpu().tolist()]  # step 0: fully masked response
+    if n_resp == 0:
+        return trajectory, prompt_len
+    chunk = max(1, math.ceil(n_resp / num_steps))
     with torch.inference_mode():
-        for _ in range(num_steps * 4):
+        for _ in range(num_steps):
             mask_pos = (x == MASK_ID)
-            if not mask_pos.any():
+            n_remaining = int(mask_pos.sum().item())
+            if n_remaining == 0:
                 break
             out = model(input_ids=x, use_cache=False)
-            logits = out.logits  # [1, T, V]
-            probs = F.softmax(logits.float(), dim=-1)
-            entropy = -(probs * (probs + 1e-12).log()).sum(dim=-1)  # [1, T]
-            # Only decode masked positions in the response region
-            decode = mask_pos & (entropy < 1.5)
-            if not decode.any():
-                # Force-decode the most confident masked position
-                ent_masked = entropy.clone()
-                ent_masked[~mask_pos] = float("inf")
-                best = ent_masked.argmin(dim=1)
-                decode[0, best[0]] = True
-            # Sample tokens at decode positions (use ground truth for proper trajectory)
-            x[decode] = ground_truth[decode]
+            logits = out.logits  # [1, T, V], dtype matches model (bf16 under NF4)
+            # Compute entropy only at masked positions, chunked, in fp32.
+            # Avoids materializing [1, T, V] fp32 softmax + log_softmax (multi-GB
+            # for V≈248k, T≈2k on a 27B model with limited VRAM headroom).
+            masked_idx_flat = mask_pos.view(-1).nonzero(as_tuple=True)[0]  # [N_masked]
+            flat_logits = logits.view(-1, logits.size(-1))                  # [T, V]
+            ent_chunk_size = 256
+            ent_masked = torch.empty(masked_idx_flat.numel(), dtype=torch.float32, device=device)
+            for s in range(0, masked_idx_flat.numel(), ent_chunk_size):
+                idx_c = masked_idx_flat[s : s + ent_chunk_size]
+                l_c = flat_logits.index_select(0, idx_c).float()             # [c, V]
+                lse_c = torch.logsumexp(l_c, dim=-1)                         # [c]
+                p_c = F.softmax(l_c, dim=-1)                                 # [c, V]
+                ent_masked[s : s + ent_chunk_size] = lse_c - (p_c * l_c).sum(dim=-1)
+                del l_c, p_c, lse_c
+            k = min(chunk, n_remaining)
+            _, top_local = torch.topk(ent_masked, k, largest=False)          # indices into masked_idx_flat
+            top_idx = masked_idx_flat[top_local]                              # absolute positions
+            flat_x = x.view(-1)
+            flat_gt = ground_truth.view(-1)
+            flat_x[top_idx] = flat_gt[top_idx]
             trajectory.append(x[0].cpu().tolist())
-            if len(trajectory) >= num_steps and not (x == MASK_ID).any():
-                break
-            if len(trajectory) >= num_steps:
-                break
-    # Ensure final fully-decoded state
     if (x == MASK_ID).any():
         x[x == MASK_ID] = ground_truth[x == MASK_ID]
-    if not trajectory or trajectory[-1] != x[0].cpu().tolist():
         trajectory.append(x[0].cpu().tolist())
-    return trajectory
+    return trajectory, prompt_len
 
 def main():
     ap = argparse.ArgumentParser()
@@ -117,11 +127,14 @@ def main():
             idx = d["idx"]
             if idx in done_indices:
                 skipped += 1; continue
-            traj = entropy_trajectory(
+            traj, prompt_len = scheduled_trajectory(
                 model, tok, d["prompt"], d["response"],
                 args.num_steps, args.max_seq_len, args.device
             )
-            fout.write(json.dumps({"idx": idx, "trajectory": traj, "nfe": len(traj)}) + "\n")
+            fout.write(json.dumps({
+                "idx": idx, "trajectory": traj, "nfe": len(traj),
+                "prompt_len": prompt_len,
+            }) + "\n")
             fout.flush()
             written += 1
             if written % 10 == 0:

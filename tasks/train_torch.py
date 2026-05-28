@@ -24,7 +24,7 @@ from veomni.data import (
     build_iterative_dataset,
     build_mapping_dataset,
 )
-from veomni.data.data_transform import process_pretrain_example, process_sft_example
+from veomni.data.data_transform import process_pretrain_example, process_prompt_response_example, process_sft_example
 from veomni.data.constants import IGNORE_INDEX
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
@@ -246,7 +246,18 @@ def main():
     if tokenizer.mask_token is None:
         tokenizer.add_special_tokens({"mask_token": "<M>"})
     print(f'tokenizer.mask_token_id: {tokenizer.mask_token_id}')
-    if args.data.data_type == "plaintext":
+    # d3LLM trajectory training requires prompt+response pairs tokenized the same
+    # way as the trajectory generator (separate encode of prompt and response).
+    # We gate on trajectory_data_path so the existing plaintext path is untouched.
+    _use_prompt_response = bool(getattr(args.train, "trajectory_data_path", None)) and \
+        args.data.data_type == "plaintext"
+    if _use_prompt_response:
+        transform = partial(
+            process_prompt_response_example,
+            tokenizer=tokenizer,
+            max_seq_len=args.data.max_seq_len,
+        )
+    elif args.data.data_type == "plaintext":
         transform = partial(
             process_pretrain_example,
             tokenizer=tokenizer,
@@ -690,9 +701,12 @@ def main():
         for _ in range(start_step, args.train.train_steps):
             global_step += 1
 
-            # Update trajectory collator curriculum schedule
+            # Update trajectory collator curriculum schedule.
+            # Pace the curriculum across the full run (train_steps * num_train_epochs)
+            # so mask_ratio sweeps min → max once across all epochs, not within epoch 1.
             if trajectory_collator is not None:
-                progress = min(global_step / max(args.train.train_steps, 1), 1.0)
+                _total = max(args.train.train_steps * args.train.num_train_epochs, 1)
+                progress = min(global_step / _total, 1.0)
                 trajectory_collator.current_mask_ratio = _traj_min_mask + progress * (_traj_max_mask - _traj_min_mask)
                 if _traj_prog_blocks:
                     ep = min(epoch, len(_traj_prog_blocks) - 1)

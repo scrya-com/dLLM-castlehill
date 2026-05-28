@@ -26,12 +26,14 @@ model:
       - down_proj
 
 data:
-  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/train.jsonl
-  max_seq_len: 512
+  # Use the original prompt/response JSONL so the training tokenization matches
+  # the trajectory generator exactly (separate encode of prompt and response).
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024              # half of trajectory max_seq_len (collator slices)
   train_size: 500
   eval_size: 0
-  data_type: plaintext
-  text_keys: text
+  data_type: plaintext           # gated to prompt/response transform by trajectory_data_path
+  text_keys: text                # unused for the prompt/response path
   drop_last: true
   num_workers: 2
   prefetch_factor: 2
@@ -44,7 +46,7 @@ train:
   save_total_limit: 2
   auto_resume: false
   num_train_epochs: 10
-  max_steps: 500
+  max_steps: 2500              # 5 epochs over 500 samples — meaningful curriculum sweep
   micro_batch_size: 1
   global_batch_size: 1
   lr: 2e-4
@@ -58,11 +60,14 @@ train:
   enable_masking: true
   repr_align_wt: 0.0
 
-  # d3LLM trajectory-guided masking with reasoning dataset trajectories
+  # d3LLM trajectory-guided masking with reasoning dataset trajectories.
+  # Curriculum covers the full range: at mask_ratio=0.95 the student sees
+  # step 1 of the trajectory (almost everything still masked, hardest case);
+  # at 0.05 it sees the near-final step (just a few hard tokens left).
   trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
-  trajectory_min_mask_ratio: 0.1
-  trajectory_max_mask_ratio: 0.5
-  trajectory_entropy_weight: 0.1
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0     # off for the rerun; re-enable after baseline ablation
   trajectory_temperature: 1.0
 
   enable_mixed_precision: true

@@ -263,108 +263,138 @@ class DataCollatorWithTrajectoryMasking(DataCollator):
             sample_idx, mask_ratio, self.mask_token_id, block_start, block_end
         )
 
-    def _mask_with_trajectory(self, input_ids, sample_idx):
+    def _mask_with_trajectory(self, input_ids, sample_idx, prompt_lens):
+        """Apply trajectory-derived mask to response tokens only.
+
+        Args:
+            input_ids:   [b, L] full sequence (prompt + response, concatenated)
+            sample_idx:  [b]    row index for trajectory_dataset lookup
+            prompt_lens: [b]    number of prompt tokens at the start of each row
+
+        For each sample i:
+            - positions [0, prompt_lens[i]) are NEVER masked (context)
+            - positions [prompt_lens[i], L) are masked according to the trajectory
+              step closest to cur_mask_ratio; if no trajectory is available, fall
+              back to bernoulli(cur_mask_ratio).
+        """
         b, l = input_ids.shape
         device = input_ids.device
-        cur_mask_ratio = self.current_mask_ratio
-        cur_mask_ratio = cur_mask_ratio + torch.rand(1, device=device).item() * (
-            self.max_mask_ratio - cur_mask_ratio
-        )
+        cur_mask_ratio = float(self.current_mask_ratio)
+        # Jitter within [current, max] so we don't see a single discrete ratio per step
+        if self.max_mask_ratio > cur_mask_ratio:
+            cur_mask_ratio = cur_mask_ratio + torch.rand(1).item() * (
+                self.max_mask_ratio - cur_mask_ratio
+            )
 
         masked = input_ids.clone()
         masked_indices = torch.zeros_like(input_ids, dtype=torch.bool)
 
         for i in range(b):
-            if self.use_blockwise_loss:
-                max_blocks = l // self.current_block_size
-                num_blocks = torch.randint(0, max_blocks + 1, (1,)).item()
-                mask_start = num_blocks * self.current_block_size
-                mask_end = min(
-                    mask_start + self.current_block_size,
-                    l,
-                )
-            else:
-                mask_start = 0
-                mask_end = l
+            p_len = int(prompt_lens[i].item()) if prompt_lens is not None else 0
+            p_len = max(0, min(p_len, l))
+            sidx = sample_idx[i].item() if sample_idx is not None else None
 
-            traj_step = self._select_trajectory_step(
-                sample_idx[i].item() if sample_idx is not None else None,
-                cur_mask_ratio,
-                mask_start,
-                mask_end,
+            traj_step = (
+                self.trajectory_dataset.select_step(
+                    sidx, cur_mask_ratio, self.mask_token_id, p_len, l
+                )
+                if self.trajectory_dataset is not None and sidx is not None
+                else None
             )
 
-            seg_len = mask_end - mask_start
             if traj_step is not None:
-                traj_tensor = torch.tensor(
-                    traj_step, device=device, dtype=torch.long
-                )
-                seg_mask = traj_tensor[mask_start:mask_end] == self.mask_token_id
+                traj_tensor = torch.tensor(traj_step, device=device, dtype=torch.long)
+                # Trajectory rows are length (prompt_len + response_len) == l for
+                # samples produced by process_prompt_response_example. Be defensive
+                # if it differs (truncation): align by min-length.
+                end = min(l, traj_tensor.numel())
+                seg_mask = torch.zeros(l, dtype=torch.bool, device=device)
+                seg_mask[p_len:end] = traj_tensor[p_len:end] == self.mask_token_id
             else:
+                # Random-mask fallback over the response region only
                 p_mask = 0.999 * cur_mask_ratio + 0.001
-                seg_mask = torch.rand(seg_len, device=device) < p_mask
+                seg_mask = torch.zeros(l, dtype=torch.bool, device=device)
+                if p_len < l:
+                    seg_mask[p_len:] = torch.rand(l - p_len, device=device) < p_mask
 
-            masked_indices[i, mask_start:mask_end] = seg_mask
-            masked[i, mask_start:mask_end] = torch.where(
-                seg_mask, self.mask_token_id, input_ids[i, mask_start:mask_end]
-            )
-            masked[i, mask_end:l] = self.mask_token_id
+            masked_indices[i] = seg_mask
+            masked[i] = torch.where(seg_mask, self.mask_token_id, input_ids[i])
 
         return masked, masked_indices
 
     def __call__(self, features):
         batch = {}
 
-        # Extract sample_idx first (before input_ids processing needs it)
+        # Extract sample_idx and prompt_len up-front (the masking routine needs both)
         if "sample_idx" in features[0]:
             sample_indices = torch.tensor(
-                [f["sample_idx"] for f in features], dtype=torch.long
+                [int(f["sample_idx"]) for f in features], dtype=torch.long
             )
             batch["sample_idx"] = sample_indices
         else:
             sample_indices = None
 
-        for input_name in features[0].keys():
-            if input_name == "input_ids":
-                input_ids = torch.cat(
-                    [f[input_name] for f in features], dim=-1
-                ).unsqueeze(0)
-                batch["casual_input_ids"] = input_ids.clone()
+        if "prompt_len" in features[0]:
+            prompt_lens = torch.tensor(
+                [int(f["prompt_len"]) for f in features], dtype=torch.long
+            )
+        else:
+            prompt_lens = None
 
-                masked_ids, mask_idx = self._mask_with_trajectory(
-                    input_ids, sample_indices
-                )
-                batch[input_name] = masked_ids
-                batch["mask_ratio"] = torch.full(
-                    (input_ids.size(0),),
-                    self.current_mask_ratio,
-                    device=input_ids.device,
-                )
-                batch["left_mask"] = torch.zeros_like(
-                    input_ids, dtype=torch.float, device=input_ids.device
-                )
-                for j in range(1, input_ids.size(-1)):
-                    batch["left_mask"][..., j - 1] = mask_idx[..., j].float()
+        # Per-sample input_ids stacked into [B, L] with right-padding so we can
+        # mask each row using its own prompt_len. Trajectory format is one row
+        # per sample, so we deliberately do NOT pack along dim=-1 here.
+        per_sample_ids = [f["input_ids"] for f in features]
+        max_len = max(int(t.numel()) for t in per_sample_ids)
+        pad_id = 0
+        stacked = torch.full((len(per_sample_ids), max_len), pad_id, dtype=per_sample_ids[0].dtype)
+        for i, t in enumerate(per_sample_ids):
+            stacked[i, : t.numel()] = t
+        input_ids = stacked  # [B, L]
+        batch["casual_input_ids"] = input_ids.clone()
 
-            elif input_name in ("attention_mask", "labels", "position_ids", "sample_idx"):
-                if input_name not in batch:
-                    batch[input_name] = torch.cat(
-                        [f[input_name] for f in features], dim=-1
-                    ).unsqueeze(0)
-            else:
-                batch[input_name] = default_collate(
-                    [f[input_name] for f in features]
-                )
+        masked_ids, mask_idx = self._mask_with_trajectory(
+            input_ids, sample_indices, prompt_lens
+        )
+        batch["input_ids"] = masked_ids
+        batch["mask_ratio"] = torch.full(
+            (input_ids.size(0),),
+            float(self.current_mask_ratio),
+            device=input_ids.device,
+        )
+        batch["left_mask"] = torch.zeros_like(input_ids, dtype=torch.float)
+        if input_ids.size(-1) > 1:
+            batch["left_mask"][..., :-1] = mask_idx[..., 1:].float()
 
-        if "position_ids" not in batch:
-            batch["position_ids"] = torch.cat(
-                [torch.arange(len(f["input_ids"])) for f in features]
-            ).unsqueeze(0)
+        # Right-pad attention_mask / labels to the same L
+        if "attention_mask" in features[0]:
+            am = torch.zeros_like(input_ids)
+            for i, f in enumerate(features):
+                t = f["attention_mask"]
+                am[i, : t.numel()] = t
+            batch["attention_mask"] = am
+        else:
+            batch["attention_mask"] = (input_ids != pad_id).long()
+
+        if "labels" in features[0]:
+            lbl = torch.full_like(input_ids, IGNORE_INDEX)
+            for i, f in enumerate(features):
+                t = f["labels"]
+                lbl[i, : t.numel()] = t
+            batch["labels"] = lbl
+
+        if "position_ids" in features[0]:
+            pos = torch.zeros_like(input_ids)
+            for i, f in enumerate(features):
+                t = f["position_ids"]
+                pos[i, : t.numel()] = t
+            batch["position_ids"] = pos
+        else:
+            batch["position_ids"] = torch.arange(input_ids.size(-1)).unsqueeze(0).expand_as(input_ids).contiguous()
 
         if "labels" in batch:
             batch["casual_labels"] = batch["labels"].clone()
-            cu_seqlens = pos2culen(batch["position_ids"])
-            batch["casual_labels"][:, cu_seqlens[1:-1]] = IGNORE_INDEX
+            # Loss only on positions that were actually masked in this step
             batch["labels"][batch["input_ids"] != self.mask_token_id] = IGNORE_INDEX
 
         return batch

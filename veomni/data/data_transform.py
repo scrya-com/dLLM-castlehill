@@ -71,6 +71,43 @@ def process_pretrain_example(
     return examples
 
 
+def process_prompt_response_example(
+    example: Dict[str, Any],
+    tokenizer: "PreTrainedTokenizer",
+    max_seq_len: int,
+    source_name: Optional[str] = None,
+    index: Optional[int] = None,
+) -> List[Dict[str, "torch.Tensor"]]:
+    """Tokenize prompt and response separately, matching the trajectory generator.
+
+    Returns one example per sample (no chunking) so the trajectory step (which is
+    keyed by sample_idx, not chunk) lines up positionally with input_ids.
+
+    Output fields:
+        input_ids       = tok(prompt) + tok(response), truncated to max_seq_len
+        attention_mask  = ones
+        labels          = input_ids (collator will mask non-target positions)
+        prompt_len      = len(tok(prompt))   -- scalar per sample
+        sample_idx      = mapping-dataset row index, matches trajectories.jsonl idx
+    """
+    p_ids = tokenizer.encode(example["prompt"], add_special_tokens=False)
+    r_ids = tokenizer.encode(example["response"], add_special_tokens=False)
+    if len(p_ids) + len(r_ids) > max_seq_len:
+        r_ids = r_ids[: max_seq_len - len(p_ids)]
+    input_ids = p_ids + r_ids
+    if len(input_ids) == 0:
+        return []
+    example_dict = {
+        "input_ids": torch.tensor(input_ids),
+        "attention_mask": torch.tensor([1] * len(input_ids)),
+        "labels": torch.tensor(input_ids),
+        "prompt_len": torch.tensor(len(p_ids)),
+    }
+    if index is not None:
+        example_dict["sample_idx"] = index
+    return [example_dict]
+
+
 def process_sft_example(
     example: Dict[str, Any],
     chat_template: "ChatTemplate",

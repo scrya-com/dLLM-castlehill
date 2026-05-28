@@ -1,22 +1,47 @@
-# d3LLM 27B QLoRA smoke test — 10 steps with trajectory-guided masking
-# Uses 1.7B trajectories on same FineWeb data (pipeline test, not quality test)
-
+# d3LLM 27B smoke test — 5 samples × 5 steps, validate the data path end-to-end.
 model:
   model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
   attn_implementation: sdpa
   enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 4
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
 
 data:
-  train_path: /home/johndpope/ds_offload/data_50_fineweb.jsonl
-  max_seq_len: 512
-  train_size: 50
+  train_path: /home/johndpope/ds_offload/trajectories/smoke5/data.jsonl
+  max_seq_len: 1024
+  train_size: 5
+  eval_size: 0
   data_type: plaintext
   text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
 
 train:
   output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_smoke
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 0
+  save_total_limit: 0
+  auto_resume: false
   num_train_epochs: 1
-  max_steps: 10
+  max_steps: 5
   micro_batch_size: 1
   global_batch_size: 1
   lr: 2e-4
@@ -27,17 +52,17 @@ train:
   data_parallel_mode: ddp
   ckpt_manager: dcp
 
-  # Repr-Align disabled for pipeline smoke test (no anchor cache for 50-sample subset)
   enable_masking: true
   repr_align_wt: 0.0
-  # align_layers: "16,32,48,64"
-  # anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3.6-27b
-  # repr_align_sub_sample_ratio: 0.25
 
-  # d3LLM trajectory-guided masking
-  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3-1.7b-fineweb-50/trajectories.jsonl
-  trajectory_min_mask_ratio: 0.1
-  trajectory_max_mask_ratio: 0.5
-  trajectory_progressive_block_sizes: "1,2,4"
-  trajectory_entropy_weight: 0.1
-  trajectory_temperature: 1.0
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/smoke5/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: false
