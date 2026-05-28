@@ -410,6 +410,14 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Min-SNR loss weighting cap for MDM training (Hang et al. ICCV 2023). When set, loss is multiplied by min(1/mask_ratio, gamma). Typical γ=5. None=disabled."},
     )
+    gen_sample_every_steps: int = field(
+        default=100,
+        metadata={"help": "Generate sample text every N steps during QLoRA training (logged to wandb + side JSONL). 0 = disable."},
+    )
+    gen_sample_log_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path for the side JSONL dump of generation samples. Default: {output_dir}/generations.jsonl."},
+    )
     # ------------------------------------------------------------------
     # Cola DLM (Continuous Latent Diffusion LM, arXiv:2605.06548)
     # auxiliary head on top of Repr-Align. Off when cola_wt == 0.

@@ -16,10 +16,10 @@ model:
   enable_qlorafy: true
   qlorafy_config:
     use_hf_native: true
-    r: 16                        # 4 → 16 (4× capacity, ~16M trainable params, tiny memory cost)
+    r: 8                         # 4 → 8 (2× capacity). r=16 OOMs at optim.step (120M trainable * 8B fp32 m+v ≈ 960MB)
     lora_alpha: 32
     lora_dropout: 0.05
-    use_dora: true               # Weight-Decomposed LoRA (Liu et al. ICML 2024)
+    use_dora: false              # DoRA on 27B NF4 OOMs (dequantizes per-layer weight every forward). Skipping for this run.
     use_rslora: true             # Rank-stabilized scaling — better stability at higher rank
     target_modules:
       - in_proj_qkv
@@ -34,8 +34,7 @@ model:
       - gate_proj
       - up_proj
       - down_proj
-      - embed_tokens             # <M> embedding can now adapt via LoRA
-      - lm_head                  # lm_head row for <M> can now adapt via LoRA
+      - embed_tokens             # <M> embedding can adapt via LoRA (tied to lm_head)
 
 data:
   train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
@@ -55,8 +54,8 @@ train:
   save_steps: 500
   save_total_limit: 2
   auto_resume: false
-  num_train_epochs: 10
-  max_steps: 2500
+  num_train_epochs: 30           # 30 × 500 train_steps/epoch = 15,000 total iterations
+  max_steps: 15000
   micro_batch_size: 1
   global_batch_size: 1
   lr: 2e-4
@@ -78,6 +77,8 @@ train:
 
   min_snr_gamma: 5.0             # Min-SNR loss weighting (Hang et al. ICCV 2023)
 
+  gen_sample_every_steps: 500    # generate + dump to {output_dir}/generations.jsonl every 500 steps
+
   enable_mixed_precision: true
   enable_gradient_checkpointing: true
   empty_cache_steps: 1
@@ -85,4 +86,4 @@ train:
 
   use_wandb: true
   wandb_project: open-dllm-27b
-  wandb_name: d3llm-27b-reasoning-500-v3
+  wandb_name: d3llm-27b-reasoning-500-v3-15k

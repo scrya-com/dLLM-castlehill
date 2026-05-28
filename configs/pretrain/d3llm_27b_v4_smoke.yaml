@@ -1,0 +1,101 @@
+# d3LLM 27B v4 — trajectory + Repr-Align (via anchor cache, no in-memory teacher)
+#
+# Stacks two orthogonal alignment signals:
+#   - d3LLM trajectory: aligns training-time mask pattern to inference-time
+#     decode order (one-bit-per-position curriculum).
+#   - Repr-Align: dense per-layer cosine-sim supervision against the frozen
+#     AR teacher's hidden states (precomputed offline, looked up by
+#     SHA-256(input_ids) at training time — zero in-memory teacher cost).
+#
+# Hypothesis: Repr-Align gives 3-4x faster convergence (per repo docs);
+# d3LLM trajectory keeps inference behavior consistent. The peak-quality
+# checkpoint should land earlier than v3's step 5k-7.5k window.
+#
+# Prereq: precompute_anchor.py with --data_type prompt_response against
+# data.jsonl, layers 16/32/48/64, max_seq_len 1024.
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false              # NF4 DoRA OOMs at 27B; not worth the fight
+    use_rslora: true
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+      - embed_tokens
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 5
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v4_smoke
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 0
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 1
+  max_steps: 5
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 2e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  # d3LLM trajectory-guided masking (unchanged from v3)
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  # Repr-Align via anchor cache (NEW in v4)
+  repr_align_wt: 0.5             # start moderate; d3LLM CE already provides token signal
+  anchor_cache_dir: /run/media/johndpope/12TB/open_dllm/anchors/qwen3.6-27b-reasoning-500
+  align_layers: "16,32,48,64"
+  repr_align_sub_sample_ratio: 0.25   # 4x memory cut on alignment branch
+  repr_align_num_sample_layers: 2     # random 2 of 4 layers per step (2x more cut)
+  repr_align_layer_exp: 2.0           # later layers weighted heavier (~7x last vs first)
+
+  min_snr_gamma: 5.0             # carried over from v3
+
+  gen_sample_every_steps: 0    # generations dumped to {output_dir}/generations.jsonl
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: false
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-reasoning-500-v4-repralign

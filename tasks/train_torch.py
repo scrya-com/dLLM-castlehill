@@ -1027,11 +1027,16 @@ def main():
                         train_metrics["qlora/grad_norm"] = lora_gnorm
                         train_metrics["qlora/grad_to_param_ratio"] = lora_gnorm / max(lora_pnorm, 1e-8)
 
-                    if args.model.enable_qlorafy and global_step % 100 == 0:
+                    _gen_every = getattr(args.train, "gen_sample_every_steps", 100)
+                    if args.model.enable_qlorafy and _gen_every > 0 and global_step % _gen_every == 0:
                         try:
                             import time as _time
                             model.eval()
-                            gen_prompts = ["The meaning of life is", "def fibonacci(n):"]
+                            # Default reasoning prompts. Override via args.train.gen_prompts.
+                            gen_prompts = getattr(args.train, "gen_prompts", None) or [
+                                "Explain how a hash table handles collisions in O(1) average lookup time.",
+                                "What is the time complexity of merge sort and why? Walk through the recursion.",
+                            ]
                             gen_samples = []
                             ar_toks_total, ar_time_total = 0, 0.0
                             diff_toks_total, diff_time_total = 0, 0.0
@@ -1041,7 +1046,7 @@ def main():
                                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                                     # AR generation — timed
                                     _t0 = _time.perf_counter()
-                                    ar_out = model.generate(pids, max_new_tokens=64, do_sample=True, temperature=0.7, top_k=200)
+                                    ar_out = model.generate(pids, max_new_tokens=256, do_sample=True, temperature=0.7, top_k=200)
                                     torch.cuda.synchronize()
                                     ar_time_total += _time.perf_counter() - _t0
                                     ar_new_toks = ar_out.shape[1] - pids.shape[1]
@@ -1052,7 +1057,7 @@ def main():
                                     from veomni.models.transformers.qwen2.generation_utils import mdm_generate
                                     if tokenizer.mask_token_id is not None:
                                         _t0 = _time.perf_counter()
-                                        diff_ids = mdm_generate(model, pids, mask_token_id=tokenizer.mask_token_id, max_new_tokens=64, steps=16, temperature=0.7)
+                                        diff_ids = mdm_generate(model, pids, mask_token_id=tokenizer.mask_token_id, max_new_tokens=256, steps=16, temperature=0.7)
                                         torch.cuda.synchronize()
                                         diff_time_total += _time.perf_counter() - _t0
                                         diff_new_toks = diff_ids.shape[1] - pids.shape[1]
@@ -1070,6 +1075,23 @@ def main():
                                 train_metrics["inference/ar_tok_per_sec"] = ar_toks_total / ar_time_total
                             if diff_time_total > 0:
                                 train_metrics["inference/diff_tok_per_sec"] = diff_toks_total / diff_time_total
+
+                            # Side-file dump: each generation as one JSONL row so the file
+                            # can be tail -f'd alongside the wandb run.
+                            _gen_log_path = getattr(args.train, "gen_sample_log_path", None) or \
+                                os.path.join(args.train.output_dir, "generations.jsonl")
+                            try:
+                                os.makedirs(os.path.dirname(_gen_log_path), exist_ok=True)
+                                with open(_gen_log_path, "a") as _gf:
+                                    for _i, _gp in enumerate(gen_prompts):
+                                        _entry = {
+                                            "step": global_step,
+                                            "prompt": _gp,
+                                            "sample_html": gen_samples[_i] if _i < len(gen_samples) else None,
+                                        }
+                                        _gf.write(json.dumps(_entry, ensure_ascii=False) + "\n")
+                            except Exception as _e:
+                                logger.warning_rank0(f"[step {global_step}] gen JSONL dump failed: {_e}")
                             model.train()
                         except Exception as e:
                             logger.warning_rank0(f"[step {global_step}] Generation probe failed: {e}")

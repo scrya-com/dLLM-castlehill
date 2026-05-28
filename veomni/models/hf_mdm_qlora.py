@@ -240,7 +240,11 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
     lora = LoraConfig(
         r=cfg.get("r", 16), lora_alpha=cfg.get("lora_alpha", 32),
         lora_dropout=cfg.get("lora_dropout", 0.05), target_modules=targets,
-        task_type=TaskType.CAUSAL_LM, use_rslora=cfg.get("use_rslora", True),
+        task_type=TaskType.CAUSAL_LM,
+        use_rslora=cfg.get("use_rslora", True),
+        use_dora=cfg.get("use_dora", False),
+        modules_to_save=cfg.get("modules_to_save", None),
+        bias=cfg.get("bias", "none"),
     )
     base = get_peft_model(base, lora)
     base.print_trainable_parameters()

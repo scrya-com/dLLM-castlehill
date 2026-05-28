@@ -209,6 +209,52 @@ The first run ([wandb v4gxqrxa](https://wandb.ai/snoozie/open-dllm-27b/runs/v4gx
 
 Still unaddressed (cheap follow-ups if v2 results still trail): `<M>` embedding + `lm_head` row are frozen at random-init under QLoRA, and r=4 / 500 samples is below the data×capacity threshold for reasoning gains.
 
+### v3 — convergence accelerators (what fit, what didn't)
+
+After the v2 data-path fix landed, v3 attempted to stack four convergence tricks: **DoRA r=16**, `embed_tokens` LoRA so `<M>` can learn, **AdamW8bit** for memory headroom, and **Min-SNR loss weighting** (γ=5). Iterating on a 32 GB RTX 5090 turned up the actual memory ceilings:
+
+| Knob | Outcome on 27B NF4 + L=1024 |
+|---|---|
+| **AdamW8bit** (bnb `PagedAdamW8bit`) | ❌ `cudaErrorIllegalAddress` at first `optimizer.step()` on Blackwell SM 12.0. Reverted to plain AdamW. Savings would've been ~few hundred MB on 60M LoRA params — not worth chasing. |
+| **DoRA r=16 + `embed_tokens` LoRA** | ❌ 4.74 GB OOM at model build. DoRA dequantizes the full `embed_tokens` weight (5120 × 248320 bf16 ≈ 2.5 GB) twice during its magnitude calculation. |
+| **DoRA r=8 + `embed_tokens` removed** | ❌ 1.13 GB OOM at step 1. DoRA on quantized linears needs to materialize each layer's weight per forward; on a 27B base that's still over budget. |
+| **DoRA r=8 + `embed_tokens` removed + no DoRA** (final v3) | ✅ Stable at ~26 GB. r=8 + rsLoRA + `embed_tokens` LoRA + Min-SNR γ=5. |
+
+Net of the v3 work: **r=8 + rsLoRA + `embed_tokens` LoRA + Min-SNR γ=5** is the largest config that fits at L=1024 on a single 32 GB Blackwell. DoRA needs either a smaller seq_len, a non-quantized base, or out-of-process magnitude caching to fit on this hardware.
+
+**Silent bug found and fixed along the way:** `veomni/models/hf_mdm_qlora.py:240` was constructing the PEFT `LoraConfig` without passing `use_dora`, `modules_to_save`, or `bias` — so any yaml with `use_dora: true` would silently train as vanilla LoRA. Confirmed by inspecting the saved `adapter_config.json`. Fix in commit (forward all three args).
+
+### v3 training stages (observed live)
+
+The model walks a fairly predictable curriculum on 500 samples × 30 epochs of MDM trajectory training:
+
+| # | Stage | What stops being misaligned | When (this run) |
+|---|---|---|---|
+| 1 | Adapter settling | Random LoRA-init noise | steps 0 – 200 |
+| 2 | Scaffold alignment | Wrong response *structure* — no `<think>`, no bullets | 200 – 1,500 |
+| 3 | Topic alignment | Wrong-topic generations (asked X, answered Y) | 1,500 – 4,000 |
+| 4 | Lexical / content alignment | Generic placeholders where domain terms belong | 4,000 – 7,000 |
+| 5 | Decode-order alignment | AR and 16-step diffusion outputs diverge | ~5,000 – 7,500 (**keeper window**) |
+| 6 | Memorization | Held-out quality starts regressing | 7,500 – 12,000 |
+| 7 | Over-alignment | Held-out prompts collapse to training-data fragments | 12,000+ |
+
+The keeper checkpoint is between stages 5 and 6 — not at step 15,000. The full 15k target is to *see* the curve, not because the last checkpoint is the best.
+
+### v4 — d3LLM trajectory + Repr-Align via anchor cache
+
+v3 supervises only with the trajectory ordering (one bit per position). v4 adds **dense per-layer cosine-sim supervision** from a frozen AR teacher, without loading the teacher into GPU memory at training time. This is the [Repr-Align](https://arxiv.org/abs/2605.06885) recipe, plumbed through the `CachedTeacher` infrastructure:
+
+1. **Precompute** the teacher's hidden states once: 500 samples × 4 layers (16/32/48/64) × max_seq_len 1024 in NF4 = **20 GB on disk, ~3.4 min wall-time on the 5090**. Cache is keyed by `sha256(input_ids)` and stored as one safetensors per chunk.
+2. **Train** with `repr_align_wt > 0` + `anchor_cache_dir` pointing at the cache. The trainer's `CachedTeacher` looks up the teacher hidden states by hash and computes cosine-sim against the student's hidden states at the same layers. No teacher model in memory.
+
+For this to work, the **precompute and training tokenizations must produce identical `input_ids` byte-for-byte** (the hash is over input_ids). `scripts/precompute_anchor.py` was extended with `--data_type prompt_response` to mirror `process_prompt_response_example` exactly: separate `tok(prompt)` and `tok(response)`, response truncated, no EOS appended, no chunking. (Without this, every cache lookup misses and Repr-Align degenerates back to pure d3LLM.)
+
+Memory budget at L=1024 r=8 with subsampling (`repr_align_sub_sample_ratio=0.25`, `repr_align_num_sample_layers=2`): ~27 GB out of 32 GB on the 5090 — fits with room.
+
+Config: [`configs/pretrain/d3llm_27b_v4.yaml`](configs/pretrain/d3llm_27b_v4.yaml). Expected outcome: same training curve as v3 but compressed — peak-quality window should land closer to step 2,500–4,000 instead of v3's 5,000–7,500.
+
+**Smoke-test verified (5 steps):** loss components now include `repr_align:0.5` alongside `mdm:38.6` and `path:0.26` — CachedTeacher hash lookups hitting, per-layer cosine-sim computing, gradients finite. VRAM peak 26.6 GB. Per-step cost ~2.7 s vs v3's 2.13 s — ~27% slower per step but net convergence should be faster.
+
 ---
 
 ## 🗺️ File Map

@@ -98,6 +98,16 @@ def main():
                     help="Quantize model with bitsandbytes (8bit or 4bit)")
     ap.add_argument("--force", action="store_true",
                     help="Overwrite existing cache files")
+    ap.add_argument("--data_type", default="plaintext",
+                    choices=["plaintext", "prompt_response"],
+                    help="JSONL schema. 'plaintext' reads {'text'} and chunks by max_seq_len. "
+                         "'prompt_response' reads {'prompt','response'}, tokenizes them "
+                         "separately and concatenates (matches process_prompt_response_example "
+                         "in veomni/data/data_transform.py for hash-match with CachedTeacher).")
+    ap.add_argument("--add_mask_token", action="store_true",
+                    help="Add <M> mask token to tokenizer to match train_torch.py state. "
+                         "Does not change emitted input_ids (no <M> in unmasked sequence) but "
+                         "keeps vocab-size consistent with training.")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -111,6 +121,9 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
+    if args.add_mask_token and tok.mask_token is None:
+        tok.add_special_tokens({"mask_token": "<M>"})
+        print(f"[precompute] Added mask token, mask_token_id={tok.mask_token_id}")
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
 
@@ -171,14 +184,31 @@ def main():
             if args.max_examples is not None and i >= args.max_examples:
                 break
             try:
-                text = json.loads(line)["text"]
+                row = json.loads(line)
             except Exception:
                 continue
 
-            tokens = tok.encode(text, add_special_tokens=False) + [tok.eos_token_id]
+            if args.data_type == "prompt_response":
+                # Mirror process_prompt_response_example exactly: separate encode
+                # of prompt and response, response truncated, no EOS appended.
+                # Hashes must equal what the trainer emits in casual_input_ids.
+                if "prompt" not in row or "response" not in row:
+                    continue
+                p_ids = tok.encode(row["prompt"], add_special_tokens=False)
+                r_ids = tok.encode(row["response"], add_special_tokens=False)
+                if len(p_ids) + len(r_ids) > args.max_seq_len:
+                    r_ids = r_ids[: args.max_seq_len - len(p_ids)]
+                if len(p_ids) + len(r_ids) == 0:
+                    continue
+                chunks_iter = [p_ids + r_ids]
+            else:
+                if "text" not in row:
+                    continue
+                tokens = tok.encode(row["text"], add_special_tokens=False) + [tok.eos_token_id]
+                chunks_iter = [tokens[j:j + args.max_seq_len]
+                               for j in range(0, len(tokens), args.max_seq_len)]
 
-            for j in range(0, len(tokens), args.max_seq_len):
-                chunk = tokens[j:j + args.max_seq_len]
+            for chunk in chunks_iter:
                 chunks_seen += 1
 
                 ids_cpu = torch.tensor(chunk, dtype=torch.long)
