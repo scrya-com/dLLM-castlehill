@@ -547,6 +547,11 @@ def build_optimizer(
         foreach = False if is_torch_npu_available() else (not fused)
         fused = False if is_torch_npu_available() else fused
         optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
+    elif optimizer_type == "adamw_8bit":
+        # bitsandbytes paged 8-bit AdamW. Optimizer-state memory ~25% of fp32 AdamW.
+        # Paged variant offloads spilled state to CPU under memory pressure.
+        from bitsandbytes.optim import PagedAdamW8bit
+        optim = PagedAdamW8bit(param_groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
     elif optimizer_type == "anyprecision_adamw":
         optim = AnyPrecisionAdamW(param_groups, lr, betas, eps, weight_decay)
     elif optimizer_type == "apollo":

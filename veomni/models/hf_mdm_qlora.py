@@ -49,9 +49,15 @@ def _repr_align_loss(z1, z2, layer_weights=None, contrastive=False, contrastive_
     return 1.0 - cosine_sim.mean()
 
 
-def _mdm_loss(logits, labels, chunk_size=512):
+def _mdm_loss(logits, labels, chunk_size=512, mask_ratio=None, min_snr_gamma=None):
     # Chunked CE to avoid materialising [B, T, V] fp32 at long seq_len.
     # At seq_len=4096, V=248320: full tensor = 4.1 GB fp32; chunks keep peak at 0.5 GB.
+    #
+    # Min-SNR loss weighting (Hang et al. ICCV 2023, ported to discrete MDM):
+    # weight = min(1/mask_ratio, gamma). Upweights low-mask-ratio steps to match the
+    # unbiased ELBO contribution; gamma caps the weight on near-zero-mask edge cases
+    # to prevent variance explosion. Gated on both mask_ratio and min_snr_gamma being
+    # provided so default behavior is unchanged.
     logits_s = logits[:, :-1, :]
     labels_s = labels[:, 1:] if labels.dim() == 2 else labels.view(logits.size(0), -1)[:, 1:]
     L = min(logits_s.size(1), labels_s.size(1))
@@ -70,6 +76,13 @@ def _mdm_loss(logits, labels, chunk_size=512):
     denom = loss_mask.sum() + 1e-8
     mdm = (token_loss * loss_mask).sum() / denom
     path = ((-token_loss).exp().detach() * token_loss * loss_mask).sum() / denom
+
+    if mask_ratio is not None and min_snr_gamma is not None and min_snr_gamma > 0:
+        r = mask_ratio.float().mean().clamp(min=1e-3)
+        w = (1.0 / r).clamp(max=float(min_snr_gamma))
+        mdm = mdm * w
+        path = path * w
+
     return mdm + path, mdm.detach(), path.detach()
 
 
@@ -120,7 +133,11 @@ class MDMQLoRAWrapper(nn.Module):
         loss = None
         comps = {}
         if labels is not None:
-            loss, mdm, path = _mdm_loss(logits, labels)
+            loss, mdm, path = _mdm_loss(
+                logits, labels,
+                mask_ratio=mask_ratio,
+                min_snr_gamma=getattr(self, "min_snr_gamma", None),
+            )
             comps = {"mdm": float(mdm), "path": float(path)}
 
         if _repr_align_active:

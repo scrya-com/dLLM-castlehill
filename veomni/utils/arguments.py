@@ -238,7 +238,7 @@ class TrainingArguments:
         default=0,
         metadata={"help": "L2 regularization strength."},
     )
-    optimizer: Literal["adamw", "anyprecision_adamw", "apollo", "galore", "scale", "persistent_sparse_adam"] = field(
+    optimizer: Literal["adamw", "adamw_8bit", "anyprecision_adamw", "apollo", "galore", "scale", "persistent_sparse_adam"] = field(
         default="adamw",
         metadata={"help": "Optimizer. Default to adamw."},
     )
@@ -405,6 +405,10 @@ class TrainingArguments:
     trajectory_temperature: float = field(
         default=0.5,
         metadata={"help": "Temperature for entropy regularization softmax."},
+    )
+    min_snr_gamma: Optional[float] = field(
+        default=None,
+        metadata={"help": "Min-SNR loss weighting cap for MDM training (Hang et al. ICCV 2023). When set, loss is multiplied by min(1/mask_ratio, gamma). Typical γ=5. None=disabled."},
     )
     # ------------------------------------------------------------------
     # Cola DLM (Continuous Latent Diffusion LM, arXiv:2605.06548)

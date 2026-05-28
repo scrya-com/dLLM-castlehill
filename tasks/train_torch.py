@@ -442,6 +442,15 @@ def main():
     )
 
     model_config = model.config
+
+    # Min-SNR loss weighting (Hang et al. ICCV 2023, ported to discrete MDM).
+    # Read once from args and attach to the model so _mdm_loss can read it via
+    # self.min_snr_gamma without further plumbing. None = disabled (default).
+    _min_snr = getattr(args.train, "min_snr_gamma", None)
+    if _min_snr is not None and _min_snr > 0:
+        model.min_snr_gamma = float(_min_snr)
+        logger.info_rank0(f"Min-SNR loss weighting active: gamma={_min_snr}")
+
     # lm_head_module = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
     # if lm_head_module is not None:
     #     for param in lm_head_module.parameters():
