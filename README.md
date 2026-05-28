@@ -107,18 +107,18 @@ All metrics logged to [wandb.ai/snoozie/open-dllm-27b](https://wandb.ai/snoozie/
 
 ## 🎯 d3LLM Trajectory Training (27B Qwen3.6)
 
-End-to-end recipe to train Qwen3.6-27B with entropy-based trajectory-guided masking.
+End-to-end recipe to train Qwen3.6-27B with scheduled-decode trajectory-guided masking.
 
 ### 1. Get the Data
 
-Download the Qwen3.6-Plus reasoning dataset (500 examples, ~7 MB):
+Download the Qwen3.6-Plus reasoning dataset (500 examples, ~7 MB). The training pipeline reads `{idx, prompt, response}` directly — no separate concatenated `text` field needed (the trainer tokenizes prompt and response separately, matching the trajectory generator).
 
 ```python
 from datasets import load_dataset
 import json
 
 ds = load_dataset("khazarai/qwen3.6-plus-high-reasoning-500x", split="train")
-with open("train.jsonl", "w") as f:
+with open("data.jsonl", "w") as f:
     for i in range(len(ds)):
         msg = ds[i]["messages"]
         f.write(json.dumps({
@@ -130,22 +130,26 @@ with open("train.jsonl", "w") as f:
 
 Each example has a user prompt (63-105 tokens) + a rich assistant reasoning response (2,300-4,100 tokens) — ideal for trajectory distillation.
 
-### 2. Precompute Entropy-Based Trajectories
+### 2. Precompute Scheduled-Decode Trajectories
 
-Generate the unmasking order by running the 27B model in entropy-threshold decode mode over each response:
+Generate the unmasking order by running the 27B model in scheduled top-k decode over each response. At each step the model fills the `ceil(n_resp / num_steps)` **lowest-entropy** masked positions with their ground-truth tokens, yielding a strict monotonic mask-ratio progression from ~100% → 0% across `num_steps + 1` entries.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/gen_trajectories_reasoning.py \
-    --data_path /path/to/train.jsonl \
+    --data_path /path/to/data.jsonl \
     --output_dir /path/to/trajectories/ \
     --model_path /path/to/Qwen3.6-27B \
     --num_steps 32 \
     --max_seq_len 2048
 ```
 
-Output: `trajectories.jsonl` — one entry per example with `idx`, `trajectory` (list of token-ID sequences at each decode step), and `nfe` (number of steps).
+Output: `trajectories.jsonl` — one entry per example with `idx`, `trajectory` (list of token-ID sequences, one per decode step), `nfe` (number of steps), and `prompt_len`.
 
-Each trajectory step records which positions are still mask tokens. The collator uses these to determine training-time masking positions. Step 0 has all response tokens masked; final step has all unmasked.
+Step 0 = response fully masked; step k ≈ k/num_steps decoded; step N = fully decoded. The collator picks the step whose mask ratio is closest to the curriculum target and applies its mask pattern to the response positions only (`[prompt_len:L]`).
+
+> **Why scheduled, not entropy-threshold**: an entropy threshold on a confident teacher decodes ~75% of tokens on iteration 1 and then plateaus — every "step" looks identical, so the trajectory carries no ordering signal. Scheduled top-k guarantees a graded curriculum. (See [`prior-run post-mortem`](#why-the-original-d3llm-27b-run-was-meh) below if you saw the broken run.)
+
+Entropy at each step is computed at **masked positions only**, chunked at 256 in fp32, via `logsumexp(z) - sum(softmax(z) * z)` — this avoids materializing the full `[1, T, V]` softmax + log_softmax tensors (multi-GB at `V=248k`, `T=2k`).
 
 ### 3. Train with QLoRA (Fits RTX 5090 32 GB)
 
@@ -157,7 +161,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python tasks/train_torch.py configs/pretrain/d3llm_27b_reasoning.yaml
 ```
 
-The config wraps Qwen3.6-27B in NF4 QLoRA (r=4) with `use_hf_native: true` for Gated DeltaNet compatibility. Trajectory-guided masking is active via `DataCollatorWithTrajectoryMasking` — every 200 steps, three wandb panels log to `wandb.ai/snoozie/open-dllm-27b`:
+The config wraps Qwen3.6-27B in NF4 QLoRA (r=4) with `use_hf_native: true` for Gated DeltaNet compatibility. Setting `trajectory_data_path` switches the dataloader to `process_prompt_response_example` (matching the gen tokenization, one chunk per sample) and the collator to `DataCollatorWithTrajectoryMasking` (response-only masking using each sample's `prompt_len`). Every 200 steps three wandb panels log to `wandb.ai/snoozie/open-dllm-27b`:
 
 | Panel | Key | What it shows |
 |-------|-----|---------------|
@@ -175,18 +179,35 @@ model:
   enable_qlorafy: true
   qlorafy_config:
     use_hf_native: true           # Required for Gated DeltaNet
-    r: 4                          # r=4 fits better on 32 GB
+    r: 4                          # r=4 fits on 32 GB at seq_len 1024
+
+data:
+  train_path: /path/to/data.jsonl # {idx, prompt, response} JSONL
+  max_seq_len: 1024               # collator slices trajectory to first L positions
 
 train:
-  max_seq_len: 512                # Reduce to 1024 if VRAM allows
   enable_masking: true
   repr_align_wt: 0.0              # Pure d3LLM, no repr-align
 
   trajectory_data_path: /path/to/trajectories.jsonl
-  trajectory_min_mask_ratio: 0.1
-  trajectory_max_mask_ratio: 0.5
-  trajectory_entropy_weight: 0.1
+  trajectory_min_mask_ratio: 0.05 # full curriculum sweep
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0  # disabled by default; enable for sharpening once baseline lands
 ```
+
+> **Curriculum schedule**: `mask_ratio` is interpolated linearly from `trajectory_min_mask_ratio` → `trajectory_max_mask_ratio` over `train_steps × num_train_epochs` (paced across the full run, not just epoch 1).
+
+### Why the original d3LLM-27B run was meh
+
+The first run ([wandb v4gxqrxa](https://wandb.ai/snoozie/open-dllm-27b/runs/v4gxqrxa), 6 h, weak quality) was compounded by:
+
+1. **Degenerate trajectory data** — entropy-threshold decode dumped ~75% of response tokens on iteration 1 (model too confident under the 1.5-nat threshold), then plateaued at ~19% mask for 30 more steps before force-filling on the last. Every "step" looked identical → trajectory carried **no ordering signal**. Equivalent to training with one fixed random mask. *Fix: scheduled top-k decode.*
+2. **Tokenization & chunking mismatch** — gen used `tok(prompt) + tok(response)`, train used `tok(prompt+response)` split into 512-token chunks. Chunks beyond #0 silently reused `trajectory[0:512]`. *Fix: new `process_prompt_response_example` transform; one chunk per sample, matching gen tokenization.*
+3. **Prompt-position loss leak** — collator masked the entire sequence; prompt tokens could become loss targets. *Fix: collator masks `[prompt_len:L]` only.*
+4. **Curriculum saturated in epoch 1** — `progress = step / train_steps` hit max by step 500, then plateaued for 9 epochs. *Fix: pace across `train_steps × num_train_epochs`.*
+5. **Narrow mask range [0.1, 0.5]** — never exposed the heavy-masking regime where ordering matters most. *Fix: widened to [0.05, 0.95].*
+
+Still unaddressed (cheap follow-ups if v2 results still trail): `<M>` embedding + `lm_head` row are frozen at random-init under QLoRA, and r=4 / 500 samples is below the data×capacity threshold for reasoning gains.
 
 ---
 
@@ -466,7 +487,7 @@ Open-dLLM supports three approaches for converting an autoregressive LM into a d
 
 ### Recommended: d3LLM Trajectory Distillation
 
-Uses pre-computed entropy trajectories from the model itself to guide training-time masking. Trains faster and with better convergence than random masking. See [d3LLM Training section](#-d3llm-trajectory-training-27b-qwen36) for the full recipe using Qwen3.6-27B with QLoRA.
+Uses pre-computed scheduled-decode trajectories from the model itself to guide training-time masking — each trajectory step decodes the lowest-entropy `ceil(n_resp / num_steps)` masked positions, yielding a monotonic mask-ratio curriculum. See [d3LLM Training section](#-d3llm-trajectory-training-27b-qwen36) for the full recipe using Qwen3.6-27B with QLoRA.
 
 ### Representation Alignment (Light)
 
@@ -694,7 +715,7 @@ See [`docs/ldlm.md`](docs/ldlm.md) for architecture comparison table (paper vs 3
 |---|-----------|--------------|--------|-----------|
 | L1 | **Reduce per-step cost** (KV-cache, fused kernels) | ≥2× tok/s (27B: 115→230) | 🟢 active | ~138ms/step is model-bound; KV-cache or fused DeltaNet attention could halve it. Highest single-lever gain. |
 | L2 | **27B comparison grid** (reproduce 1.7B findings at scale) | ppl ≤ 2.0, ≥0.7× baseline throughput | 🟡 blocked (compute) | The 1.7B findings need verification at 27B. Requires 2× Blackwell or cloud rental. |
-| L3 | **d3LLM trajectory training at 27B** (4K ctx, QLoRA) | ppl vs random-mask baseline | 🟢 active | Configs `d3llm_27b_4k.yaml` and `d3llm_27b_100_traj.yaml` exist. Trajectories precomputable via `precompute_trajectories.py --mode entropy --quantize 4bit`. |
+| L3 | **d3LLM trajectory training at 27B** (1K ctx, QLoRA) | ppl vs random-mask baseline | 🟢 active (v2) | v1 run failed silently due to degenerate entropy-threshold trajectories (see post-mortem). v2 uses scheduled top-k decode + response-only masking. Trajectories regenerated via `scripts/gen_trajectories_reasoning.py`; config `d3llm_27b_reasoning.yaml`. |
 | L4 | **Chunked cross-entropy for long context** (seq_len > 2K) | Stable training at 4K+ ctx | ✅ done | Landed in `hf_mdm_qlora.py:_mdm_loss()`. Enables 4096-seq-len training without OOM. |
 | L5 | **Cola DLM training + eval** | ppl, tok/s vs Repr-Align baseline | 🟡 blocked (need results) | `configs/pretrain/compare_50x_cola.yaml` exists. Hierarchical VAE+DiT head on Repr-Align. No benchmark results yet. |
 | L6 | **Full 64-layer alignment on 27B** (verify 60× memory ratio) | Expected: 21 MB vs 1.3 GB alignment activations | 🟡 blocked (compute) | Verified on 1.7B (zero VRAM difference). Ratio calculated, not measured. Requires 27B run. |
