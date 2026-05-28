@@ -1,0 +1,110 @@
+# d3LLM 27B v5 — rebalance Repr-Align so it actually pulls the student
+#
+# v4 diagnosis (15k-step run, wandb gtuexatl):
+#   - mdm dropped 70% (24.78 → 4.66) — token prediction was fine
+#   - repr_align REGRESSED 0.36 → 0.44 — cosine sim drifted DOWN over training
+#   - root cause: repr_align contributed only ~4% of total loss
+#     · repr_align_wt = 0.5 (too low)
+#     · Min-SNR amplified mdm by up to 5× but not repr_align (asymmetric)
+#     · bidirectional student + causal teacher diverge structurally as
+#       MDM gets better; weak alignment can't restrain it
+#     · layer_exp = 2.0 over-emphasized layer 64, the hardest to align
+#
+# v5 deltas:
+#   1. repr_align_wt: 0.5 → 5.0           (10× — brings to ~30-50% of loss)
+#   2. repr_align_layer_exp: 2.0 → 0.0    (uniform weighting; spreads pressure
+#                                          to easier-to-align early/mid layers)
+#   3. Code patch in hf_mdm_qlora.py: apply Min-SNR weight to align_loss too
+#      (restores symmetry; mdm and repr_align now scale together with mask_ratio)
+#   4. max_steps: 15000 → 5000            (we should know by step 1500-2000
+#                                          whether repr_align is actually
+#                                          dropping; if so, extend later)
+#
+# Everything else identical to v4 (data, trajectories, anchor cache, rank, etc.)
+# so the comparison isolates the alignment-strength fix.
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+      - embed_tokens
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 500
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v5
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 500
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 10
+  max_steps: 5000                  # short run to confirm repr_align actually drops
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 2e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  # d3LLM trajectory-guided masking (unchanged from v4)
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  # Repr-Align rebalanced
+  repr_align_wt: 5.0                     # was 0.5
+  anchor_cache_dir: /run/media/johndpope/12TB/open_dllm/anchors/qwen3.6-27b-reasoning-500
+  align_layers: "16,32,48,64"
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 2
+  repr_align_layer_exp: 0.0              # was 2.0 — uniform now
+
+  min_snr_gamma: 5.0                     # now applies to repr_align too (code patch)
+
+  gen_sample_every_steps: 500
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-reasoning-500-v5-rebalanced

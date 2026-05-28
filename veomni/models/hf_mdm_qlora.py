@@ -195,11 +195,22 @@ class MDMQLoRAWrapper(nn.Module):
                 )
 
             if n_aligned > 0:
-                # align_loss is already normalized (cosine: weighted avg; contrastive: CE)
-                if loss is not None:
-                    loss = loss + repr_align_wt * align_loss
+                # align_loss is already normalized (cosine: weighted avg; contrastive: CE).
+                # Apply the same Min-SNR weight to repr_align as _mdm_loss applies to
+                # mdm/path, so the asymmetry doesn't structurally favor MDM and the
+                # student doesn't drift away from teacher representations as it learns
+                # to predict tokens (observed in v4 — see issue analysis).
+                _msg = getattr(self, "min_snr_gamma", None)
+                if mask_ratio is not None and _msg is not None and _msg > 0:
+                    _r = mask_ratio.float().mean().clamp(min=1e-3)
+                    _w = (1.0 / _r).clamp(max=float(_msg))
+                    _align_term = repr_align_wt * align_loss * _w
                 else:
-                    loss = repr_align_wt * align_loss
+                    _align_term = repr_align_wt * align_loss
+                if loss is not None:
+                    loss = loss + _align_term
+                else:
+                    loss = _align_term
                 comps["repr_align"] = align_loss.detach().item()
                 if self._vis_step:
                     self._vis_data = {
