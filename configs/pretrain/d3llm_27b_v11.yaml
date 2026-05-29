@@ -74,7 +74,12 @@ train:
   num_train_epochs: 40
   max_steps: 5000
   micro_batch_size: 1
-  global_batch_size: 2   # 2-GPU DDP → 1 per rank
+  # Single-GPU first. Overfit diagnostic peaked at 26.48 GB VRAM — that's
+  # over the PRO 4000's 24 GB ceiling, so 2-GPU DDP would OOM on the smaller
+  # rank. Launch on the 5090 only via CUDA_VISIBLE_DEVICES=1. The auto.py
+  # LOCAL_RANK fix is in place for the next run that uses both GPUs (will
+  # need seq_len reduction or FSDP-style sharding to actually fit).
+  global_batch_size: 1
   lr: 1e-4
   weight_decay: 0.01
   optimizer: adamw

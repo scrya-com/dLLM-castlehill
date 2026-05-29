@@ -92,10 +92,16 @@ def build_foundation_model(
             from .hf_mdm_qlora import build_hf_mdm_qlora
 
             logger.info_rank0("Loading model via HF-native MDM QLoRA wrapper (Option A)")
+            # Under torchrun multi-GPU DDP, each rank must load its model copy
+            # onto its own GPU (cuda:LOCAL_RANK), not all onto cuda:0. The
+            # previous hardcoded "cuda:0" caused both ranks to load on the same
+            # GPU, OOMing the 5090 with 2× 15GB allocations.
+            import os
+            _default_device = f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
             return build_hf_mdm_qlora(
                 weights_path or config_path,
                 qlorafy_config=_qc,
-                device=_qc.get("device", "cuda:0"),
+                device=_qc.get("device", _default_device),
                 align_layers=align_layers,
                 anchor_cache_dir=anchor_cache_dir,
                 repr_align_sub_sample_ratio=repr_align_sub_sample_ratio,
