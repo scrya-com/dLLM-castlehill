@@ -374,16 +374,30 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
     ])
-    lora = LoraConfig(
-        r=cfg.get("r", 16), lora_alpha=cfg.get("lora_alpha", 32),
-        lora_dropout=cfg.get("lora_dropout", 0.05), target_modules=targets,
-        task_type=TaskType.CAUSAL_LM,
-        use_rslora=cfg.get("use_rslora", True),
-        use_dora=cfg.get("use_dora", False),
-        modules_to_save=cfg.get("modules_to_save", None),
-        bias=cfg.get("bias", "none"),
-    )
-    base = get_peft_model(base, lora)
+    # Warm-start: load a previously-saved LoRA adapter instead of fresh-init.
+    # Used by v9+ to resume from v6's converged adapter (saves ~1500 cold-start
+    # steps and gives a direct A/B vs v6 with one variable changed — the new
+    # subgoal_align loss — and the LoRA weights identical at step 0).
+    # Caveat: PEFT only restores the adapter matrices; optimizer state, RNG,
+    # and global_step are not part of the safetensors. The caller is
+    # responsible for flattening curricula in the resume yaml so they don't
+    # un-train the warm-started weights (see configs/pretrain/d3llm_27b_v9.yaml).
+    _resume_path = cfg.get("resume_adapter_path", None)
+    if _resume_path:
+        from peft import PeftModel
+        print(f"[hf_mdm_qlora] WARM-START: loading LoRA adapter from {_resume_path}")
+        base = PeftModel.from_pretrained(base, _resume_path, is_trainable=True)
+    else:
+        lora = LoraConfig(
+            r=cfg.get("r", 16), lora_alpha=cfg.get("lora_alpha", 32),
+            lora_dropout=cfg.get("lora_dropout", 0.05), target_modules=targets,
+            task_type=TaskType.CAUSAL_LM,
+            use_rslora=cfg.get("use_rslora", True),
+            use_dora=cfg.get("use_dora", False),
+            modules_to_save=cfg.get("modules_to_save", None),
+            bias=cfg.get("bias", "none"),
+        )
+        base = get_peft_model(base, lora)
     base.print_trainable_parameters()
     wrapper = MDMQLoRAWrapper(base)
     if align_layers is not None:

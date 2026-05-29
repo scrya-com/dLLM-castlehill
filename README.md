@@ -290,7 +290,7 @@ Ran 5,000 steps in ~3.5 h ([wandb `d3llm-27b-reasoning-500-v5-rebalanced`](https
 
 **LoRA sanity check at step 5000** also surfaced something nasty: `embed_tokens.lora_embedding_B` had mean|w|=**0.78** and max=**3.94** — vs ~0.01 for every other LoRA_B in the model. The `<M>` token row was being pushed by ~80× the network scale, plausibly contributing to the plateau by perturbing the input layer in a direction the frozen teacher's embedding never moves.
 
-### v6 — angular loss + 16-layer subsample + LLRD + curriculum (current run)
+### v6 — angular loss + 16-layer subsample + LLRD + curriculum
 
 [`configs/pretrain/d3llm_27b_v6.yaml`](configs/pretrain/d3llm_27b_v6.yaml). Combined fixes to the v5 plateau:
 
@@ -310,6 +310,66 @@ Ran 5,000 steps in ~3.5 h ([wandb `d3llm-27b-reasoning-500-v5-rebalanced`](https
 - `repr_align/wt_effective` — current curriculum-adjusted weight. v3–v5 logged the yaml's *starting* `repr_align_wt`; the wt actually changed over the run.
 - `llrd/lr_min` / `llrd/lr_max` — actual LR range across the 64 layer groups. `training/lr` only shows the base.
 
+**Result:** repr_align trailing-mean (last 2000 samples) = **0.218** — 22% below v5's 0.28 plateau. Angular + LLRD + 16-layer coverage broke the v5 floor. The per-token cosine still asymptotes because of the structural causal-vs-bidirectional mismatch (same token has fundamentally different attention context in teacher vs student). To go lower, we need an alignment objective that doesn't depend on per-token positional agreement.
+
+### v7 — Bidirectional Diffusion Search (designed, not built)
+
+Reimagining of [Xu et al., "Self-Improving Language Models with Bidirectional Evolutionary Search"](https://arxiv.org/abs/2605.28814) with diffusion as the first-class primitive. Forward phase = full-trajectory denoising from noise; backward phase = hierarchical subgoal conditioning at multiple noise scales. *Skipped* — needs a verifier + recursive-decomposition pipeline we don't have. The implementable nugget moves to v8 below.
+
+### v8 — block-level subgoal alignment + viz restored
+
+[`configs/pretrain/d3llm_27b_v8.yaml`](configs/pretrain/d3llm_27b_v8.yaml). BDS-inspired block-level alignment as an *auxiliary* loss alongside v6's per-token angular. Treats each contiguous chunk of the response (opening / premise / derivation / conclusion) as an implicit subgoal; aligns student-block-mean vs teacher-block-mean. Block-averaging washes out per-token causal/bidirectional positional disagreement → can converge well below the per-token floor.
+
+| Change | Effect |
+|---|---|
+| **`_subgoal_align_loss`** in `hf_mdm_qlora.py` (refs arXiv:2605.28814 BES + arXiv:2605.06885 Repr-Align) | New auxiliary loss term emitted as `loss_components["subgoal_align"]`. Same Min-SNR scaling as repr_align for symmetry. |
+| **`subgoal_align_wt: 1.0`**, **`subgoal_align_n_blocks: 4`** in yaml | Activates the block loss; tunable per run |
+| **Viz bug fix: `(16,) vs (4,)` shape mismatch** | `_vis_data['layer_indices']` now stores the *subsampled* indices, not the full `align_layers` list |
+| **Viz bug fix: `micro_batch` scoping** | Stable `_last_micro_batch` handle so post-loop d3llm-vis works even when the inner loop body was skipped |
+
+v8 was launched as a cold-start and killed early when the resume mechanism for v9 was ready (the warm-start gives v9 a more direct A/B vs v6).
+
+### v9 — warm-start the LoRA from v6's converged adapter (current run)
+
+[`configs/pretrain/d3llm_27b_v9.yaml`](configs/pretrain/d3llm_27b_v9.yaml). Adds a `resume_adapter_path` knob to `qlorafy_config`. When set, `build_hf_mdm_qlora` swaps `get_peft_model(base, config)` for `PeftModel.from_pretrained(base, resume_adapter_path, is_trainable=True)` — LoRA matrices start at v6's step-5000 values instead of fresh-random init.
+
+**Resume — what's preserved and what isn't**:
+
+| | Preserved | Resets | Why it matters |
+|---|---|---|---|
+| LoRA matrix weights | ✅ exact | — | adapter byte-identical to v6 end |
+| Optimizer (Adam moments) | — | ❌ | first ~100 steps oscillate as Adam re-estimates variance |
+| LR scheduler step | — | ❌ | nil here — flat lr 2e-4, no warmup |
+| Dataloader / RNG | — | ❌ | re-shuffles the 500 samples; per-step layer/token subsamples differ from v6 |
+| `global_step` counter | — | ❌ | **would re-trigger curriculum schedules from t=0 and un-train the warm-started weights** — mitigated by *flattening* curricula in the v9 yaml (`repr_align_wt: 0.5 / 0.5`, same start and end) |
+| `current_mask_ratio` | — | ❌ | restarts curriculum from `trajectory_min_mask_ratio`; we left the full [0.05, 0.95] range so mask_ratio diversity is preserved (the adapter has seen the full range already in v6) |
+| Vis history rings | — | ❌ | cosmetic |
+| NF4 base re-quantization | usually bit-identical | — | deterministic per `BitsAndBytesConfig`; same env → same NF4 weights |
+
+**Smoke (5 steps) confirms the warm-start works**:
+
+| | v6 step 1 (cold) | v9 step 1 (warm from v6 step 5000) |
+|---|---|---|
+| `mdm` | 38.63 | **5.42** |
+| `repr_align` | 0.50 | **0.03** (under the 0.5 rad margin → near-zero gradient) |
+| `subgoal_align` | n/a | **0.08** (active gradient still available) |
+| Log line | — | `[hf_mdm_qlora] WARM-START: loading LoRA adapter from .../global_step_5000` |
+
+Hypothesis: v6's per-token-aligned adapter is a *good starting point* for the new block-level objective. If yes → v9 final `subgoal_align` < v8's cold-start value. If no → the structural mismatch carries over to block level too.
+
+**To use the resume path for your own run**:
+```yaml
+model:
+  qlorafy_config:
+    use_hf_native: true
+    r: 8                                       # MUST MATCH the saved adapter
+    lora_alpha: 32                             # MUST MATCH
+    target_modules: [...]                       # MUST MATCH (same list)
+    use_rslora: true                           # MUST MATCH
+    resume_adapter_path: /path/to/global_step_N  # NEW — path to a v6+ checkpoint
+```
+PEFT raises a clear error if the rank / targets / dora-vs-not don't match the saved adapter.
+
 ## 📚 Training-run breadcrumb trail
 
 The d3LLM-27B work is a sequence of runs, each isolating a different fix to the previous one's failure mode. Read top-to-bottom:
@@ -321,7 +381,10 @@ The d3LLM-27B work is a sequence of runs, each isolating a different fix to the 
 | **v3** | [`d3llm_27b_reasoning.yaml`](configs/pretrain/d3llm_27b_reasoning.yaml) | [`x8rnrpmd`](https://wandb.ai/snoozie/open-dllm-27b) | r=8 + rsLoRA + `embed_tokens` LoRA + Min-SNR γ=5; ran 15k steps | Memory-ceiling map (DoRA, AdamW8bit both fail on Blackwell 27B); training stages curriculum |
 | **v4** | [`d3llm_27b_v4.yaml`](configs/pretrain/d3llm_27b_v4.yaml) | [`gtuexatl`](https://wandb.ai/snoozie/open-dllm-27b/runs/gtuexatl) | v3 + Repr-Align via anchor cache (4 layers, `wt=0.5`) | repr_align *regressed* 0.36 → 0.44. Asymmetric Min-SNR + too-weak `wt` + structural mismatch |
 | **v5** | [`d3llm_27b_v5.yaml`](configs/pretrain/d3llm_27b_v5.yaml) | `d3llm-27b-reasoning-500-v5-rebalanced` | `wt: 5.0`, Min-SNR applied to align loss, uniform layer weighting | repr_align finally moves right way (0.37 → 0.28), but plateaus. Cosine has vanishing gradient + structural floor. LoRA sanity check: `embed_tokens.lora_embedding_B` runaway. |
-| **v6** (current) | [`d3llm_27b_v6.yaml`](configs/pretrain/d3llm_27b_v6.yaml) | `d3llm-27b-reasoning-500-v6-angular-16L` | Angular loss + margin, 16 layers with k=4 subsample, drop embed LoRA, LLRD 0.85, curriculum 2.0 → 0.5 | TBD |
+| **v6** | [`d3llm_27b_v6.yaml`](configs/pretrain/d3llm_27b_v6.yaml) | `d3llm-27b-reasoning-500-v6-angular-16L` | Angular loss + margin, 16 layers with k=4 subsample, drop embed LoRA, LLRD 0.85, curriculum 2.0 → 0.5 | repr_align trailing-mean 0.218 (22% below v5). Per-token cosine still asymptotes — structural mismatch is per-token. Two viz panels silently broken. |
+| **v7** | (design only) | — | BDS — diffusion-first reimagining of arXiv:2605.28814 | Needs verifier + recursive decomposition infra. Implementable nugget moves to v8. |
+| **v8** | [`d3llm_27b_v8.yaml`](configs/pretrain/d3llm_27b_v8.yaml) | `d3llm-27b-reasoning-500-v8-subgoal` | v6 + `subgoal_align` block-mean auxiliary loss; viz bugs fixed | Killed early; warm-start mechanism for v9 supersedes the cold-start ablation. |
+| **v9** (current) | [`d3llm_27b_v9.yaml`](configs/pretrain/d3llm_27b_v9.yaml) | `d3llm-27b-reasoning-500-v9-warmstart-from-v6` | Warm-start LoRA from v6 step_5000 + v8's `subgoal_align` loss + flat repr_align curriculum (no un-training) | TBD |
 
 ### How to reproduce any run
 
