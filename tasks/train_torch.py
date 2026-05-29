@@ -436,6 +436,8 @@ def main():
         repr_align_layer_exp=getattr(args.train, "repr_align_layer_exp", 0.0),
         repr_align_contrastive=getattr(args.train, "repr_align_contrastive", False),
         repr_align_contrastive_temp=getattr(args.train, "repr_align_contrastive_temp", 0.07),
+        repr_align_loss_mode=getattr(args.train, "repr_align_loss_mode", "cosine"),
+        repr_align_angular_margin=getattr(args.train, "repr_align_angular_margin", 0.0),
         enable_nvfp4_qat=getattr(args.model, "enable_nvfp4_qat", False),
         enable_qlorafy=getattr(args.model, "enable_qlorafy", False),
         qlorafy_config=getattr(args.model, "qlorafy_config", None),

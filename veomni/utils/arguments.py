@@ -334,6 +334,14 @@ class TrainingArguments:
         default=0.07,
         metadata={"help": "Temperature τ for InfoNCE contrastive repr_align loss. Lower = sharper distribution. 0.07 is SimCLR default."},
     )
+    repr_align_loss_mode: str = field(
+        default="cosine",
+        metadata={"help": "Repr-Align loss formulation. 'cosine' (default, 1-cos_sim, gradient vanishes near alignment), 'angular' (arccos(cos_sim) in radians, gradient INCREASES near alignment so it keeps pushing to 0), 'infonce' (same as repr_align_contrastive=True)."},
+    )
+    repr_align_angular_margin: float = field(
+        default=0.0,
+        metadata={"help": "When repr_align_loss_mode='angular', clamp loss below this many radians to 0. Honest accounting of the structural causal-vs-bidirectional floor — once the student is within `margin` radians of the teacher, the loss reads 0. 0 = no margin (default)."},
+    )
     llrd_decay: float = field(
         default=0.0,
         metadata={"help": "Layer-wise LR decay for LoRA adapters. lr * decay^(layer_depth_fraction). 0=disabled (flat LR). 0.85 is typical for NLP fine-tuning."},

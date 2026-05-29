@@ -20,17 +20,32 @@ import torch.nn.functional as F
 from ..data.constants import IGNORE_INDEX
 
 
-def _repr_align_loss(z1, z2, layer_weights=None, contrastive=False, contrastive_temp=0.07):
-    """Cosine alignment or InfoNCE contrastive loss for repr-align.
+def _repr_align_loss(z1, z2, layer_weights=None, contrastive=False, contrastive_temp=0.07,
+                     mode="cosine", angular_margin=0.0):
+    """Alignment loss for repr-align.
 
     z1, z2: [N_tokens, N_layers, D]
     layer_weights: [N_layers] summing to 1, or None (uniform)
+
+    mode:
+        "cosine"  — `1 - cos_sim`. Gradient vanishes near alignment (cos→1),
+                    floors at the structural causal-vs-bidirectional gap.
+        "angular" — `arccos(cos_sim)` in radians, range [0, π]. Gradient
+                    `1/sqrt(1-cos²)` INCREASES as cos → 1, so it keeps
+                    pushing right up to perfect alignment instead of giving
+                    up at the cosine plateau. Drop-in replacement.
+        "infonce" — equivalent to contrastive=True (kept for explicit-mode API).
+
+    angular_margin: clamp the angular loss below `margin` to zero.
+        Honest accounting of the structural floor — once you're within
+        `margin` radians of the teacher (e.g., 0.6 rad ≈ 35°), the loss
+        reads 0 instead of asymptoting above 0. Only used when mode="angular".
     """
     if z1.size(0) == 0:
         return z1.sum() * 0.0  # empty batch — return zero with grad
     z1n = F.normalize(z1, p=2, dim=-1)
     z2n = F.normalize(z2, p=2, dim=-1)
-    if contrastive:
+    if contrastive or mode == "infonce":
         # Pool over layers → [N, D], then InfoNCE with sequence-position negatives
         if layer_weights is not None:
             z1n = (z1n * layer_weights.view(1, -1, 1)).sum(dim=1)
@@ -43,7 +58,19 @@ def _repr_align_loss(z1, z2, layer_weights=None, contrastive=False, contrastive_
         logits = (z1n @ z2n.T) / contrastive_temp
         labels = torch.arange(logits.size(0), device=logits.device)
         return F.cross_entropy(logits, labels)
+
     cosine_sim = (z1n * z2n).sum(dim=-1)  # [N, L]
+    if mode == "angular":
+        # Clamp inside [-1, 1] domain of acos with eps margin to avoid NaN
+        cs = cosine_sim.clamp(min=-1.0 + 1e-6, max=1.0 - 1e-6)
+        per_token_layer = torch.acos(cs)  # radians [0, π]
+        if angular_margin > 0:
+            per_token_layer = (per_token_layer - angular_margin).clamp_min(0.0)
+        if layer_weights is not None:
+            return (per_token_layer * layer_weights.unsqueeze(0)).sum(dim=-1).mean()
+        return per_token_layer.mean()
+
+    # Default: cosine
     if layer_weights is not None:
         return ((1.0 - cosine_sim) * layer_weights.unsqueeze(0)).sum(dim=-1).mean()
     return 1.0 - cosine_sim.mean()
@@ -99,6 +126,11 @@ class MDMQLoRAWrapper(nn.Module):
         self.repr_align_layer_exp = 0.0
         self.repr_align_contrastive = False
         self.repr_align_contrastive_temp = 0.07
+        # Loss formulation knobs (v6+):
+        # mode="cosine" (default, back-compat), "angular", "infonce"
+        # angular_margin: clamp angular loss below this many radians to zero
+        self.repr_align_loss_mode = "cosine"
+        self.repr_align_angular_margin = 0.0
         # Visualization: set _vis_step=True before a forward to capture tensors
         self._vis_step = False
         self._vis_data = None
@@ -192,6 +224,8 @@ class MDMQLoRAWrapper(nn.Module):
                     layer_weights=_layer_weights_t,
                     contrastive=self.repr_align_contrastive,
                     contrastive_temp=self.repr_align_contrastive_temp,
+                    mode=getattr(self, "repr_align_loss_mode", "cosine"),
+                    angular_margin=getattr(self, "repr_align_angular_margin", 0.0),
                 )
 
             if n_aligned > 0:
@@ -226,7 +260,8 @@ class MDMQLoRAWrapper(nn.Module):
 def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
                         align_layers=None, anchor_cache_dir=None,
                         repr_align_sub_sample_ratio=1.0, repr_align_layer_exp=0.0,
-                        repr_align_contrastive=False, repr_align_contrastive_temp=0.07, **kw):
+                        repr_align_contrastive=False, repr_align_contrastive_temp=0.07,
+                        repr_align_loss_mode="cosine", repr_align_angular_margin=0.0, **kw):
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 
@@ -266,6 +301,8 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
     wrapper.repr_align_layer_exp = repr_align_layer_exp
     wrapper.repr_align_contrastive = repr_align_contrastive
     wrapper.repr_align_contrastive_temp = repr_align_contrastive_temp
+    wrapper.repr_align_loss_mode = repr_align_loss_mode
+    wrapper.repr_align_angular_margin = repr_align_angular_margin
     if anchor_cache_dir:
         from .cached_teacher import CachedTeacher
         # Qwen3_5Config stores hidden_size inside text_config

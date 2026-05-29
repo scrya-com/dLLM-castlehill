@@ -64,6 +64,8 @@ def build_foundation_model(
     repr_align_layer_exp: float = 0.0,
     repr_align_contrastive: bool = False,
     repr_align_contrastive_temp: float = 0.07,
+    repr_align_loss_mode: str = "cosine",
+    repr_align_angular_margin: float = 0.0,
     enable_nvfp4_qat: bool = False,
     enable_qlorafy: bool = False,
     qlorafy_config: Optional[Dict] = None,
@@ -97,6 +99,8 @@ def build_foundation_model(
                 repr_align_layer_exp=repr_align_layer_exp,
                 repr_align_contrastive=repr_align_contrastive,
                 repr_align_contrastive_temp=repr_align_contrastive_temp,
+                repr_align_loss_mode=repr_align_loss_mode,
+                repr_align_angular_margin=repr_align_angular_margin,
             )
         from .qlorafy import QLoRAConfig, build_qlorafied_model
 
