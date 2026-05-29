@@ -279,6 +279,51 @@ Balls synthesis produces a Flywheel Node that must appear in **both**:
 If (a) and (b) diverge, the README is stale — fix it before moving to the next
 task. A commit that ships code without syncing the README is a defect.
 
+### Spoonfeed mode (also non-negotiable)
+
+Every commit that introduces a new training run, new precompute step, new cache
+artifact, new wandb metric, or new launch path **must** add the corresponding
+**user-followable breadcrumb** to the README. The default assumption is that a
+reader arriving cold from GitHub knows nothing about prior runs, internal
+chat history, or what changed when.
+
+#### Triggers for breadcrumb updates
+- New training-run version (v3 → v4 → v5 → ...): append a row to the
+  **Training-run breadcrumb trail** table in README (run name, config path,
+  wandb link, what it tried, what it taught). Include the failure mode of the
+  predecessor as the *motivation* for this run.
+- New precompute step (anchor cache, trajectory file, frozen-teacher dump):
+  document **how to calculate it to disk** — the exact command, the expected
+  wall-time, the expected disk size, the layers/dtype/seq_len arguments, and
+  why those values match training.
+- New cache artifact on disk: document the **storage path convention** and the
+  hash-key contract (e.g. `sha256(input_ids)` for anchor cache → both
+  precompute and training tokenizations must produce identical input_ids).
+- New wandb metric: document what it means and what to watch for. If the metric
+  is a curriculum-adjusted version of a yaml setting (e.g. `wt_effective` vs the
+  yaml's `wt`), say so explicitly — the chart is otherwise misleading.
+- New launch path or pipeline: include a 3-step reproduce recipe (precompute →
+  precompute → train) so a reader can rerun the experiment from scratch.
+
+#### What "spoonfeed" means concretely
+- **Exact commands, not pseudo-commands.** Real paths, real flags, real layer
+  lists. Reader should be able to copy-paste.
+- **Estimated wall-time and disk usage** at the recipe step. Saves the reader
+  from finding out the hard way that a precompute takes 4 hours and 80 GB.
+- **The "why" beside the "how".** Each non-default flag gets a one-line
+  rationale (e.g. `--data_type prompt_response  # match training tokenization
+  so CachedTeacher SHA-256 lookups hit`).
+- **Failure modes called out.** If skipping a step degrades silently (e.g.
+  forgetting `--add_mask_token` makes the lookups miss but training continues
+  with no error), name the silent failure explicitly.
+- **Link configs and wandb runs by name.** Each run gets a table row with the
+  exact `configs/pretrain/d3llm_27b_vN.yaml` path and the wandb URL.
+
+A commit that ships a new training run or new cache type **without** the
+matching breadcrumb is a defect, same as a stale Flywheel graph. The README
+is the user manual; if the README doesn't tell a reader how to reproduce the
+run we just shipped, we shipped half the work.
+
 
 ## Architecture
 
