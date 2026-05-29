@@ -194,11 +194,32 @@ class MDMQLoRAWrapper(nn.Module):
             else:
                 _layer_weights_t = None
 
+            # Pre-loop layer subsample: pick k of L align_layers BEFORE materializing
+            # fp32 tensors. Without this, every align_layer is upcast (4× memory) and
+            # subsampled only at the cosine compute. With it, only k layers are
+            # materialized → bumping align_layers from 4 → 16 costs the same VRAM as
+            # before. Coverage of all configured layers happens stochastically over
+            # many steps.
+            _step_align_layers = list(self.align_layers)
+            _n_sample_layers = getattr(self, "repr_align_num_sample_layers", None)
+            if self.training and _n_sample_layers is not None and _n_sample_layers > 0 \
+                    and _n_sample_layers < len(_step_align_layers):
+                # torch.randperm so it's deterministic under the active generator state
+                _idx = torch.randperm(len(_step_align_layers))[:int(_n_sample_layers)].tolist()
+                _step_align_layers = sorted(_step_align_layers[i] for i in _idx)
+
+            # If we used exponential layer weights above, re-weight to the SUBSAMPLED layers
+            if _layer_weights_t is not None and _step_align_layers != list(self.align_layers):
+                _full_indices = list(self.align_layers)
+                _sub_positions = [_full_indices.index(li) for li in _step_align_layers]
+                _layer_weights_t = _layer_weights_t[_sub_positions]
+                _layer_weights_t = _layer_weights_t / _layer_weights_t.sum()
+
             # Collect per-layer hiddens with a SHARED token permutation so stacking works.
             # (Shared perm is required for contrastive mode; harmless for cosine mode.)
             _s_layers, _t_layers = [], []
             _shared_perm = None
-            for layer_idx in self.align_layers:
+            for layer_idx in _step_align_layers:
                 s = student_hiddens[layer_idx][:, :-1, :].float().squeeze(0)  # [L-1, D]
                 t = teacher_hiddens[layer_idx][:, :-1, :].float().squeeze(0)
                 if loss_mask is not None and loss_mask.any():
@@ -261,7 +282,8 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
                         align_layers=None, anchor_cache_dir=None,
                         repr_align_sub_sample_ratio=1.0, repr_align_layer_exp=0.0,
                         repr_align_contrastive=False, repr_align_contrastive_temp=0.07,
-                        repr_align_loss_mode="cosine", repr_align_angular_margin=0.0, **kw):
+                        repr_align_loss_mode="cosine", repr_align_angular_margin=0.0,
+                        repr_align_num_sample_layers=None, **kw):
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 
@@ -303,6 +325,7 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
     wrapper.repr_align_contrastive_temp = repr_align_contrastive_temp
     wrapper.repr_align_loss_mode = repr_align_loss_mode
     wrapper.repr_align_angular_margin = repr_align_angular_margin
+    wrapper.repr_align_num_sample_layers = repr_align_num_sample_layers
     if anchor_cache_dir:
         from .cached_teacher import CachedTeacher
         # Qwen3_5Config stores hidden_size inside text_config

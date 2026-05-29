@@ -255,6 +255,99 @@ Config: [`configs/pretrain/d3llm_27b_v4.yaml`](configs/pretrain/d3llm_27b_v4.yam
 
 **Smoke-test verified (5 steps):** loss components now include `repr_align:0.5` alongside `mdm:38.6` and `path:0.26` — CachedTeacher hash lookups hitting, per-layer cosine-sim computing, gradients finite. VRAM peak 26.6 GB. Per-step cost ~2.7 s vs v3's 2.13 s — ~27% slower per step but net convergence should be faster.
 
+### v4 actually ran (15k steps) — Repr-Align silently regressed
+
+v4 trained to completion ([wandb `gtuexatl`](https://wandb.ai/snoozie/open-dllm-27b/runs/gtuexatl)). MDM did its job (mdm dropped 70%, 24.78 → 4.66 across the run), but Repr-Align went **the wrong way**:
+
+| Window | mean repr_align (= 1 − cos_sim) | cos_sim |
+|---|---|---|
+| Steps 100–1,100 (early) | **0.364** | 0.636 |
+| Last 1,000 steps | **0.436** | 0.564 |
+
+Student hidden states drifted **away** from the teacher over training. The PCA viz panel showed two non-converging clusters — because they really were two non-converging clusters at ~55° apart in 5,120-dim space.
+
+Root cause: repr_align contributed only ~4% of total loss → its gradient was 4% of MDM's. Three structural reasons compounded:
+
+| # | Issue | Effect |
+|---|---|---|
+| 1 | `repr_align_wt = 0.5` was too low | Half of what 1.7B configs use (`1.0`), fighting a 27B + Min-SNR-amplified MDM signal |
+| 2 | Min-SNR amplified MDM up to 5× but **not** repr_align | Asymmetric — shifted gradient share toward MDM at low mask_ratio where alignment matters most |
+| 3 | Bidirectional student + causal teacher | Same token has fundamentally different attention context → hidden states *naturally diverge* as student gets better at bidirectional prediction. Weak alignment can't restrain it. |
+
+### v5 — rebalance Repr-Align so it actually pulls the student
+
+[`configs/pretrain/d3llm_27b_v5.yaml`](configs/pretrain/d3llm_27b_v5.yaml). Two deltas vs v4 (everything else identical so the comparison isolates the alignment fix):
+
+1. **`repr_align_wt: 0.5 → 5.0`** — 10× higher, brings the alignment contribution from ~4% to ~20% of total loss.
+2. **Code patch in `veomni/models/hf_mdm_qlora.py`**: apply Min-SNR weight to `align_loss` too. Restores symmetry; mdm/path AND repr_align now scale together with mask_ratio.
+3. **`repr_align_layer_exp: 2.0 → 0.0`** — uniform layer weighting (was over-weighting layer 64, the *hardest* layer to align).
+4. **`max_steps: 15000 → 5000`** — short run to confirm the rebalanced loss actually moves repr_align down before extending.
+
+Ran 5,000 steps in ~3.5 h ([wandb `d3llm-27b-reasoning-500-v5-rebalanced`](https://wandb.ai/snoozie/open-dllm-27b)). repr_align dropped 0.37 → 0.28 (cos_sim 0.63 → 0.72) — moving the right direction this time. But it plateaued at ~0.28 for the last ~3,000 steps. **Two structural reasons it couldn't reach 0:**
+
+1. **Cosine loss has a vanishing gradient near alignment.** `dL/dθ = -sin θ → 0` as θ → 0. The optimizer pushes hardest where you're already wrong, weakest where you're close — the opposite of what closing the gap requires.
+2. **Causal-vs-bidirectional gap is structural.** At position `i`, teacher `h[i]` uses `tokens[0..i]`; student `h[i]` uses up to all *unmasked* tokens. They encode genuinely different information regardless of training.
+
+**LoRA sanity check at step 5000** also surfaced something nasty: `embed_tokens.lora_embedding_B` had mean|w|=**0.78** and max=**3.94** — vs ~0.01 for every other LoRA_B in the model. The `<M>` token row was being pushed by ~80× the network scale, plausibly contributing to the plateau by perturbing the input layer in a direction the frozen teacher's embedding never moves.
+
+### v6 — angular loss + 16-layer subsample + LLRD + curriculum (current run)
+
+[`configs/pretrain/d3llm_27b_v6.yaml`](configs/pretrain/d3llm_27b_v6.yaml). Combined fixes to the v5 plateau:
+
+| Change | What it fixes |
+|---|---|
+| **Angular loss** (`L = arccos(cos_sim)`) with margin `0.5 rad` | Gradient `1/sin(θ)` *increases* as cos → 1, fighting the vanishing-gradient problem. Margin gives an honest floor — below 29° the loss reads 0 (instead of asymptoting above it). |
+| **Pre-loop layer subsample** in `hf_mdm_qlora.py` | Previously only the cosine *compute* was subsampled — all align_layers were materialized as fp32 → bumping `align_layers` increased VRAM linearly. Now only k=4 layers are materialized per step → can configure 16 layers without OOM. |
+| **`align_layers: "4,8,12,...,64"` (16 layers)** + `repr_align_num_sample_layers: 4` | Stochastic coverage of 4× more layers at the same VRAM. Over many steps every layer sees alignment pressure. |
+| **Drop `embed_tokens` from LoRA targets** | Stops the runaway `lora_embedding_B` magnitude observed in v5. `<M>` stays at mean-of-vocab init. |
+| **LLRD `decay=0.85`** | Layer-wise LR decay on LoRA adapters. Bottom layers get 1.7e-4, top get 2.0e-4. Anchors low-level features, lets task-relevant deeper layers move freely. |
+| **Curriculum `repr_align_wt: 2.0 → 0.5`** (cosine decay over the full run) | Strong start to break the plateau; anneals so MDM has room to finish converging. |
+
+**New 16-layer anchor cache** (`scripts/precompute_anchor.py` against `data.jsonl` with `--layers "4,8,12,...,64"` and `--data_type prompt_response`): ~78 GB on disk, ~9 min wall-time on the 5090.
+
+**New wandb metrics** (in [`tasks/train_torch.py`](tasks/train_torch.py)) — surface what v3–v5 silently changed but didn't log:
+
+- `repr_align/wt_effective` — current curriculum-adjusted weight. v3–v5 logged the yaml's *starting* `repr_align_wt`; the wt actually changed over the run.
+- `llrd/lr_min` / `llrd/lr_max` — actual LR range across the 64 layer groups. `training/lr` only shows the base.
+
+## 📚 Training-run breadcrumb trail
+
+The d3LLM-27B work is a sequence of runs, each isolating a different fix to the previous one's failure mode. Read top-to-bottom:
+
+| Run | Config | Wandb | What it tried | What it taught |
+|---|---|---|---|---|
+| **v1** | (pre-fix) | [`v4gxqrxa`](https://wandb.ai/snoozie/open-dllm-27b/runs/v4gxqrxa) | Naïve d3LLM trajectory at 27B | 5 silent bugs in the data path — see [post-mortem](#why-the-original-d3llm-27b-run-was-meh) |
+| **v2** | (interim) | (killed) | The 5 bug fixes (scheduled-decode trajectories, response-only masking, prompt/response transform, full-run curriculum, [0.05, 0.95] mask range) | Pipeline works; never run to completion (skipped to v3) |
+| **v3** | [`d3llm_27b_reasoning.yaml`](configs/pretrain/d3llm_27b_reasoning.yaml) | [`x8rnrpmd`](https://wandb.ai/snoozie/open-dllm-27b) | r=8 + rsLoRA + `embed_tokens` LoRA + Min-SNR γ=5; ran 15k steps | Memory-ceiling map (DoRA, AdamW8bit both fail on Blackwell 27B); training stages curriculum |
+| **v4** | [`d3llm_27b_v4.yaml`](configs/pretrain/d3llm_27b_v4.yaml) | [`gtuexatl`](https://wandb.ai/snoozie/open-dllm-27b/runs/gtuexatl) | v3 + Repr-Align via anchor cache (4 layers, `wt=0.5`) | repr_align *regressed* 0.36 → 0.44. Asymmetric Min-SNR + too-weak `wt` + structural mismatch |
+| **v5** | [`d3llm_27b_v5.yaml`](configs/pretrain/d3llm_27b_v5.yaml) | `d3llm-27b-reasoning-500-v5-rebalanced` | `wt: 5.0`, Min-SNR applied to align loss, uniform layer weighting | repr_align finally moves right way (0.37 → 0.28), but plateaus. Cosine has vanishing gradient + structural floor. LoRA sanity check: `embed_tokens.lora_embedding_B` runaway. |
+| **v6** (current) | [`d3llm_27b_v6.yaml`](configs/pretrain/d3llm_27b_v6.yaml) | `d3llm-27b-reasoning-500-v6-angular-16L` | Angular loss + margin, 16 layers with k=4 subsample, drop embed LoRA, LLRD 0.85, curriculum 2.0 → 0.5 | TBD |
+
+### How to reproduce any run
+
+Each yaml is self-contained. Walk the breadcrumb in two commands:
+
+```bash
+# 1. Precompute the matching trajectory file
+python scripts/gen_trajectories_reasoning.py \
+    --data_path /path/to/data.jsonl \
+    --output_dir /path/to/trajectories/ \
+    --num_steps 32 --max_seq_len 2048
+
+# 2. For v4+, precompute the matching anchor cache (skip if running v1–v3)
+python scripts/precompute_anchor.py \
+    --model_path /path/to/Qwen3.6-27B \
+    --data_path /path/to/data.jsonl \
+    --output_dir /path/to/anchors/ \
+    --layers "16,32,48,64"  \         # or 16-layer set for v6
+    --max_seq_len 1024 \
+    --data_type prompt_response --add_mask_token --quantize 4bit
+
+# 3. Train
+CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    python tasks/train_torch.py configs/pretrain/d3llm_27b_v6.yaml
+```
+
 ---
 
 ## 🗺️ File Map

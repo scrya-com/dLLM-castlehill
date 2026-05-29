@@ -980,6 +980,19 @@ def main():
                     train_metrics.update(
                         {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
                     )
+                    # Curriculum-adjusted Repr-Align weight (silent when no schedule).
+                    # The yaml's repr_align_wt is the *start*; the cosine schedule decays it
+                    # to repr_align_wt_final over the full run. Without this metric the chart
+                    # looks constant when it's actually halving.
+                    if args.train.repr_align_wt > 0:
+                        train_metrics["repr_align/wt_effective"] = _current_repr_align_wt
+                    # LLRD per-layer LR spread (only meaningful when llrd_decay > 0).
+                    # training/lr only reports the base; the actual layers run on different LRs.
+                    if _llrd_param_groups is not None:
+                        _lrs = [g["lr"] for g in _llrd_param_groups if "lr" in g]
+                        if _lrs:
+                            train_metrics["llrd/lr_min"] = min(_lrs)
+                            train_metrics["llrd/lr_max"] = max(_lrs)
                     # ----------------------------------------------------------
                     # Cola DLM extras (only when active). Scalars already
                     # live in step_loss_components → train_metrics; here

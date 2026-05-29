@@ -101,6 +101,7 @@ def build_foundation_model(
                 repr_align_contrastive_temp=repr_align_contrastive_temp,
                 repr_align_loss_mode=repr_align_loss_mode,
                 repr_align_angular_margin=repr_align_angular_margin,
+                repr_align_num_sample_layers=repr_align_num_sample_layers,
             )
         from .qlorafy import QLoRAConfig, build_qlorafied_model
 
