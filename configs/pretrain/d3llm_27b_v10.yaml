@@ -1,0 +1,121 @@
+# d3LLM 27B v10 — anti-repetition loss + warm-start from v6
+#
+# The dominant visible defect in v5/v6/v9 diffusion outputs is repetition:
+# "Topic Topic:", "Key - **Key Concept**", "Initial Initial Knowledge".
+# This is a factorization failure — MDM trains the per-position marginals
+# p(x_i | context), but parallel decoding at inference samples each masked
+# position independently from those marginals. When the marginals at i and
+# i+1 both peak at the same token (which they do in bullet-list scaffolds),
+# the joint decode emits the repeat.
+#
+# Fix (v10): add `anti_rep_wt` term to the MDM loss. Penalizes
+#     sum_v p_i(v) * p_j(v)
+# at adjacent masked positions (i, i+1) when their ground-truth labels
+# DIFFER. Math: this is the expected indicator that i and j decode to the
+# same token under the model's marginals — exactly what fails at inference.
+# Gated on differing GT labels so legitimate repeats (`.`, `(`, repeated
+# emphasis markers) aren't penalized. Min-SNR scaled for symmetry with
+# mdm/path.
+#
+# No extra forward pass. No new cache. ~10 LoC in _mdm_loss, chunked along
+# the position axis to bound fp32 softmax memory (same as existing CE).
+#
+# v10 also warm-starts the LoRA from v6 step_5000 (the v9 resume
+# infrastructure) so we get an immediate A/B vs v6 with one variable
+# changed: the new loss term. Curricula flattened at v6's end values so the
+# global_step reset doesn't undo warm-started weights.
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    resume_adapter_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v6/checkpoints/global_step_5000
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 500
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v10
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 500
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 40
+  max_steps: 20000              # bumped from 5000 — give the anti-rep loss room to actually drive p_i p_j → 0
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 2e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  # Repr-Align — flat at v6 end (warm-start preserved by no curriculum un-training)
+  repr_align_wt: 0.5
+  repr_align_wt_final: 0.5
+  anchor_cache_dir: /run/media/johndpope/12TB/open_dllm/anchors/qwen3.6-27b-reasoning-500-16L
+  align_layers: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64"
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 4
+  repr_align_layer_exp: 0.0
+  repr_align_loss_mode: "angular"
+  repr_align_angular_margin: 0.5
+
+  # Block-level subgoal alignment (from v8/v9)
+  subgoal_align_wt: 1.0
+  subgoal_align_n_blocks: 4
+
+  # NEW in v10 — anti-repetition penalty
+  anti_rep_wt: 1.0
+
+  llrd_decay: 0.85
+  min_snr_gamma: 5.0
+  gen_sample_every_steps: 500
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-reasoning-500-v10-antirep-warmstart

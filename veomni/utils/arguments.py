@@ -350,6 +350,10 @@ class TrainingArguments:
         default=4,
         metadata={"help": "Number of contiguous blocks the response is split into for subgoal_align_wt. Typical reasoning structure: opening / premise / derivation / conclusion."},
     )
+    anti_rep_wt: float = field(
+        default=0.0,
+        metadata={"help": "Anti-repetition penalty for parallel MDM decoding. Penalizes sum_v p_i(v)*p_j(v) at adjacent masked positions (i, i+1) when their ground-truth labels differ. Targets the 'Topic Topic' / 'Initial Initial' failure where parallel decode from independent marginals collapses to repeats. Min-SNR scaled. 0 = disabled."},
+    )
     llrd_decay: float = field(
         default=0.0,
         metadata={"help": "Layer-wise LR decay for LoRA adapters. lr * decay^(layer_depth_fraction). 0=disabled (flat LR). 0.85 is typical for NLP fine-tuning."},

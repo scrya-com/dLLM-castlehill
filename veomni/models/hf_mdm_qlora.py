@@ -114,7 +114,69 @@ def _repr_align_loss(z1, z2, layer_weights=None, contrastive=False, contrastive_
     return 1.0 - cosine_sim.mean()
 
 
-def _mdm_loss(logits, labels, chunk_size=512, mask_ratio=None, min_snr_gamma=None):
+def _anti_rep_loss(logits, labels, chunk_size=128):
+    # Smaller default chunk than _mdm_loss (which uses 512). The anti_rep
+    # softmax materializes p_left, p_right, AND their product in fp32,
+    # so each ~chunk × V slab is ~500 MB at chunk=512, V=248k. With backward
+    # retention this hits ~2 GB peak — enough to OOM v6/v9-sized adapters
+    # on a 32 GB Blackwell. chunk=128 drops it to ~125 MB per slab.
+    """Anti-repetition penalty for parallel MDM decoding.
+
+    Repetition in MDM ("Topic Topic", "Initial Initial") is a factorization
+    failure: training optimizes per-position marginals p(x_i | context), but
+    inference decodes adjacent masked positions independently from those
+    marginals. When the marginals at i and i+1 both peak at the same token
+    (which they often do in scaffold-heavy text), the parallel decode emits
+    the repeat. The training objective is *silent* about adjacent-position
+    interaction.
+
+    Fix: penalize the joint probability that adjacent masked positions
+    decode to the same token,
+        L = E_{(i,j) ∈ pairs}[ sum_v p_i(v) * p_j(v) ]
+    gated on (1) both positions being supervised (predicted), (2) the
+    ground-truth tokens at i and j being DIFFERENT — so legitimate
+    repetitions in data ('.', '(', repeated header markers) aren't penalized.
+
+    Same chunked-along-position structure as _mdm_loss so peak fp32 softmax
+    memory stays bounded. Skips pairs that straddle a chunk boundary (~0.2%
+    of pairs at chunk_size=512), simpler than reaching into the next chunk.
+
+    Returns (anti_rep_loss [scalar], n_pairs_seen [int]) — caller decides
+    whether/how to weight.
+    """
+    logits_s = logits[:, :-1, :]                              # [B, L-1, V]
+    labels_s = labels[:, 1:] if labels.dim() == 2 else labels.view(logits.size(0), -1)[:, 1:]
+    L = min(logits_s.size(1), labels_s.size(1))
+    logits_flat = logits_s[:, :L].reshape(-1, logits_s.size(-1))  # [T, V] bf16
+    labels_flat = labels_s[:, :L].reshape(-1)                      # [T]
+
+    total = torch.zeros((), device=logits.device, dtype=torch.float32)
+    count = 0
+    for i in range(0, L, chunk_size):
+        end = min(i + chunk_size, L)
+        if end - i < 2:
+            continue
+        chunk_l = logits_flat[i:end].float()                       # [c, V]
+        chunk_y = labels_flat[i:end]                                # [c]
+        masked = (chunk_y != IGNORE_INDEX)                          # [c]
+        # adjacent pairs (k, k+1) within the chunk
+        pair_mask = masked[:-1] & masked[1:]                        # [c-1]
+        pair_diff = chunk_y[:-1] != chunk_y[1:]                     # [c-1]
+        valid = pair_mask & pair_diff                               # [c-1]
+        if not valid.any():
+            continue
+        p = F.softmax(chunk_l, dim=-1)                              # [c, V] fp32
+        joint_same = (p[:-1] * p[1:]).sum(dim=-1)                   # [c-1]
+        total = total + (joint_same * valid.float()).sum()
+        count = count + int(valid.sum().item())
+
+    if count == 0:
+        return logits.sum() * 0.0, 0
+    return total / count, count
+
+
+def _mdm_loss(logits, labels, chunk_size=512, mask_ratio=None, min_snr_gamma=None,
+              anti_rep_wt=0.0):
     # Chunked CE to avoid materialising [B, T, V] fp32 at long seq_len.
     # At seq_len=4096, V=248320: full tensor = 4.1 GB fp32; chunks keep peak at 0.5 GB.
     #
@@ -148,7 +210,19 @@ def _mdm_loss(logits, labels, chunk_size=512, mask_ratio=None, min_snr_gamma=Non
         mdm = mdm * w
         path = path * w
 
-    return mdm + path, mdm.detach(), path.detach()
+    # Anti-repetition penalty (v10). Adds a third return value so callers can
+    # log the raw, unweighted anti_rep statistic. Min-SNR scaling applied so
+    # the term stays balanced with mdm/path at any mask ratio.
+    anti_rep_term = torch.zeros((), device=logits.device, dtype=torch.float32)
+    if anti_rep_wt > 0:
+        # Use anti_rep's own smaller chunk (default 128), not the CE chunk_size,
+        # because the fp32 elementwise-product materialization is the bottleneck.
+        anti_rep_term, _ = _anti_rep_loss(logits, labels)
+        if mask_ratio is not None and min_snr_gamma is not None and min_snr_gamma > 0:
+            anti_rep_term = anti_rep_term * w
+        anti_rep_term = anti_rep_term * anti_rep_wt
+
+    return mdm + path + anti_rep_term, mdm.detach(), path.detach(), anti_rep_term.detach()
 
 
 class MDMQLoRAWrapper(nn.Module):
@@ -172,6 +246,8 @@ class MDMQLoRAWrapper(nn.Module):
         # Subgoal (block-level) alignment — BDS-inspired auxiliary
         self.subgoal_align_wt = 0.0
         self.subgoal_align_n_blocks = 4
+        # Anti-repetition penalty (v10) — see _anti_rep_loss docstring
+        self.anti_rep_wt = 0.0
         # Visualization: set _vis_step=True before a forward to capture tensors
         self._vis_step = False
         self._vis_data = None
@@ -206,12 +282,15 @@ class MDMQLoRAWrapper(nn.Module):
         loss = None
         comps = {}
         if labels is not None:
-            loss, mdm, path = _mdm_loss(
+            loss, mdm, path, anti_rep = _mdm_loss(
                 logits, labels,
                 mask_ratio=mask_ratio,
                 min_snr_gamma=getattr(self, "min_snr_gamma", None),
+                anti_rep_wt=getattr(self, "anti_rep_wt", 0.0),
             )
             comps = {"mdm": float(mdm), "path": float(path)}
+            if getattr(self, "anti_rep_wt", 0.0) > 0:
+                comps["anti_rep"] = float(anti_rep)
 
         if _repr_align_active:
             student_hiddens = out.hidden_states
@@ -352,7 +431,8 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
                         repr_align_contrastive=False, repr_align_contrastive_temp=0.07,
                         repr_align_loss_mode="cosine", repr_align_angular_margin=0.0,
                         repr_align_num_sample_layers=None,
-                        subgoal_align_wt=0.0, subgoal_align_n_blocks=4, **kw):
+                        subgoal_align_wt=0.0, subgoal_align_n_blocks=4,
+                        anti_rep_wt=0.0, **kw):
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 
@@ -411,6 +491,7 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
     wrapper.repr_align_num_sample_layers = repr_align_num_sample_layers
     wrapper.subgoal_align_wt = subgoal_align_wt
     wrapper.subgoal_align_n_blocks = subgoal_align_n_blocks
+    wrapper.anti_rep_wt = anti_rep_wt
     if anchor_cache_dir:
         from .cached_teacher import CachedTeacher
         # Qwen3_5Config stores hidden_size inside text_config

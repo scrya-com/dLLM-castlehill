@@ -329,7 +329,7 @@ Reimagining of [Xu et al., "Self-Improving Language Models with Bidirectional Ev
 
 v8 was launched as a cold-start and killed early when the resume mechanism for v9 was ready (the warm-start gives v9 a more direct A/B vs v6).
 
-### v9 — warm-start the LoRA from v6's converged adapter (current run)
+### v9 — warm-start the LoRA from v6's converged adapter
 
 [`configs/pretrain/d3llm_27b_v9.yaml`](configs/pretrain/d3llm_27b_v9.yaml). Adds a `resume_adapter_path` knob to `qlorafy_config`. When set, `build_hf_mdm_qlora` swaps `get_peft_model(base, config)` for `PeftModel.from_pretrained(base, resume_adapter_path, is_trainable=True)` — LoRA matrices start at v6's step-5000 values instead of fresh-random init.
 
@@ -370,6 +370,41 @@ model:
 ```
 PEFT raises a clear error if the rank / targets / dora-vs-not don't match the saved adapter.
 
+### v10 — anti-repetition loss + warm-start (current run)
+
+[`configs/pretrain/d3llm_27b_v10.yaml`](configs/pretrain/d3llm_27b_v10.yaml). Targets the most visible defect in v5/v6/v9 generations: the diffusion outputs literally repeat themselves (`"Topic Topic:"`, `"Initial Initial Knowledge"`, `"**Key - **Key Concept**"`). v5 step 500 vs step 5000 showed no improvement — the failure mode plateaued.
+
+**Why MDM repeats**: training optimizes per-position marginals `p(x_i | context)`. At inference, the 16-step diffusion sampler decodes every masked position *independently* from those marginals in one forward pass. When the marginals at `i` and `i+1` both peak at the same token (which they often do in bullet-list scaffolds), the joint decode emits the repeat. The training objective is **silent** about adjacent-position dependence — the model is correctly optimizing what we asked.
+
+**The fix** — penalize the joint probability that adjacent masked positions decode to the same token, gated on the ground-truth labels differing:
+
+$$\mathcal{L}_{\text{anti-rep}} = \frac{1}{|\mathcal{P}|}\sum_{(i,j) \in \mathcal{P}} \sum_{v} p_i(v) \cdot p_j(v), \quad \mathcal{P} = \{(i, i{+}1) : \text{both masked} \land y_i \neq y_{i+1}\}$$
+
+`Σ_v p_i(v) p_j(v)` is the expected indicator that `i` and `j` decode to the same token under the model's marginals. We penalize the diagonal of the implied joint, restricted to positions where the data says they should differ — so legitimate repeats (`. .`, `( (`, repeated emphasis markers) aren't penalized. Min-SNR scaled for symmetry with mdm/path.
+
+| Property | Cost |
+|---|---|
+| Extra forward pass | **0** (uses existing logits) |
+| Extra memory | ~150 MB peak at the chunked fp32 softmax (`chunk_size=128` for anti_rep, smaller than CE's 512) |
+| Extra wall-time | ~10% (smoke: 2.83 → 3.42 s/step) |
+| New cache / precompute | none |
+
+**Smoke (5 steps)** with warm-start from v6:
+```
+step 1: anti_rep=0.22  mdm=5.42   loss=6.71   ← 22% joint-same probability at v6's adapter
+step 2: anti_rep=0.25  mdm=20.01  loss=21.57
+step 3: anti_rep=0.27  mdm=15.87  loss=17.90
+step 4: anti_rep=0.20  mdm=23.59  loss=25.72
+step 5: anti_rep=0.28  mdm=11.90  loss=13.38
+VRAM peak: 27.86 GB / 32 GB
+```
+
+`anti_rep=0.22` at step 1 confirms the loss is real and nontrivial: v6's adapter is assigning ~22% expected joint probability mass to adjacent-same-token at masked pairs where the data says they should differ. The training objective never had a gradient against this before. v10 should drive it toward 0, which should visibly kill the `"Topic Topic"` pattern in the generations.jsonl panel by step 500–1000.
+
+Also carries v9's warm-start mechanism (LoRA loaded from v6 step_5000) + v8's `subgoal_align: 1.0` + flat curricula.
+
+**A complementary inference-side fix** is to switch the eval hook's diffusion sampler from flat-parallel 16-step decode to *entropy-mode* decode (already in `scripts/gen_trajectories_reasoning.py` — decode k lowest-entropy positions per step, leave the rest masked, run forward again). That fixes repetition at inference without retraining. Deploying both together is strictly additive. Not in v10 yet — adding if v10 alone doesn't visibly close the repetition.
+
 ## 📚 Training-run breadcrumb trail
 
 The d3LLM-27B work is a sequence of runs, each isolating a different fix to the previous one's failure mode. Read top-to-bottom:
@@ -384,7 +419,8 @@ The d3LLM-27B work is a sequence of runs, each isolating a different fix to the 
 | **v6** | [`d3llm_27b_v6.yaml`](configs/pretrain/d3llm_27b_v6.yaml) | `d3llm-27b-reasoning-500-v6-angular-16L` | Angular loss + margin, 16 layers with k=4 subsample, drop embed LoRA, LLRD 0.85, curriculum 2.0 → 0.5 | repr_align trailing-mean 0.218 (22% below v5). Per-token cosine still asymptotes — structural mismatch is per-token. Two viz panels silently broken. |
 | **v7** | (design only) | — | BDS — diffusion-first reimagining of arXiv:2605.28814 | Needs verifier + recursive decomposition infra. Implementable nugget moves to v8. |
 | **v8** | [`d3llm_27b_v8.yaml`](configs/pretrain/d3llm_27b_v8.yaml) | `d3llm-27b-reasoning-500-v8-subgoal` | v6 + `subgoal_align` block-mean auxiliary loss; viz bugs fixed | Killed early; warm-start mechanism for v9 supersedes the cold-start ablation. |
-| **v9** (current) | [`d3llm_27b_v9.yaml`](configs/pretrain/d3llm_27b_v9.yaml) | `d3llm-27b-reasoning-500-v9-warmstart-from-v6` | Warm-start LoRA from v6 step_5000 + v8's `subgoal_align` loss + flat repr_align curriculum (no un-training) | TBD |
+| **v9** | [`d3llm_27b_v9.yaml`](configs/pretrain/d3llm_27b_v9.yaml) | `d3llm-27b-reasoning-500-v9-warmstart-from-v6` | Warm-start LoRA from v6 step_5000 + v8's `subgoal_align` loss + flat repr_align curriculum | Warm-start mechanism worked (`mdm` step 1: 5.42 vs cold's 38.63). Killed early when v10's anti-rep idea landed — same warm-start, better target. |
+| **v10** (current) | [`d3llm_27b_v10.yaml`](configs/pretrain/d3llm_27b_v10.yaml) | `d3llm-27b-reasoning-500-v10-antirep-warmstart` | Warm-start from v6 + anti-repetition penalty $\sum_v p_i(v)p_j(v)$ at adjacent masked pairs (gated on differing GT) + v9's subgoal. **20k steps** (4× v5–v9 horizon) to give the anti-rep gradient room to converge | TBD — early signal at step 500 generation samples |
 
 ### How to reproduce any run
 
