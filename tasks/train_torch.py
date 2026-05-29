@@ -438,6 +438,8 @@ def main():
         repr_align_contrastive_temp=getattr(args.train, "repr_align_contrastive_temp", 0.07),
         repr_align_loss_mode=getattr(args.train, "repr_align_loss_mode", "cosine"),
         repr_align_angular_margin=getattr(args.train, "repr_align_angular_margin", 0.0),
+        subgoal_align_wt=getattr(args.train, "subgoal_align_wt", 0.0),
+        subgoal_align_n_blocks=getattr(args.train, "subgoal_align_n_blocks", 4),
         enable_nvfp4_qat=getattr(args.model, "enable_nvfp4_qat", False),
         enable_qlorafy=getattr(args.model, "enable_qlorafy", False),
         qlorafy_config=getattr(args.model, "qlorafy_config", None),
@@ -770,7 +772,12 @@ def main():
             else:
                 _current_repr_align_wt = _lam_start
 
+            # Stable handle so the post-loop vis blocks don't crash with
+            # "local variable 'micro_batch' referenced before assignment"
+            # when the loop body is skipped (e.g., empty micro_batches).
+            _last_micro_batch = None
             for micro_batch in micro_batches:
+                _last_micro_batch = micro_batch
                 environ_meter.add(micro_batch)
 
                 micro_batch = {
@@ -1123,26 +1130,27 @@ def main():
                             logger.warning_rank0(f"[step {global_step}] repr_align vis failed: {e}")
 
                     # d3LLM trajectory visualization
-                    if _do_vis and _has_d3llm_vis:
+                    if _do_vis and _has_d3llm_vis and _last_micro_batch is not None:
                         try:
+                            _mb = _last_micro_batch
                             _mask_id = tokenizer.mask_token_id or 248077
-                            _mi = (micro_batch.get("input_ids") == _mask_id)
+                            _mi = (_mb.get("input_ids") == _mask_id)
                             _logits = outputs.logits[:1].detach().cpu()
-                            _labels = micro_batch.get("labels", micro_batch.get("input_ids"))[:1].detach().cpu()
+                            _labels = _mb.get("labels", _mb.get("input_ids"))[:1].detach().cpu()
                             _probs = torch.nn.functional.softmax(_logits.float(), dim=-1)
                             _pred = _probs.argmax(dim=-1)
                             _correct = (_pred == _labels)
                             _entropy = -(_probs * (_probs + 1e-12).log()).sum(dim=-1)
                             _vis_data = {
                                 "logits": _logits[:1],
-                                "input_ids": micro_batch.get("input_ids", micro_batch.get("casual_input_ids"))[:1].detach().cpu(),
+                                "input_ids": _mb.get("input_ids", _mb.get("casual_input_ids"))[:1].detach().cpu(),
                                 "masked_indices": _mi[:1].detach().cpu(),
                                 "H_tok": _entropy[:1].detach().cpu(),
                                 "correct_mask": _correct[:1].detach().cpu(),
                                 "trajectory": None,
                                 "prompt_length": 0,
                                 "mask_token_id": tokenizer.mask_token_id or 248077,
-                                "mask_ratio": float(micro_batch.get("mask_ratio", [0.5])[0].item()),
+                                "mask_ratio": float(_mb.get("mask_ratio", [0.5])[0].item()),
                             }
                             import matplotlib
                             matplotlib.use("Agg")

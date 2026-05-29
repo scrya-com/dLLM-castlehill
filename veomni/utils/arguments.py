@@ -342,6 +342,14 @@ class TrainingArguments:
         default=0.0,
         metadata={"help": "When repr_align_loss_mode='angular', clamp loss below this many radians to 0. Honest accounting of the structural causal-vs-bidirectional floor — once the student is within `margin` radians of the teacher, the loss reads 0. 0 = no margin (default)."},
     )
+    subgoal_align_wt: float = field(
+        default=0.0,
+        metadata={"help": "Block-level subgoal alignment auxiliary loss weight. Inspired by Bidirectional Evolutionary Search (Xu et al., arXiv:2605.28814) — uses contiguous response blocks as implicit subgoals, layered on top of Repr-Align (arXiv:2605.06885). Splits the token sequence into n_blocks chunks, averages hidden states per chunk per layer, computes 1-cos_sim between block means. Robust to per-token causal-vs-bidirectional mismatch (block-averaging washes it out). 0 = disabled (default)."},
+    )
+    subgoal_align_n_blocks: int = field(
+        default=4,
+        metadata={"help": "Number of contiguous blocks the response is split into for subgoal_align_wt. Typical reasoning structure: opening / premise / derivation / conclusion."},
+    )
     llrd_decay: float = field(
         default=0.0,
         metadata={"help": "Layer-wise LR decay for LoRA adapters. lr * decay^(layer_depth_fraction). 0=disabled (flat LR). 0.85 is typical for NLP fine-tuning."},
