@@ -434,6 +434,10 @@ class TrainingArguments:
         default=100,
         metadata={"help": "Generate sample text every N steps during QLoRA training (logged to wandb + side JSONL). 0 = disable."},
     )
+    gen_sample_steps: int = field(
+        default=16,
+        metadata={"help": "Number of diffusion denoising steps for the in-training gen-sample hook. More steps = fewer parallel unmaskings per step = less exposure to the joint-marginal factorization failure that anti_rep_wt targets."},
+    )
     gen_sample_log_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path for the side JSONL dump of generation samples. Default: {output_dir}/generations.jsonl."},

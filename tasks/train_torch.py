@@ -1055,11 +1055,36 @@ def main():
                         try:
                             import time as _time
                             model.eval()
-                            # Default reasoning prompts. Override via args.train.gen_prompts.
-                            gen_prompts = getattr(args.train, "gen_prompts", None) or [
+                            # Default 20-prompt pool. Each gen-sample step picks ONE
+                            # at random, seeded by global_step so A/B'd runs (same step
+                            # number) draw the same prompt for direct comparison while
+                            # successive steps in a single run see different prompts.
+                            # Override via args.train.gen_prompts (any pool size; one
+                            # is still sampled per step).
+                            _prompt_pool = getattr(args.train, "gen_prompts", None) or [
                                 "Explain how a hash table handles collisions in O(1) average lookup time.",
                                 "What is the time complexity of merge sort and why? Walk through the recursion.",
+                                "Derive the gradient of the softmax cross-entropy loss with respect to the logits.",
+                                "Why does adding a residual connection help train very deep networks? Walk through the gradient.",
+                                "Explain why floating-point addition is not associative, with a concrete example.",
+                                "What is the difference between a B-tree and a B+ tree, and why do databases prefer B+ trees?",
+                                "Prove that the sum of the first n odd numbers equals n squared.",
+                                "Why does Adam usually converge faster than SGD on transformers? Be specific about the mechanism.",
+                                "Walk through how RSA encryption uses modular exponentiation and why factoring is hard.",
+                                "Explain the bias-variance tradeoff using a concrete polynomial-fitting example.",
+                                "Why does layer normalization stabilize transformer training? Contrast with batch norm.",
+                                "Describe how the kernel trick lets SVMs find non-linear decision boundaries.",
+                                "What goes wrong if you train a transformer with all positions attending fully and no causal mask?",
+                                "Explain the relationship between entropy, cross-entropy, and KL divergence.",
+                                "Why do we use gradient checkpointing, and what's the time vs memory tradeoff?",
+                                "Walk through how a Bloom filter trades false positives for memory savings.",
+                                "Explain why dropout acts as a regularizer in terms of ensembling.",
+                                "Derive the closed-form solution to ordinary least squares regression.",
+                                "Why is depth more important than width in modern neural networks? Cite the universal approximation context.",
+                                "Explain how the attention mechanism in transformers approximates a soft dictionary lookup.",
                             ]
+                            import random as _random
+                            gen_prompts = [_random.Random(global_step).choice(_prompt_pool)]
                             gen_samples = []
                             ar_toks_total, ar_time_total = 0, 0.0
                             diff_toks_total, diff_time_total = 0, 0.0
@@ -1080,7 +1105,7 @@ def main():
                                     from veomni.models.transformers.qwen2.generation_utils import mdm_generate
                                     if tokenizer.mask_token_id is not None:
                                         _t0 = _time.perf_counter()
-                                        diff_ids = mdm_generate(model, pids, mask_token_id=tokenizer.mask_token_id, max_new_tokens=256, steps=16, temperature=0.7)
+                                        diff_ids = mdm_generate(model, pids, mask_token_id=tokenizer.mask_token_id, max_new_tokens=256, steps=args.train.gen_sample_steps, temperature=0.7)
                                         torch.cuda.synchronize()
                                         diff_time_total += _time.perf_counter() - _t0
                                         diff_new_toks = diff_ids.shape[1] - pids.shape[1]
@@ -1091,7 +1116,7 @@ def main():
                                 gen_samples.append(
                                     f"<b>Prompt:</b> {gp}<br>"
                                     f"<b>AR:</b> {ar_text}<br>"
-                                    f"<b>Diffusion (16-step):</b> {diff_text}"
+                                    f"<b>Diffusion ({args.train.gen_sample_steps}-step):</b> {diff_text}"
                                 )
                             train_metrics["generation/sample"] = wandb.Html("<hr>".join(gen_samples))
                             if ar_time_total > 0:
@@ -1140,7 +1165,26 @@ def main():
                             _labels = _mb.get("labels", _mb.get("input_ids"))[:1].detach().cpu()
                             _probs = torch.nn.functional.softmax(_logits.float(), dim=-1)
                             _pred = _probs.argmax(dim=-1)
-                            _correct = (_pred == _labels)
+                            # AR-shift correctness — matches _mdm_loss (hf_mdm_qlora.py:188-189),
+                            # which pairs logits[i] with labels[i+1]. At masked position m, the
+                            # trained prediction lives at logits[m-1], not logits[m]. Build a
+                            # length-T correct_mask where correct_mask[m] = True iff position m
+                            # is masked AND argmax(logits[m-1]) == labels[m]. Validated by the
+                            # 5-sample overfit: shifted top-1 = 0.947, unshifted = 0.040.
+                            _mi_cpu = _mi[:1].detach().cpu()
+                            _correct = torch.zeros_like(_labels, dtype=torch.bool)
+                            _correct[:, 1:] = (_pred[:, :-1] == _labels[:, 1:])
+                            _n_masked = _mi_cpu.sum().clamp(min=1).float()
+                            train_metrics["d3llm/masked_top1_acc"] = (
+                                (_correct & _mi_cpu).sum().float() / _n_masked
+                            ).item()
+                            # Diagnostic: unshifted comparison. Only matches the shifted version
+                            # when the model has mode-collapsed onto position-independent output;
+                            # under healthy training the two should diverge substantially.
+                            _correct_unshifted = (_pred == _labels)
+                            train_metrics["d3llm/masked_top1_acc_unshifted"] = (
+                                (_correct_unshifted & _mi_cpu).sum().float() / _n_masked
+                            ).item()
                             _entropy = -(_probs * (_probs + 1e-12).log()).sum(dim=-1)
                             _vis_data = {
                                 "logits": _logits[:1],

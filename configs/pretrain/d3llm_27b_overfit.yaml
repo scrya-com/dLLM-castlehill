@@ -1,0 +1,125 @@
+# d3LLM 27B overfit-5 — 5-sample, 5-minute pipeline sanity test
+#
+# Goal: prove the MDM training pipeline can drive mdm → 0 on a tiny dataset
+# in ~5 minutes. If it can, everything downstream (loss, optimizer, vis,
+# data path, LM head) is wired correctly and v10a's "0/895 correct"
+# reflects the model's actual state, not a structural bug. If it can't,
+# the failing stage is exposed before sinking compute on a fresh-start v11.
+#
+# Knobs intentionally set to maximize overfit speed:
+#   - Fresh LoRA (no resume_adapter_path) — clean slate.
+#   - Single tiny aux: NONE. Pure MDM. We want all gradient on the LM head.
+#   - LR 1e-3 (5× v10a's 2e-4) — overfit fast on 5 samples.
+#   - llrd_decay 1.0 — no per-layer decay, train all LoRA params at full LR.
+#   - weight_decay 0, lora_dropout 0.0 — no regularization fighting overfit.
+#   - No trajectory_data_path — uses DataCollatorWithPositionIDsMasking
+#     (pure random masking), simpler and removes one variable.
+#   - gen_sample_every_steps 200 — 5 sample probes over the 1000-step run.
+#
+# Expected outcome by step ~500 if pipeline is sound:
+#   - mdm < 1.0 (random baseline = 12.4 over 248k vocab)
+#   - d3llm/masked_top1_acc_shifted > 0.5 (shifted matches loss convention)
+#   - d3llm/masked_top1_acc (unshifted) — diverges from shifted ⇒ vis was buggy
+#   - generation/sample at step 600+ shows verbatim recall of training prompts
+#   - qlora/grad_norm bounded, no NaN
+#
+# Launch (MSI):
+#   python tasks/train_torch.py configs/pretrain/d3llm_27b_overfit.yaml
+#
+# Prereq: a 5-sample jsonl. Extract with:
+#   head -5 /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl \
+#       > /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data_overfit_5.jsonl
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.0
+    use_dora: false
+    use_rslora: true
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+data:
+  # 5-row subset of the same prompt/response jsonl v10a used. The yaml-level
+  # text_keys field is dead in this routing — process_prompt_response_example
+  # is picked when trajectory_data_path is set (see train_torch.py:252-253)
+  # and reads `prompt`/`response` directly. Keeping text_keys for arg-parser
+  # compatibility; it is intentionally unused.
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data_overfit_5.jsonl
+  max_seq_len: 1024
+  train_size: 5
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: false
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_overfit
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 0
+  save_total_limit: 0
+  auto_resume: false
+  num_train_epochs: 9999
+  max_steps: 1000
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 1e-4
+  weight_decay: 0.0
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  # Reuse v10a's trajectory file (covers sample_idx 0..499; ours are 0..4).
+  # Setting trajectory_data_path routes data through process_prompt_response_example,
+  # which is what we actually want — matches v10a's data treatment exactly.
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  # Fixed mask ratio — removes mask-difficulty noise that interacts badly with
+  # high LR. At [0.05, 0.95] jitter the loss bounces wildly per step and the
+  # optimizer takes a random walk. Pinning to a single ratio lets us actually
+  # see whether the gradient signal is moving the model toward fitting the data.
+  trajectory_min_mask_ratio: 0.3
+  trajectory_max_mask_ratio: 0.3
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  repr_align_wt: 0.0
+  repr_align_wt_final: 0.0
+  subgoal_align_wt: 0.0
+  anti_rep_wt: 0.0
+
+  llrd_decay: 1.0
+  min_snr_gamma: 0
+  gen_sample_every_steps: 200
+  gen_sample_steps: 64
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-overfit-5sample

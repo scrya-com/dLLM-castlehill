@@ -1,0 +1,112 @@
+# d3LLM 27B v11 — clean fresh start on validated settings
+#
+# What changed from v10a:
+#   - Fresh LoRA (no resume_adapter_path). v10a's "0/895 correct" chart was
+#     diagnosed as a vis bug (d3llm/prediction read the wrong head); the
+#     5-sample overfit at lr=1e-4 fixed mask=0.3 converged in 8 minutes
+#     with shifted top-1 = 0.947, proving the pipeline is sound. v11 starts
+#     fresh to validate end-to-end on the full 500-sample reasoning corpus.
+#   - lr 2e-4 → 1e-4. v6 used 2e-4 with warm gradients from prior runs; for
+#     a truly fresh QLoRA, 1e-4 is the conservative starting point validated
+#     by the overfit. The broken lr=1e-3 overfit run drove qlora/grad_to_param
+#     to 0.044 (random walk) and mode-collapsed the LM head.
+#   - All aux losses set to 0. Get to a known-good fresh-LoRA MDM baseline
+#     before adding back repr_align / subgoal_align / anti_rep one at a time.
+#     v10a's aux-loss accumulation across v6→v10a was not the problem (vis
+#     bug was), but removing them removes a class of confounders.
+#   - 2-GPU DDP: launch with torchrun --nproc_per_node=2. Both 5090 (32GB)
+#     and PRO 4000 (24GB) fit NF4 base + r=8 LoRA + activations at seq 1024.
+#   - max_steps 20000 → 5000 to start. Extend after validating curve shape.
+#
+# Vis correctness (already in tasks/train_torch.py):
+#   - d3llm/masked_top1_acc now uses AR-shift comparison (matches loss).
+#   - d3llm/masked_top1_acc_unshifted kept as a divergence indicator; if
+#     these two collapse to equal values during training, mode-collapse is
+#     happening and the run should be killed.
+#
+# Launch (MSI):
+#   torchrun --nproc_per_node=2 tasks/train_torch.py configs/pretrain/d3llm_27b_v11.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    # No resume_adapter_path — fresh LoRA init.
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 500
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text   # unused — process_prompt_response_example reads prompt/response directly
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v11
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 500
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 40
+  max_steps: 5000
+  micro_batch_size: 1
+  global_batch_size: 2   # 2-GPU DDP → 1 per rank
+  lr: 1e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  # Aux losses OFF — pure MDM baseline first. Add back one at a time later.
+  repr_align_wt: 0.0
+  repr_align_wt_final: 0.0
+  subgoal_align_wt: 0.0
+  anti_rep_wt: 0.0
+
+  llrd_decay: 0.85
+  min_snr_gamma: 0
+  gen_sample_every_steps: 500
+  gen_sample_steps: 64
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-v11-fresh-2gpu
