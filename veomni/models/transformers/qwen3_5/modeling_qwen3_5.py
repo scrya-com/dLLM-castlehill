@@ -428,44 +428,114 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             v_in = v.permute(0, 1, 3, 2).reshape(B, self.linear_num_value_heads * self.linear_value_head_dim, S)
             v = self.v_conv(v_in)[..., :S].reshape(B, self.linear_num_value_heads, self.linear_value_head_dim, S).permute(0, 1, 3, 2)
 
-        # Handle recurrent cache for decode
-        if past_key_value is not None:
-            state = past_key_value.get(self.layer_idx)
-            if state is not None:
-                # Cache stores (q_acc, kv_prod) for delta rule state
-                q_acc, kv_prod = state
-                # Extend sequences
-                q = torch.cat([q_acc, q], dim=2)
-                k = torch.cat([kv_prod[0], k], dim=2)
-                v = torch.cat([kv_prod[1], v], dim=2)
-                g = torch.cat([kv_prod[2][:, :, :q_acc.shape[2]], g], dim=2)
-                beta = torch.cat([kv_prod[3][:, :, :q_acc.shape[2]], beta], dim=2)
+        # ------------------------------------------------------------------
+        # Real recurrent-state caching (replaces the previous fake-history
+        # accumulator that stored full q/k/v/g/beta sequences and reran the
+        # kernel over them — saved no compute, only memory churn).
+        #
+        # New cache format per layer: (state, conv_tail_k, conv_tail_v)
+        #   - state:        FLA's compressed delta-rule accumulator
+        #                   (shape depends on FLA internals; single tensor)
+        #   - conv_tail_k:  last (kernel_dim - 1) pre-conv k tokens of the
+        #                   prefix — needed because the conv layer's
+        #                   kernel_dim=4 receptive field straddles the
+        #                   prefix↔block boundary. Without this the block's
+        #                   first (kernel_dim - 1) conv outputs would be
+        #                   computed with zero-pad left context instead of
+        #                   the actual prefix tokens.
+        #   - conv_tail_v:  same for v.
+        #
+        # Constraint: only works with the FLA path. The pytorch fallback in
+        # delta_rule.py returns (s, z) tuple — incompatible format with
+        # FLA's single-tensor state. When FLA is unavailable, caching is
+        # silently disabled and we fall back to the no-cache behavior.
+        # ------------------------------------------------------------------
+        cache_active = (
+            past_key_value is not None
+            and self.use_fla
+            and getattr(self, "_disable_delta_cache", False) is False
+        )
+
+        # Save pre-conv k/v of the CURRENT input (post-rotary, pre-conv-prepend)
+        # for use as the next forward's conv_tail. Must be done before we mutate
+        # k/v below — otherwise we'd have to re-project from hidden_states, which
+        # is what the v0 patch did and got the rotary wrong.
+        saved_k_for_next_tail = None
+        saved_v_for_next_tail = None
+        if cache_active and self.linear_conv_kernel_dim > 1:
+            K_minus_1 = self.linear_conv_kernel_dim - 1
+            tail = min(K_minus_1, S)
+            saved_k_for_next_tail = k[:, :, -tail:].detach().clone()
+            saved_v_for_next_tail = v[:, :, -tail:].detach().clone()
+
+        initial_state = None
+        prepend_len = 0
+        if cache_active:
+            cached = past_key_value.get(self.layer_idx)
+            if cached is not None and isinstance(cached, tuple) and len(cached) == 3:
+                initial_state, prev_conv_tail_k, prev_conv_tail_v = cached
+                if (
+                    self.linear_conv_kernel_dim > 1
+                    and prev_conv_tail_k is not None
+                    and prev_conv_tail_v is not None
+                ):
+                    prepend_len = prev_conv_tail_k.shape[2]
+                    k = torch.cat([prev_conv_tail_k.to(k.dtype), k], dim=2)
+                    v = torch.cat([prev_conv_tail_v.to(v.dtype), v], dim=2)
+
+        # Apply conv to k and v (now with proper left context if we prepended)
+        if self.linear_conv_kernel_dim > 1:
+            S_in = k.shape[2]
+            k_in = k.permute(0, 1, 3, 2).reshape(B, self.linear_num_key_heads * self.linear_key_head_dim, S_in)
+            k = self.k_conv(k_in)[..., :S_in].reshape(B, self.linear_num_key_heads, self.linear_key_head_dim, S_in).permute(0, 1, 3, 2)
+            v_in = v.permute(0, 1, 3, 2).reshape(B, self.linear_num_value_heads * self.linear_value_head_dim, S_in)
+            v = self.v_conv(v_in)[..., :S_in].reshape(B, self.linear_num_value_heads, self.linear_value_head_dim, S_in).permute(0, 1, 3, 2)
+
+        # Trim the prepended conv-context off so the delta-rule kernel only
+        # sees current-segment tokens (the prefix state already covers prior).
+        if prepend_len > 0:
+            k = k[:, :, prepend_len:]
+            v = v[:, :, prepend_len:]
 
         # Apply delta rule — ensure consistent bf16 dtype for FLA kernels
         q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
         beta, g = beta.bfloat16(), g.bfloat16()
 
+        new_state = None
         if self.use_fla:
             try:
                 from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_delta
-                output, new_state = fla_delta(q, k, v, beta, g)
+                if cache_active:
+                    output, new_state = fla_delta(
+                        q, k, v, beta, g,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                    )
+                else:
+                    output, new_state = fla_delta(q, k, v, beta, g)
             except Exception as _fla_err:
                 print(f"[GatedDeltaNet] FLA kernel failed ({type(_fla_err).__name__}: {_fla_err}), falling back to pytorch")
                 output, new_state = chunk_gated_delta_rule_pytorch(q, k, v, beta, g)
+                cache_active = False  # incompatible state format
         else:
             output, new_state = chunk_gated_delta_rule_pytorch(q, k, v, beta, g)
+            cache_active = False
 
         # Reshape output
         output = output.transpose(1, 2).contiguous().view(B, S, self.linear_num_value_heads * self.linear_value_head_dim)
         output = self.o_proj(output)
 
-        # Store cache for decode
-        cache_tuple = None
-        if past_key_value is not None:
-            cache_tuple = (q, (k, v, g, beta))
-            past_key_value.update(self.layer_idx, cache_tuple, layer_type="linear")
+        # Update cache with compressed state + the pre-conv k/v tail we saved
+        # at the top of the function (post-rotary, pre-prepend). These are
+        # the last (kernel_dim - 1) positions of the CURRENT input — so the
+        # next forward's conv has the right left context for its first
+        # position.
+        cache_value = None
+        if cache_active:
+            cache_value = (new_state, saved_k_for_next_tail, saved_v_for_next_tail)
+            past_key_value.update(self.layer_idx, cache_value, layer_type="linear_attention")
 
-        return output, cache_tuple
+        return output, cache_value
 
 
 # ---------------------------------------------------------------------------
@@ -477,9 +547,9 @@ class Qwen3_5DynamicCache(DynamicCache):
 
     def update(
         self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
+        key_states,
+        value_states: Optional[torch.Tensor] = None,
+        layer_idx: int = 0,
         cache_kwargs: Optional[Dict] = None,
         layer_type: str = "full_attention",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -487,11 +557,13 @@ class Qwen3_5DynamicCache(DynamicCache):
 
         # For linear attention layers, store recurrent state tuple
         if layer_type == "linear_attention":
-            # key_states here is actually (q, (k, v, g, beta))
-            new_state = key_states  # already the tuple
-            if layer_idx not in self.key_cache:
-                self.key_cache[layer_idx] = new_state
-            return key_states[1][1], key_states[1][0]  # return v, k for interface compat
+            # key_states here is the cache_value tuple: (state, conv_tail_k, conv_tail_v)
+            # ALWAYS overwrite — previous code only stored on the first call for a
+            # layer, silently dropping subsequent updates. That broke any
+            # multi-step block-wise decode pattern (the cache stayed pinned
+            # at step-1's state forever).
+            self.key_cache[layer_idx] = key_states
+            return None, None  # callers in linear path ignore the return
 
         # Standard KV-cache update for full attention
         return super().update(key_states, value_states, layer_idx, cache_kwargs)
