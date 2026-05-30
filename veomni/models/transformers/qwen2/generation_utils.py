@@ -606,3 +606,124 @@ def mdm_generate_block_parallel(
             x.view(-1)[chosen_flat_positions] = sampled[select].to(x.dtype)
 
     return x
+
+
+@torch.no_grad()
+def mdm_generate_block_cached(
+    model: torch.nn.Module,
+    input_ids: torch.LongTensor,
+    mask_token_id: int,
+    max_new_tokens: int = 32,
+    block_size: int = 32,
+    threshold: float = 0.9,
+    max_iters_per_block: int = 32,
+    temperature: float = 0.0,
+) -> torch.LongTensor:
+    """Block-wise parallel decode WITH KV / DeltaNet cache reuse across
+    block iterations.
+
+    Fast-dLLM v1's full algorithm:
+    1. Forward the prompt once, fill the cache, snapshot it.
+    2. For each block of `block_size` tokens:
+       a. For each iteration within the block:
+          - Restore cache to the prefix-only snapshot (undo previous
+            iteration's mutations).
+          - Forward only the block_size masked tokens with past=cache.
+            Block-only forward is ~constant-time regardless of prefix
+            length — that's the architectural win.
+          - Confidence-threshold unmask high-confidence positions.
+          - Repeat until no masks remain in the block.
+       b. After convergence, forward the final block tokens with cache
+          to bake them into the prefix state.
+       c. Re-snapshot the cache so the next block starts from the
+          extended prefix.
+
+    Notes:
+    - The AR-shift means logits[i] predicts position i+1. For the first
+      block position we need the logit at prefix_end-1 — saved from the
+      prompt forward.
+    - The model must support our custom Qwen3_5DynamicCache (with the
+      snapshot/restore methods we added to it).
+    - The full-attention layers use HF's standard cropping pattern via
+      past_key_values length; the DeltaNet layers use the recurrent
+      state we fixed.
+    """
+    device = input_ids.device
+    pad_token_id = getattr(model.config, "pad_token_id", None)
+    prompt_len = input_ids.size(1)
+    x = F.pad(input_ids, (0, max_new_tokens), value=mask_token_id)
+
+    # 1. Forward the prompt to fill the cache + capture the prompt-end logit.
+    prompt_out = model(input_ids=input_ids, use_cache=True, is_causal=False)
+    cache = prompt_out.past_key_values
+    # Logit at the last prompt position predicts position prompt_len (= block[0]).
+    boundary_logit = prompt_out.logits[:, -1:, :].clone()  # [B, 1, V]
+
+    import copy
+    # HF's native DynamicCache has neither snapshot nor restore. Use deepcopy
+    # as a portable fallback. Slow on long prefixes (~hundreds of MB per copy)
+    # but correctness over speed for the first cut.
+    def _snap():
+        return copy.deepcopy(cache)
+    snapshot = _snap()
+
+    block_starts = list(range(prompt_len, prompt_len + max_new_tokens, block_size))
+    for b_start in block_starts:
+        b_end = min(b_start + block_size, prompt_len + max_new_tokens)
+        block_len = b_end - b_start
+
+        for _ in range(max_iters_per_block):
+            current_block_ids = x[:, b_start:b_end]
+            block_mask = (current_block_ids == mask_token_id)
+            if not block_mask.any():
+                break
+
+            # Restore cache to prefix-only state for this iteration.
+            cache = copy.deepcopy(snapshot)
+
+            # Forward block-only with cached prefix.
+            block_out = model(input_ids=current_block_ids, past_key_values=cache,
+                              use_cache=True, is_causal=False)
+            block_logits = block_out.logits  # [B, block_len, V]
+
+            # Construct AR-shifted logits at block positions:
+            #   shifted[0] = boundary_logit (from prefix's last position)
+            #   shifted[i] = block_logits[i-1] for i >= 1
+            shifted = torch.cat([boundary_logit, block_logits[:, :-1, :]], dim=1)  # [B, block_len, V]
+
+            # Confidence at masked block positions
+            mask_logits = shifted[block_mask]  # [N_masked, V]
+            if temperature > 0:
+                mask_logits = mask_logits / temperature
+            probs = torch.softmax(mask_logits.float(), dim=-1)
+            confidence, pred = probs.max(dim=-1)
+            if temperature > 0:
+                sampled = torch.multinomial(probs, 1).squeeze(-1)
+            else:
+                sampled = pred
+
+            select = confidence > threshold
+            if not select.any():
+                top_idx = confidence.argmax()
+                select = torch.zeros_like(confidence, dtype=torch.bool)
+                select[top_idx] = True
+
+            # Write sampled tokens at chosen positions within the block.
+            mask_positions = block_mask.nonzero(as_tuple=False)  # [N_masked, 2]
+            chosen_positions = mask_positions[select]             # [N_chosen, 2]
+            chosen_values = sampled[select].to(x.dtype)           # [N_chosen]
+            for k in range(chosen_positions.size(0)):
+                bi = int(chosen_positions[k, 0].item())
+                pi = int(chosen_positions[k, 1].item())
+                x[bi, b_start + pi] = int(chosen_values[k].item())
+
+        # Block converged. Forward the final block tokens to bake them into cache.
+        cache = copy.deepcopy(snapshot)
+        final_out = model(input_ids=x[:, b_start:b_end], past_key_values=cache,
+                          use_cache=True, is_causal=False)
+        # Update boundary_logit for next block's first position.
+        boundary_logit = final_out.logits[:, -1:, :].clone()
+        # Update snapshot to include this block.
+        snapshot = _snap()
+
+    return x

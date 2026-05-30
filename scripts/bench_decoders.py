@@ -23,6 +23,7 @@ from veomni.models.transformers.qwen2.generation_utils import (
     mdm_generate,
     mdm_generate_parallel,
     mdm_generate_block_parallel,
+    mdm_generate_block_cached,
 )
 
 MODEL_PATH = "/home/johndpope/ds_offload/models/Qwen3.6-27B"
@@ -73,16 +74,26 @@ def main():
     out_v, t_v = time_decode("mdm_generate (vanilla, 64 steps)", mdm_generate, model, input_ids, mask_id, steps=64)
     out_p, t_p = time_decode("mdm_generate_parallel (thr=0.9)", mdm_generate_parallel, model, input_ids, mask_id, threshold=0.9)
     out_b, t_b = time_decode("mdm_generate_block_parallel (bs=32)", mdm_generate_block_parallel, model, input_ids, mask_id, block_size=32, threshold=0.9)
+    try:
+        out_c, t_c = time_decode("mdm_generate_block_cached (bs=32, KV+DeltaNet)", mdm_generate_block_cached, model, input_ids, mask_id, block_size=32, threshold=0.9)
+    except Exception as e:
+        print(f"  mdm_generate_block_cached: FAILED — {type(e).__name__}: {e}")
+        out_c, t_c = None, None
 
     print()
-    print(f"speedup parallel vs vanilla:        {t_v/t_p:.2f}x")
-    print(f"speedup block_parallel vs vanilla:  {t_v/t_b:.2f}x")
-    print(f"speedup block_parallel vs parallel: {t_p/t_b:.2f}x")
+    print(f"speedup parallel vs vanilla:           {t_v/t_p:.2f}x")
+    print(f"speedup block_parallel vs vanilla:     {t_v/t_b:.2f}x")
+    if t_c is not None:
+        print(f"speedup block_cached vs vanilla:       {t_v/t_c:.2f}x")
+        print(f"speedup block_cached vs block_parallel: {t_b/t_c:.2f}x")
 
     # Decode + print outputs
     print()
     print("=== Decoded text (first ~100 chars of generation) ===")
-    for name, out in [("vanilla", out_v), ("parallel", out_p), ("block_parallel", out_b)]:
+    outs = [("vanilla", out_v), ("parallel", out_p), ("block_parallel", out_b)]
+    if out_c is not None:
+        outs.append(("block_cached", out_c))
+    for name, out in outs:
         gen = tok.decode(out[0][input_ids.shape[1]:], skip_special_tokens=True)
         print(f"  {name:16s}: {gen[:100].replace(chr(10), ' ')}")
 

@@ -572,6 +572,56 @@ class Qwen3_5DynamicCache(DynamicCache):
         """Retrieve cached state for a layer."""
         return self.key_cache.get(layer_idx, None)
 
+    def snapshot(self):
+        """Return a deep-clone of the cache so it can be restored later.
+
+        Use case: block-wise MDM decoding mutates the cache on every block
+        iteration, but we want the next iteration to start from the same
+        state. Snapshot once before iterating, restore at the top of each
+        iteration. After the block has converged, advance the snapshot to
+        include the final block tokens.
+        """
+        snap = {}
+        # Standard full-attention K/V (inherited from DynamicCache)
+        snap["full_k"] = {i: t.clone() for i, t in self.key_cache.items()
+                          if isinstance(t, torch.Tensor)}
+        snap["full_v"] = {i: t.clone() for i, t in getattr(self, "value_cache", {}).items()
+                          if isinstance(t, torch.Tensor)}
+        # Linear-attention layers: cache value is (state, conv_tail_k, conv_tail_v)
+        snap["linear"] = {}
+        for i, val in self.key_cache.items():
+            if isinstance(val, tuple) and len(val) == 3:
+                state, ctk, ctv = val
+                snap["linear"][i] = (
+                    state.clone() if state is not None else None,
+                    ctk.clone() if ctk is not None else None,
+                    ctv.clone() if ctv is not None else None,
+                )
+        snap["seen_tokens"] = getattr(self, "_seen_tokens", 0)
+        return snap
+
+    def restore(self, snap):
+        """Restore from a previously taken snapshot. Mutates self in place."""
+        # Clear current state
+        self.key_cache = {}
+        if hasattr(self, "value_cache"):
+            self.value_cache = {}
+        # Restore full-attention layers
+        for i, t in snap["full_k"].items():
+            self.key_cache[i] = t.clone()
+        for i, t in snap["full_v"].items():
+            self.value_cache[i] = t.clone()
+        # Restore linear-attention layers (overwrites self.key_cache[i] for those layers)
+        for i, val in snap["linear"].items():
+            state, ctk, ctv = val
+            self.key_cache[i] = (
+                state.clone() if state is not None else None,
+                ctk.clone() if ctk is not None else None,
+                ctv.clone() if ctv is not None else None,
+            )
+        if hasattr(self, "_seen_tokens"):
+            self._seen_tokens = snap["seen_tokens"]
+
 
 # ---------------------------------------------------------------------------
 # Decoder layer — dispatches between linear/full attention
