@@ -1,0 +1,62 @@
+# VFM v2.2 — deterministic encoder (no variational bottleneck) on 1.7B
+#
+# Drops the variational/Gaussian noise mechanism. Adapter now predicts
+# μ directly as continuous embeddings; LLM decodes. Strictly NOT a VFM
+# anymore — it's an encoder-decoder. But:
+#   - The speed claim (1-step inference) is preserved exactly.
+#   - The Gaussian-noise bottleneck that caused loss_data to plateau at
+#     5.6 nats and σ̄ to stay at 1.0 (encoder couldn't learn to encode
+#     anything useful) is removed.
+#
+# Trained for 10k steps (vs v2.1's 3000) to give the encoder time to
+# learn the prompt→completion mapping in continuous space.
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3-1.7B
+  attn_implementation: sdpa
+  freeze_llm: false
+  lora:
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_rslora: true
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+vfm:
+  variational: false   # ← v2.2 key change
+  adapter_layers: 4
+  adapter_heads: 8
+  adapter_dropout: 0.1
+  adapter_intermediate_size: 8192
+  max_completion_len: 512
+  tau: 1.0
+  sigma: 1.0
+  kl_weight_final: 0.0   # no-op with variational=false but kept for clarity
+  kl_weight_warmup_steps: 0
+  ar_shift: true
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_prompt_len: 256
+  max_completion_len: 512
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v2_2_1_7b_deterministic
+  lr: 1e-4
+  weight_decay: 0.01
+  max_steps: 10000
+  micro_batch_size: 1
+  global_batch_size: 1
+  log_every: 25
+  save_every: 1000
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v2-2-1.7b-deterministic-encoder

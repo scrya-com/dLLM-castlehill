@@ -18,20 +18,29 @@ model:
   freeze_llm: true   # smoke: only the adapter is trainable
 
 vfm:
-  adapter_layers: 4
+  # 2 layers + intermediate=hidden*2 keeps the adapter ~300M params at
+  # hidden=5120 (Qwen3.6). 4 layers + 4x intermediate blew past 1.4B
+  # → AdamW state alone would OOM the 5090.
+  adapter_layers: 2
   adapter_heads: 8
   adapter_dropout: 0.1
+  adapter_intermediate_size: 10240   # 2x hidden instead of 4x
   max_completion_len: 512
   tau: 1.0
   sigma: 1.0
-  kl_weight_final: 0.01
-  kl_weight_warmup_steps: 200   # linear anneal 0 → 0.01 over the first 200 steps
+  kl_weight_final: 0.001          # 10x looser than initial 0.01 to give encoder room
+  kl_weight_warmup_steps: 200
   ar_shift: true
 
 data:
+  # Smoke run: short sequences so the 27B activations fit on 32GB 5090.
+  # NF4 base 13.5GB + adapter ~1.4GB + AdamW state ~5GB + activations.
+  # At seq_len 384 we have ~12GB headroom for activations. Production
+  # would use gradient checkpointing on the LLM (frozen but still in the
+  # graph for adapter gradient flow) to push seq_len higher.
   train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
-  max_prompt_len: 256
-  max_completion_len: 512
+  max_prompt_len: 128
+  max_completion_len: 256
 
 train:
   output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v2_27b_smoke

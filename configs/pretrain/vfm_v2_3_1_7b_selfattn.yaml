@@ -1,0 +1,68 @@
+# VFM v2.3 — adapter with self-attention among completion queries
+#
+# The fix for the loss_data≈5 plateau seen in v2.0-v2.2. Those versions
+# produced each completion embedding z[j] INDEPENDENTLY (positional query +
+# cross-attn to prompt, no interaction among completion positions). That is
+# the conditional-independence assumption of single-shot non-autoregressive
+# generation — the "multimodality problem" (Gu et al. 2018) that caps such
+# models at ~5% top-1 because each position averages over all plausible
+# continuations rather than committing to one coherent answer.
+#
+# v2.3 replaces the single cross-attention layer with a full Transformer
+# DECODER stack: per layer, completion queries self-attend to each other
+# (bidirectionally — no causal mask, this is one-shot NAR) AND cross-attend
+# to the prompt. Now z[j] conditions on z[0..C-1], so the adapter can pick
+# ONE mode.
+#
+# Deterministic (variational=false) — keep the encoder-decoder framing from
+# v2.2; the Gaussian bottleneck was never the binding constraint.
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3-1.7B
+  attn_implementation: sdpa
+  freeze_llm: false
+  lora:
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_rslora: true
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+vfm:
+  variational: false
+  adapter_layers: 4          # now decoder layers (self-attn + cross-attn each)
+  adapter_heads: 8
+  adapter_dropout: 0.1
+  adapter_intermediate_size: 8192
+  max_completion_len: 512
+  tau: 1.0
+  sigma: 1.0
+  kl_weight_final: 0.0
+  kl_weight_warmup_steps: 0
+  ar_shift: true
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_prompt_len: 256
+  max_completion_len: 512
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v2_3_1_7b_selfattn
+  lr: 1e-4
+  weight_decay: 0.01
+  max_steps: 10000
+  micro_batch_size: 1
+  global_batch_size: 1
+  log_every: 25
+  save_every: 1000
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v2-3-1.7b-selfattn-decoder

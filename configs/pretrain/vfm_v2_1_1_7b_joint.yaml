@@ -1,0 +1,73 @@
+# VFM v2.1 on Qwen3-1.7B — joint LoRA + adapter on MSI 5090
+#
+# Switching to 1.7B fixes the v2.1 OOM at 27B: 1.7B NF4 ≈ 0.9 GB instead
+# of 13.5 GB. With the freed VRAM we can run a deeper adapter, joint LoRA
+# on the LLM, AND a longer sequence — all of which were blocked at 27B.
+#
+# Memory budget (approx, on 32 GB 5090):
+#   - NF4 1.7B base:         ~1 GB
+#   - LoRA r=8:               ~5 MB params + ~20 MB AdamW state
+#   - Adapter (4 layers,
+#     hidden=2048, 4x FFN):  ~210 M params, ~3 GB AdamW state (fp32 moments)
+#   - Activations + graph:    ~3-5 GB at seq_len 512
+#   - Headroom:               ~20+ GB
+#
+# Launch on MSI (5090):
+#   cd ~/Documents/GitHub/Open-dLLM
+#   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+#       PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#       .venv/bin/python tasks/train_vfm_v2.py \
+#       configs/pretrain/vfm_v2_1_1_7b_joint.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3-1.7B
+  attn_implementation: sdpa
+  freeze_llm: false   # joint LoRA + adapter (the paper-recommended setup)
+  lora:
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_rslora: true
+    # Standard Qwen3 target modules. The 1.7B doesn't have the qwen3_5
+    # DeltaNet variants (no in_proj_*), so only attention + MLP projections.
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+vfm:
+  # Deeper, wider adapter than the 27B-frozen smoke. With 1.7B we have
+  # the VRAM to spend on real adapter capacity.
+  adapter_layers: 4
+  adapter_heads: 8
+  adapter_dropout: 0.1
+  adapter_intermediate_size: 8192   # 4x hidden (2048 * 4)
+  max_completion_len: 512
+  tau: 1.0
+  sigma: 1.0
+  kl_weight_final: 0.001
+  kl_weight_warmup_steps: 200
+  ar_shift: true
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_prompt_len: 256
+  max_completion_len: 512
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v2_1_1_7b_joint
+  lr: 1e-4
+  weight_decay: 0.01
+  max_steps: 3000
+  micro_batch_size: 1
+  global_batch_size: 1
+  log_every: 10
+  save_every: 500
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v2-1-1.7b-joint-lora-adapter

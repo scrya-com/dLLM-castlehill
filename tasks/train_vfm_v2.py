@@ -76,6 +76,28 @@ def collate(batch):
     return {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
 
 
+def _save_checkpoint(out_dir, step, model):
+    """Save BOTH the adapter AND the LoRA deltas.
+
+    The optimizer trains adapter + LoRA jointly, but the original code only
+    saved the adapter — the LoRA (which teaches the frozen LLM to decode the
+    adapter's continuous embeddings + run the refinement dynamics) was lost,
+    making every checkpoint unusable for faithful inference. We now save:
+      - adapter_step_N.pt: the VFMv2NoiseAdapter weights
+      - lora_step_N/: the peft LoRA adapter (adapter_model.safetensors), if
+        the LLM is peft-wrapped (joint training). Frozen-LLM runs skip this.
+    """
+    ckpt = out_dir / "checkpoints" / f"adapter_step_{step}.pt"
+    torch.save(model.adapter.state_dict(), ckpt)
+    saved = [str(ckpt)]
+    llm = model.llm
+    if hasattr(llm, "save_pretrained") and hasattr(llm, "peft_config"):
+        lora_dir = out_dir / "checkpoints" / f"lora_step_{step}"
+        llm.save_pretrained(str(lora_dir))
+        saved.append(str(lora_dir))
+    print(f"[vfm_v2] saved checkpoint @ step {step}: {', '.join(saved)}")
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: train_vfm_v2.py <yaml-config>")
@@ -103,9 +125,45 @@ def main():
         attn_implementation=m_cfg.get("attn_implementation", "sdpa"),
     )
     llm.config.use_cache = False
-    if m_cfg.get("freeze_llm", True):
+
+    # Optional LoRA on the LLM for joint training (v2.1+).
+    # If freeze_llm is true we ALSO skip LoRA (pure frozen-LLM mode).
+    lora_cfg = m_cfg.get("lora")
+    if not m_cfg.get("freeze_llm", True) and lora_cfg is not None:
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
+        llm = prepare_model_for_kbit_training(llm, use_gradient_checkpointing=True)
+        lora = LoraConfig(
+            r=int(lora_cfg.get("r", 8)),
+            lora_alpha=int(lora_cfg.get("lora_alpha", 32)),
+            lora_dropout=float(lora_cfg.get("lora_dropout", 0.05)),
+            use_rslora=bool(lora_cfg.get("use_rslora", True)),
+            target_modules=lora_cfg["target_modules"],
+            task_type=TaskType.CAUSAL_LM,
+        )
+        llm = get_peft_model(llm, lora)
+        # Critical for inputs_embeds + LoRA + gradient checkpointing path:
+        # without this, the input embeddings don't participate in autograd
+        # and gradient checkpointing has no effect, blowing up activation
+        # memory.
+        if hasattr(llm, "enable_input_require_grads"):
+            llm.enable_input_require_grads()
+        # Also explicitly enable gradient checkpointing on the wrapped peft
+        # model (the prepare_model_for_kbit_training call enables it on the
+        # underlying model, but the wrap may disable it).
+        if hasattr(llm, "gradient_checkpointing_enable"):
+            llm.gradient_checkpointing_enable()
+        n_trainable_llm = sum(p.numel() for p in llm.parameters() if p.requires_grad)
+        print(f"[vfm_v2] joint training: LoRA wrapped LLM — {n_trainable_llm:,} trainable LLM params, grad checkpoint ON")
+    elif m_cfg.get("freeze_llm", True):
         for p in llm.parameters():
             p.requires_grad = False
+        # Even with frozen params, the LLM is in the autograd graph so
+        # activations are stored for backward (to compute grad through
+        # inputs_embeds → z → adapter). Gradient checkpointing trades
+        # recompute for memory; necessary at long sequences on a 32GB GPU.
+        if hasattr(llm, "gradient_checkpointing_enable"):
+            llm.gradient_checkpointing_enable()
+            print("[vfm_v2] gradient checkpointing enabled on the frozen LLM")
         print("[vfm_v2] LLM frozen — only the adapter will train")
 
     hidden_size = (
@@ -121,18 +179,21 @@ def main():
         adapter_layers=v_cfg["adapter_layers"],
         adapter_heads=v_cfg["adapter_heads"],
         adapter_dropout=v_cfg.get("adapter_dropout", 0.1),
+        adapter_intermediate_size=v_cfg.get("adapter_intermediate_size", None),
         max_completion_len=v_cfg["max_completion_len"],
         tau=v_cfg.get("tau", 1.0),
         sigma=v_cfg.get("sigma", 1.0),
         kl_weight=0.0,  # we anneal manually below; start at 0
         ar_shift=v_cfg.get("ar_shift", True),
+        variational=v_cfg.get("variational", True),
+        refinement_training=v_cfg.get("refinement_training", False),
     )
-    # Move ONLY the adapter to GPU — the LLM is already device-mapped via NF4
+    # Move ONLY the adapter to GPU — the LLM is already device-mapped via NF4.
+    # Keep the adapter in bf16 to match the LLM's bf16 embedding outputs. The
+    # earlier fp32 cast caused a LayerNorm dtype mismatch (fp32 weight vs
+    # bf16 input). For more numerical headroom, switch to fused AdamW with
+    # bf16 master weights or upgrade to amp later.
     model.adapter.to(device=device, dtype=torch.bfloat16)
-    # Cast adapter parameters to fp32 for stable optimizer state
-    for p in model.adapter.parameters():
-        if p.requires_grad:
-            p.data = p.data.to(torch.float32)
     print(f"[vfm_v2] adapter params: {sum(p.numel() for p in model.adapter.parameters() if p.requires_grad):,}")
 
     # Data
@@ -147,9 +208,15 @@ def main():
         collate_fn=collate, drop_last=True,
     )
 
+    # Include BOTH the adapter and any trainable LLM params (e.g. LoRA) in
+    # the optimizer. With freeze_llm=true and no LoRA, only adapter params
+    # show up here.
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    n_trainable = sum(p.numel() for p in trainable_params)
+    print(f"[vfm_v2] total trainable params (adapter + LoRA if any): {n_trainable:,}")
     optimizer = torch.optim.AdamW(
-        [p for p in model.adapter.parameters() if p.requires_grad],
-        lr=t_cfg["lr"], weight_decay=t_cfg.get("weight_decay", 0.0),
+        trainable_params,
+        lr=float(t_cfg["lr"]), weight_decay=float(t_cfg.get("weight_decay", 0.0)),
     )
 
     use_wandb = t_cfg.get("use_wandb", True)
@@ -187,9 +254,7 @@ def main():
             out = model(**batch)
             loss = out["loss"]
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for p in model.adapter.parameters() if p.requires_grad], 5.0
-            )
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 5.0)
             optimizer.step()
 
             if step % log_every == 0:
@@ -218,16 +283,12 @@ def main():
                     wandb.log(rec, step=step)
 
             if step > 0 and step % save_every == 0:
-                ckpt = out_dir / "checkpoints" / f"adapter_step_{step}.pt"
-                torch.save(model.adapter.state_dict(), ckpt)
-                print(f"[vfm_v2] saved adapter → {ckpt}")
+                _save_checkpoint(out_dir, step, model)
 
             step += 1
 
     # Final save
-    ckpt = out_dir / "checkpoints" / f"adapter_step_{step}.pt"
-    torch.save(model.adapter.state_dict(), ckpt)
-    print(f"[vfm_v2] FINAL adapter saved → {ckpt}")
+    _save_checkpoint(out_dir, step, model)
     if use_wandb:
         wandb.finish()
 
