@@ -626,9 +626,13 @@ def main():
     except ImportError:
         _mdm_history = None
 
-    # d3LLM trajectory visualization history buffer
+    # d3LLM trajectory visualization history buffer.
+    # The d3llm/ package now lives inside this repo (was previously imported
+    # from a sibling ../../d3LLM checkout). Includes the AR-shift fix to
+    # _make_prediction_fig that uses the externally-supplied correct_mask
+    # instead of the structurally-broken (pred == input_ids) at masked
+    # positions (input_ids at a mask position IS the mask token).
     try:
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../d3LLM"))
         from d3llm.d3llm_vis import D3LLMHistory, make_all_vis as make_d3llm_vis
         _d3llm_history = D3LLMHistory(maxlen=400)
         _has_d3llm_vis = True
