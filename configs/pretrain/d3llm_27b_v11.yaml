@@ -96,9 +96,28 @@ train:
   trajectory_entropy_weight: 0.0
   trajectory_temperature: 1.0
 
-  # Aux losses OFF — pure MDM baseline first. Add back one at a time later.
-  repr_align_wt: 0.0
-  repr_align_wt_final: 0.0
+  # repr_align ON — load-bearing AR→diffusion conversion signal.
+  # v6 (only previously-working baseline) used 0.5; v10/v10a stayed at 0.5
+  # with angular margin. Dropping to 0.25 cosine for v11 to leave room for
+  # the LM head to converge without alignment overpressure. Restoring this
+  # also brings back repr_align/alignment, repr_align/diffusion,
+  # repr_align/pca charts, which require the frozen teacher to be built.
+  repr_align_wt: 0.25
+  repr_align_wt_final: 0.25
+  repr_align_loss_mode: "cosine"
+  # Fresh 16-layer anchor cache precomputed for reasoning-500 data.
+  # Layers 4,8,12,…,64 — every 4th layer of the 64-layer 27B stack, which
+  # coincides with the full-attention layers in Qwen3.6's hybrid arch (the
+  # other 75% are Gated DeltaNet). max_seq_len=1024, bfloat16, ~80GB cache.
+  anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3.6-27b-reasoning-500-16L
+  align_layers: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64"
+  repr_align_sub_sample_ratio: 0.25
+  # 4 of 16 layers sampled randomly each step — over training all 16 covered.
+  # Per-step alignment branch memory: 4× lighter than aligning all 16 each step.
+  repr_align_num_sample_layers: 4
+  # subgoal_align + anti_rep stay off for now — add back one at a time
+  # only after v11's repr_align baseline shows healthy d3llm/masked_top1_acc
+  # climbing above ~0.4 in the first 2000 steps.
   subgoal_align_wt: 0.0
   anti_rep_wt: 0.0
 
