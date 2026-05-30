@@ -106,10 +106,51 @@ def main():
     inner_argmax_match_pct = (ref_argmax[1:] == cached_argmax[1:]).float().mean().item()
     print(f"argmax agreement at block[1:]:  {inner_argmax_match_pct * 100:.1f}%")
     if inner_argmax_match_pct >= 0.9:
-        print("PASS: cached vs uncached produce same greedy decode at >=90% of non-boundary positions")
+        print("PASS (single-block): cached vs uncached produce same greedy decode at >=90% of non-boundary positions")
     else:
         print("FAIL: cache changes greedy decode at >10% of positions")
         sys.exit(2)
+
+    # =================================================================
+    # MULTI-BLOCK CASCADE TEST
+    # Extend: prefix(64) → cache → block1(32) → cache → block2(32)
+    # Reference: full pass over [prefix + block1 + block2] = 128 tokens
+    # =================================================================
+    print()
+    print("=" * 60)
+    print("MULTI-BLOCK CASCADE TEST")
+    print("=" * 60)
+    BLOCK2_LEN = 32
+    torch.manual_seed(0)
+    full2 = torch.randint(0, vocab_size, (1, PREFIX_LEN + BLOCK_LEN + BLOCK2_LEN), device=DEVICE)
+    prefix_ids2 = full2[:, :PREFIX_LEN]
+    block1_ids2 = full2[:, PREFIX_LEN:PREFIX_LEN + BLOCK_LEN]
+    block2_ids2 = full2[:, PREFIX_LEN + BLOCK_LEN:]
+
+    with torch.no_grad():
+        out_ref2 = model(input_ids=full2, use_cache=False)
+    ref2_logits = out_ref2.logits.float()
+    ref2_block2_argmax = ref2_logits[:, PREFIX_LEN + BLOCK_LEN:, :].argmax(dim=-1).squeeze(0)
+
+    with torch.no_grad():
+        out_p = model(input_ids=prefix_ids2, use_cache=True)
+        past = out_p.past_key_values
+        out_b1 = model(input_ids=block1_ids2, past_key_values=past, use_cache=True)
+        past = out_b1.past_key_values
+        out_b2 = model(input_ids=block2_ids2, past_key_values=past, use_cache=True)
+    cached_block2_argmax = out_b2.logits.float().argmax(dim=-1).squeeze(0)
+
+    block2_match = (ref2_block2_argmax == cached_block2_argmax).sum().item()
+    print(f"block2 argmax agreement: {block2_match}/{BLOCK2_LEN}  ({100 * block2_match / BLOCK2_LEN:.1f}%)")
+
+    block2_inner_match = (ref2_block2_argmax[1:] == cached_block2_argmax[1:]).float().mean().item()
+    print(f"block2 argmax agreement [1:]: {block2_inner_match * 100:.1f}%")
+
+    if block2_inner_match >= 0.9:
+        print("PASS (multi-block): cache cascading preserves greedy decode")
+    else:
+        print("FAIL: cache cascading degrades greedy decode at >10% of block2 positions")
+        sys.exit(3)
 
 
 if __name__ == "__main__":
