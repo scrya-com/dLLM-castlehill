@@ -1,0 +1,117 @@
+# d3LLM 27B v6 — angular loss + margin (force repr_align toward 0)
+#
+# v5 observed: repr_align (= 1 - cos_sim) dropped from 0.37 → 0.28 then
+# plateaued. Two reasons it couldn't reach 0:
+#   1. Cosine loss has a vanishing gradient near cos_sim=1
+#      (dL/dθ = -sin θ → 0 as θ → 0)
+#   2. Causal teacher vs bidirectional student is a structural mismatch —
+#      hidden states at the same position encode genuinely different
+#      information, putting a *mathematical* floor on cos_sim
+#
+# v6 changes (vs v5):
+#   - repr_align_loss_mode: "cosine" → "angular"
+#       L = arccos(cos_sim) ∈ [0, π].  Gradient = 1/sin(θ), which
+#       INCREASES as cos_sim → 1. Keeps pushing right up to perfect
+#       alignment instead of asymptoting.
+#   - repr_align_angular_margin: 0.0 → 0.5 rad (≈ 29°, cos_sim ≈ 0.88)
+#       Honest accounting of the structural floor. Below 0.5 rad the
+#       loss reads 0, so the graph actually reaches 0 once you cross
+#       the floor. This is the "+1 offset" fix you asked for.
+#   - repr_align_wt: 5.0 → 2.0
+#       Angular loss is on a different scale (radians, up to π ≈ 3.14)
+#       vs cosine (up to 2). After subtracting the 0.5 margin, the
+#       effective magnitude is smaller, so we don't need wt=5 anymore.
+#       2.0 keeps the alignment term ~30% of total loss.
+#   - max_steps: 5 → 5000 (kept short to validate the angular formulation
+#                            before extending)
+#
+# Same data, same trajectories, same anchor cache, same rank as v4/v5.
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+      - embed_tokens
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 5
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v6_smoke
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 0
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 1
+  max_steps: 5
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 2e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  # d3LLM trajectory-guided masking (unchanged)
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  # Repr-Align with angular loss + margin (NEW in v6)
+  repr_align_wt: 2.0
+  anchor_cache_dir: /run/media/johndpope/12TB/open_dllm/anchors/qwen3.6-27b-reasoning-500
+  align_layers: "16,32,48,64"
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 2
+  repr_align_layer_exp: 0.0
+
+  repr_align_loss_mode: "angular"        # arccos(cos_sim), gradient peaks at alignment
+  repr_align_angular_margin: 0.5         # ≈29°; loss hits 0 once student within this of teacher
+
+  min_snr_gamma: 5.0                     # Min-SNR also applies to angular loss
+
+  gen_sample_every_steps: 0
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: false
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-reasoning-500-v6-angular

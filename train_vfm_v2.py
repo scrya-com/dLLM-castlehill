@@ -196,7 +196,6 @@ def main():
         kl_weight=0.0,  # we anneal manually below; start at 0
         ar_shift=v_cfg.get("ar_shift", True),
         variational=v_cfg.get("variational", True),
-        refinement_training=v_cfg.get("refinement_training", False),
     )
     # Move ONLY the adapter to GPU — the LLM is already device-mapped via NF4.
     # Keep the adapter in bf16 to match the LLM's bf16 embedding outputs. The
@@ -255,124 +254,6 @@ def main():
     max_steps = t_cfg["max_steps"]
     log_every = t_cfg.get("log_every", 10)
     save_every = t_cfg.get("save_every", 500)
-    recon_every = t_cfg.get("recon_every", 100)  # log LLM reconstructions every N steps
-
-    # Fixed reconstruction probes: the first few dataset rows, kept verbatim so
-    # the same prompts are reconstructed every probe step (comparable across
-    # training, like the d3llm generation/sample panel in train_torch.py).
-    _n_probes = int(t_cfg.get("recon_num_probes", 2))
-    _probe_rows = ds.rows[:_n_probes]
-
-    def _prediction_chart(prompt, response, step):
-        """d3llm-style prediction-quality chart for one probe: a per-position
-        green=correct / red=wrong strip + a confidence bar, from a single
-        smart-noise forward (refinement step 1). Returns a wandb.Image or None."""
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-            import numpy as np
-        except Exception:
-            return None
-        p_ids = tok.encode(prompt, add_special_tokens=False)[: d_cfg["max_prompt_len"]]
-        c_ids = tok.encode(response, add_special_tokens=False)[: min(128, d_cfg["max_completion_len"])]
-        if len(c_ids) < 2:
-            return None
-        p_t = torch.tensor([p_ids], dtype=torch.long, device=device)
-        c_t = torch.tensor([c_ids], dtype=torch.long, device=device)
-        P, C = p_t.size(1), c_t.size(1)
-        pe = model._embed_tokens(p_t)
-        ad = next(model.adapter.parameters()).dtype
-        mu, _ = model.adapter(pe.to(ad), torch.ones_like(p_t), C)
-        z = mu.to(pe.dtype)
-        full = torch.cat([pe, z], dim=1)
-        fmask = torch.ones(1, P + C, device=device, dtype=torch.long)
-        logits = model.llm(inputs_embeds=full, attention_mask=fmask, use_cache=False, is_causal=False).logits
-        logits = logits.to(next(model.adapter.parameters()).device)
-        comp_logits = logits[:, P - 1:P + C - 1, :] if model.ar_shift else logits[:, P:P + C, :]
-        probs = torch.softmax(comp_logits[0].float(), dim=-1)
-        conf, pred = probs.max(dim=-1)
-        correct = (pred == c_t[0]).cpu().numpy()
-        conf = conf.cpu().numpy()
-        T = len(c_ids)
-        img = np.zeros((1, T, 3))
-        img[0, correct, 1] = conf[correct]            # green = correct, brightness = confidence
-        img[0, ~correct, 0] = np.maximum(conf[~correct], 0.2)  # red = wrong
-        fig, axes = plt.subplots(2, 1, figsize=(14, 4), gridspec_kw={"height_ratios": [1, 3]})
-        fig.suptitle(f"VFM step-1 reconstruction — train step {step}  |  "
-                     f"top1 {100*correct.mean():.1f}%  ({correct.sum()}/{T})", fontsize=11)
-        axes[0].imshow(img, aspect="auto"); axes[0].set_yticks([]); axes[0].set_xlabel("completion position")
-        axes[0].set_title("green=correct, red=wrong (brightness=confidence)")
-        axes[1].bar(range(T), conf, width=1.0,
-                    color=["green" if correct[i] else "red" for i in range(T)])
-        axes[1].set_ylim(0, 1); axes[1].set_xlabel("completion position"); axes[1].set_ylabel("max-prob")
-        axes[1].axhline(0.5, color="k", ls="--", lw=0.5, alpha=0.5)
-        plt.tight_layout()
-        import wandb as _wb
-        im = _wb.Image(fig); plt.close(fig)
-        return im
-
-    @torch.no_grad()
-    def _log_reconstructions(step):
-        """Decode generate_refine output on the fixed probes and surface it
-        (console + wandb HTML + prediction-quality chart) — the d3llm-style
-        'LLM reconstructions' signal."""
-        model.eval()
-        html_blocks = []
-        if use_wandb and _probe_rows:
-            chart = _prediction_chart(_probe_rows[0][0], _probe_rows[0][1], step)
-            if chart is not None:
-                import wandb as _wb
-                _wb.log({"vfm/prediction": chart}, step=step)
-        for prompt, response in _probe_rows:
-            p_ids = tok.encode(prompt, add_special_tokens=False)[: d_cfg["max_prompt_len"]]
-            p_ids_t = torch.tensor([p_ids], dtype=torch.long, device=device)
-            p_mask_t = torch.ones_like(p_ids_t)
-            c_len = min(128, d_cfg["max_completion_len"])
-            # --- Diffusion (VFM refinement) reconstruction ---
-            try:
-                if getattr(model, "refinement_training", False):
-                    pred = model.generate_refine(p_ids_t, p_mask_t, completion_len=c_len,
-                                                 max_steps=t_cfg.get("recon_steps", 16),
-                                                 threshold=t_cfg.get("recon_threshold", 0.7))
-                else:
-                    pred = model.generate(p_ids_t, p_mask_t, completion_len=c_len,
-                                          num_refinement_steps=t_cfg.get("recon_steps", 1))
-                diff_recon = tok.decode(pred[0].tolist(), skip_special_tokens=True)
-            except Exception as e:
-                diff_recon = f"(diffusion gen failed: {type(e).__name__}: {e})"
-            # --- AR reconstruction (same LLM, autoregressive) — the d3llm
-            #     generation/sample comparison line. The LLM is device-mapped;
-            #     generate() handles placement. Enable KV cache just for this. ---
-            try:
-                model.llm.config.use_cache = True
-                ar_out = model.llm.generate(
-                    input_ids=p_ids_t.to(model.llm.get_input_embeddings().weight.device),
-                    attention_mask=p_mask_t.to(model.llm.get_input_embeddings().weight.device),
-                    max_new_tokens=c_len, do_sample=True, temperature=0.7, top_k=50,
-                )
-                model.llm.config.use_cache = False
-                ar_recon = tok.decode(ar_out[0][p_ids_t.shape[1]:].tolist(), skip_special_tokens=True)
-            except Exception as e:
-                model.llm.config.use_cache = False
-                ar_recon = f"(AR gen failed: {type(e).__name__}: {e})"
-            true_preview = response[:200].replace("\n", " ")
-            ar_preview = ar_recon[:200].replace("\n", " ")
-            diff_preview = diff_recon[:200].replace("\n", " ")
-            print(f"  [recon @ {step}] PROMPT: {prompt[:70]}")
-            print(f"               TRUE: {true_preview[:110]}")
-            print(f"               AR:   {ar_preview[:110]}")
-            print(f"               DIFF: {diff_preview[:110]}")
-            html_blocks.append(
-                f"<b>PROMPT:</b> {prompt[:120]}<br>"
-                f"<b>TRUE:</b> {true_preview}<br>"
-                f"<b>AR:</b> {ar_preview}<br>"
-                f"<b>Diffusion (VFM refine):</b> {diff_preview}<br><hr>"
-            )
-        if use_wandb:
-            import wandb as _wb
-            _wb.log({"reconstructions": _wb.Html("".join(html_blocks))}, step=step)
-        model.train()
 
     model.train()  # sets LLM + adapter to train mode; required for HF gradient checkpointing to activate inside transformer layers
     step = 0
@@ -405,25 +286,18 @@ def main():
                     "kl_weight": model.kl_weight,
                     "mu_norm": out["mu_norm"].item(),
                     "sigma_mean": out["sigma_mean"].item(),
-                    "masked_top1_acc": out["masked_top1_acc"].item(),
-                    "masked_top1_acc_unshifted": out["masked_top1_acc_unshifted"].item(),
                     "grad_norm": float(grad_norm),
                     "sec_per_step": dt / max(1, log_every),
                 }
                 print(
                     f"step {step:>5}  loss={rec['loss']:.3f}  "
                     f"data={rec['loss_data']:.3f}  obs={rec['loss_obs']:.3f}  "
-                    f"kl={rec['loss_kl']:.4f}  top1={rec['masked_top1_acc']:.3f}  "
+                    f"kl={rec['loss_kl']:.4f}  σ̄={rec['sigma_mean']:.3f}  "
                     f"|grad|={rec['grad_norm']:.2f}  "
                     f"{rec['sec_per_step']:.2f}s/it"
                 )
                 if use_wandb:
                     wandb.log(rec, step=step)
-
-            # LLM reconstructions — the d3llm-style generation/sample signal.
-            # Logged at step 0 too so you see the cold-start baseline.
-            if recon_every > 0 and step % recon_every == 0:
-                _log_reconstructions(step)
 
             if step > 0 and step % save_every == 0:
                 _save_checkpoint(model, out_dir, step)

@@ -1,0 +1,70 @@
+# VFM v2 smoke run — Qwen3.6-27B + frozen LLM + trainable adapter.
+#
+# Validates that the variational adapter q_φ can learn to map prompt → noise
+# such that one LLM forward produces the response. Frozen-LLM mode (no LoRA,
+# no adapter on the LLM itself) — only the small VFMv2NoiseAdapter is
+# trainable. ~260M params; ~3 GB optimizer state at fp32 + adapter weights.
+#
+# Dual-GPU model-parallel: frozen base layers → RTX PRO 4000 (cuda:1, 24 GB),
+# adapter + last layers + lm_head → RTX 5090 (cuda:0, 32 GB).
+# This is SINGLE-PROCESS model-parallel — do NOT use torchrun --nproc_per_node=2
+# (that is data-parallel and would try to load the full model twice).
+#
+# Launch on MSI (dual-GPU: VISIBLE_DEVICES=1,0 puts 5090 as cuda:0):
+#   cd ~/Documents/GitHub/Open-dLLM
+#   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,0 \
+#       PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#       .venv/bin/python tasks/train_vfm_v2.py \
+#       vfm_v2_27b_smoke.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  freeze_llm: true   # smoke: only the adapter is trainable
+  # Dual-GPU split: most frozen LLM → RTX PRO 4000, adapter+tail → 5090.
+  # gpu1_mem/gpu0_mem: accelerate fills cuda:1 first up to gpu1_mem, then
+  # spills to cuda:0. ~18 GB 4-bit model fits entirely on cuda:1 (20 GiB),
+  # leaving 5090 with ~24 GB free for adapter + activations + optimizer.
+  dual_gpu: true
+  # 14 GiB cap forces lm_head to spill to cuda:0 (5090). The lm_head forward
+  # allocates ~380 MB for logits (1×768×248k vocab) which OOMs the 4000 if
+  # the whole model is packed there. embedding+~56 layers fit in 14 GiB;
+  # remaining layers+lm_head go to cuda:0 which has 32 GB.
+  gpu1_mem: "14GiB"   # RTX PRO 4000 (24 GB) — embedding + most frozen layers
+  gpu0_mem: "16GiB"   # RTX 5090 (32 GB) — last layers + lm_head + adapter
+
+vfm:
+  # 2 layers + intermediate=hidden*2 keeps the adapter ~300M params at
+  # hidden=5120 (Qwen3.6). 4 layers + 4x intermediate blew past 1.4B
+  # → AdamW state alone would OOM the 5090.
+  adapter_layers: 2
+  adapter_heads: 8
+  adapter_dropout: 0.1
+  adapter_intermediate_size: 10240   # 2x hidden instead of 4x
+  max_completion_len: 512
+  tau: 1.0
+  sigma: 1.0
+  kl_weight_final: 0.01
+  kl_weight_warmup_steps: 200   # linear anneal 0 → 0.01 over the first 200 steps
+  ar_shift: true
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_prompt_len: 256
+  max_completion_len: 512
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v2_27b_smoke
+  lr: 1e-4
+  weight_decay: 0.01
+  max_steps: 2000
+  micro_batch_size: 1
+  global_batch_size: 1
+  grad_accum_steps: 1
+  log_every: 10
+  save_every: 500
+  eval_every: 0
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v2-27b-smoke-frozen-llm

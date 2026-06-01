@@ -1,0 +1,113 @@
+# d3LLM 27B v8 — block-level subgoal alignment + viz restored
+#
+# v6 result: repr_align trailing-mean 0.218 (vs v5's 0.28 plateau, 22% better),
+# but the per-token cosine still asymptoted because of the structural
+# causal-vs-bidirectional mismatch.
+#
+# v8 adds: BDS-inspired block-level alignment as an AUXILIARY loss alongside
+# the per-token angular loss. The trajectory is split into n_blocks contiguous
+# chunks (opening / premise / derivation / conclusion); each chunk's hidden
+# state is averaged across its tokens, and the block-means are aligned
+# student↔teacher. Block-averaging washes out the per-token positional
+# disagreement that puts the floor on per-token cosine — so this term can
+# converge well below the v6 0.218 floor.
+#
+# Also fixes two viz bugs from v6:
+#   1. repr_align_vis: shape (16,) vs (4,) mismatch — _vis_data was logging
+#      the full align_layers list while only k=4 layers were captured.
+#      Fix: store the subsampled layer indices that match the captured tensors.
+#   2. d3llm_vis: "cannot access local variable 'micro_batch'" — stable
+#      _last_micro_batch handle so the post-loop vis works even when the
+#      forward loop was empty.
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 5
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v8_smoke
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 0
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 1
+  max_steps: 5
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 2e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  # d3LLM trajectory (unchanged from v6)
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  # Repr-Align (per-token angular) — unchanged from v6
+  repr_align_wt: 2.0
+  repr_align_wt_final: 0.5
+  anchor_cache_dir: /run/media/johndpope/12TB/open_dllm/anchors/qwen3.6-27b-reasoning-500-16L
+  align_layers: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64"
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 4
+  repr_align_layer_exp: 0.0
+  repr_align_loss_mode: "angular"
+  repr_align_angular_margin: 0.5
+
+  # NEW in v8: block-level subgoal alignment auxiliary
+  subgoal_align_wt: 1.0                 # base weight; Min-SNR amplifies same as repr_align
+  subgoal_align_n_blocks: 4             # opening / premise / derivation / conclusion
+
+  llrd_decay: 0.85
+  min_snr_gamma: 5.0
+  gen_sample_every_steps: 0
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: false
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-reasoning-500-v8-subgoal

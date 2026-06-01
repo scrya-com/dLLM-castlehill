@@ -105,30 +105,14 @@ class VFMv2NoiseAdapter(nn.Module):
         self.prompt_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.prompt_norm = nn.LayerNorm(hidden_size)
 
-        # Completion decoder: a full Transformer DECODER stack, NOT a single
-        # cross-attention layer. Each layer does:
-        #   1. SELF-attention among completion queries  ← the key fix
-        #   2. CROSS-attention to the prompt context
-        #   3. FFN
-        # The self-attention is what breaks the conditional-independence
-        # assumption. Without it (the v2.0-v2.2 design), each z[j] was
-        # produced independently from (position j, prompt) and could not
-        # model inter-completion-token dependency — the "multimodality
-        # problem" that caps single-shot non-autoregressive generation at
-        # ~5% top-1. With self-attention, z[j] can condition on z[0..C-1],
-        # so the adapter can commit to ONE coherent completion rather than
-        # averaging over modes per-position.
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=hidden_size,
-            nhead=num_heads,
-            dim_feedforward=intermediate_size,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        # Cross-attention from completion queries to prompt context.
+        # Lets each completion position attend to the prompt with its own
+        # query rather than receiving a single pooled prompt summary.
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size, num_heads=num_heads,
+            dropout=dropout, batch_first=True,
         )
-        self.completion_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
-        self.completion_norm = nn.LayerNorm(hidden_size)
+        self.cross_norm = nn.LayerNorm(hidden_size)
 
         # Heads
         self.mu_head = nn.Linear(hidden_size, hidden_size)
@@ -170,16 +154,14 @@ class VFMv2NoiseAdapter(nn.Module):
         positions = positions.clamp(max=self.completion_pos_embed.num_embeddings - 1)
         queries = self.completion_pos_embed(positions).unsqueeze(0).expand(B, -1, -1)  # [B, C, D]
 
-        # 3. Transformer decoder: completion queries self-attend (bidirectional,
-        # no causal mask — this is a one-shot non-autoregressive decode, all
-        # positions visible to each other) AND cross-attend to prompt context.
-        # tgt = completion queries, memory = prompt context.
-        attended = self.completion_decoder(
-            tgt=queries,
-            memory=prompt_ctx,
-            memory_key_padding_mask=src_key_padding_mask,
-        )  # [B, C, D]
-        attended = self.completion_norm(attended)
+        # 3. Cross-attention: each completion query attends to the prompt context
+        attended, _ = self.cross_attn(
+            query=queries,
+            key=prompt_ctx,
+            value=prompt_ctx,
+            key_padding_mask=src_key_padding_mask,
+        )
+        attended = self.cross_norm(queries + attended)  # residual + norm
 
         # 4. Project to (μ, log σ²)
         mu = self.mu_head(attended)
@@ -226,7 +208,6 @@ class VFMv2(nn.Module):
         kl_weight: float = 0.01,
         ar_shift: bool = True,
         variational: bool = True,
-        refinement_training: bool = False,
     ):
         """
         Args:
@@ -267,28 +248,10 @@ class VFMv2(nn.Module):
         # too much information; the LLM was pretrained on token embeddings
         # which live on a manifold, and random Gaussian draws are off-manifold.
         self.variational = variational
-        # refinement_training: instead of one-shot (all completion positions
-        # = smart noise z), randomly "commit" a fraction of completion
-        # positions to their TRUE token embeddings and train the model to
-        # predict the rest. This is masked-diffusion / iterative-refinement
-        # training, but seeded from the adapter's smart noise z instead of
-        # all-[MASK]. The model learns to refine a smart-noise initialization
-        # toward the answer over multiple commit steps.
-        #
-        # At inference: start from all-z (smart noise), forward, commit the
-        # high-confidence positions (re-embed their argmax), repeat. Because
-        # the start is smart noise rather than mask, far fewer steps converge
-        # → that's the speedup, and the multi-step refinement fixes the
-        # one-shot multimodality errors → that's the quality.
-        self.refinement_training = refinement_training
 
     def _embed_tokens(self, ids: torch.Tensor) -> torch.Tensor:
         """Run input_ids through the LLM's embedding layer."""
-        embed = self.llm.get_input_embeddings()
-        # Move ids to the embedding table's device (may be cuda:1 in dual-GPU
-        # mode), then bring the result back to the adapter's device (cuda:0)
-        # so all subsequent adapter/loss ops stay on the training device.
-        return embed(ids.to(embed.weight.device)).to(next(self.adapter.parameters()).device)
+        return self.llm.get_input_embeddings()(ids)
 
     def forward(
         self,
@@ -333,29 +296,8 @@ class VFMv2(nn.Module):
         # concat is dtype-consistent for the LLM forward.
         z = z.to(prompt_embeds.dtype)
 
-        # 2b. Refinement training: randomly commit a fraction of completion
-        # positions to their TRUE token embeddings; the rest keep smart noise.
-        # Loss is computed only on the still-noisy (non-committed) positions,
-        # exactly as masked-diffusion trains on masked positions. commit_mask
-        # is True where the position is committed (true embed shown as context).
-        commit_mask = None
-        if self.refinement_training:
-            completion_embeds = self._embed_tokens(completion_ids)  # [B, C, D]
-            # Per-example commit ratio ~ U(0,1): early-step (ratio≈0) → mostly
-            # noise; late-step (ratio≈1) → mostly true context. Uniform sample
-            # covers the whole refinement trajectory each batch.
-            commit_ratio = torch.rand(B, 1, device=z.device)
-            commit_mask = torch.rand(B, C, device=z.device) < commit_ratio  # [B, C]
-            # Never "commit" a padded completion position.
-            commit_mask = commit_mask & completion_attention_mask.bool()
-            current_state = torch.where(
-                commit_mask.unsqueeze(-1), completion_embeds.to(z.dtype), z
-            )
-        else:
-            current_state = z
-
-        # 3. Concatenate prompt embeds with current_state, forward bidirectionally
-        full_embeds = torch.cat([prompt_embeds, current_state], dim=1)  # [B, P+C, D]
+        # 3. Concatenate prompt embeds with z, forward through LLM bidirectionally
+        full_embeds = torch.cat([prompt_embeds, z], dim=1)  # [B, P+C, D]
         full_attention_mask = torch.cat(
             [prompt_attention_mask, completion_attention_mask], dim=1
         )
@@ -366,9 +308,7 @@ class VFMv2(nn.Module):
             use_cache=False,
             is_causal=False,
         )
-        # Bring logits to the adapter device (cuda:0) so CE loss and labels
-        # are on the same device. lm_head may be on cuda:1 in dual-GPU mode.
-        logits = outputs.logits.to(next(self.adapter.parameters()).device)  # [B, P+C, V]
+        logits = outputs.logits  # [B, P+C, V]
 
         # 4. Compute CE losses with AR-shift convention
         # If ar_shift: logits[i] predicts token at position i+1.
@@ -403,51 +343,14 @@ class VFMv2(nn.Module):
             obs_mask = (region == 0) & (shifted_mask > 0)
             data_mask = (region == 1) & (shifted_mask > 0)
 
-            # Refinement: drop committed positions from the data loss. The
-            # token predicted at shifted index s is full_ids[s+1]; its commit
-            # status is commit_full[:, s+1]. Build commit_full over [P+C] with
-            # prompt positions = False (irrelevant, region filters them), then
-            # shift by 1 to align with shifted_labels.
-            if commit_mask is not None:
-                commit_full = torch.zeros(B, P + C, dtype=torch.bool, device=ce_per_pos.device)
-                commit_full[:, P:] = commit_mask  # completion positions
-                shifted_commit = commit_full[:, 1:]  # [B, P+C-1] aligned with shifted_labels
-                data_mask = data_mask & (~shifted_commit)
-
             loss_obs = (ce_per_pos * obs_mask.to(ce_per_pos.dtype)).sum() / obs_mask.sum().clamp(min=1).to(ce_per_pos.dtype)
             loss_data = (ce_per_pos * data_mask.to(ce_per_pos.dtype)).sum() / data_mask.sum().clamp(min=1).to(ce_per_pos.dtype)
-            # masked_top1_acc — the headline d3llm/MDM diagnostic: fraction of
-            # the noisy (loss-bearing) completion positions whose argmax
-            # prediction matches the true token. Computed on the SAME shifted,
-            # data_mask positions the loss uses, so it tracks loss_data.
-            with torch.no_grad():
-                pred_ids_shift = shifted_logits.argmax(dim=-1)  # [B, P+C-1]
-                correct = (pred_ids_shift == shifted_labels) & data_mask
-                masked_top1_acc = correct.sum().float() / data_mask.sum().clamp(min=1).float()
         else:
             # No shift: logits[i] predicts position i directly (BERT-style)
             prompt_logits = logits[:, :P, :]
             completion_logits = logits[:, P:, :]
             loss_obs = self._masked_ce(prompt_logits, prompt_ids, prompt_attention_mask)
             loss_data = self._masked_ce(completion_logits, completion_ids, completion_attention_mask)
-            with torch.no_grad():
-                cm = completion_attention_mask.bool()
-                correct = (completion_logits.argmax(dim=-1) == completion_ids) & cm
-                masked_top1_acc = correct.sum().float() / cm.sum().clamp(min=1).float()
-
-        # masked_top1_acc_unshifted — the mode-collapse detector (matches the
-        # d3llm/masked_top1_acc_unshifted panel). Compares argmax(logits[pos])
-        # to completion[pos] WITHOUT the AR shift. If this tracks the shifted
-        # acc closely the model is predicting position-independently (mode
-        # collapse); a healthy gap means real position-aware prediction.
-        with torch.no_grad():
-            comp_logits_u = logits[:, P:P + C, :]
-            pred_u = comp_logits_u.argmax(dim=-1)  # [B, C]
-            valid_u = completion_attention_mask.bool()
-            if commit_mask is not None:
-                valid_u = valid_u & (~commit_mask)
-            correct_u = (pred_u == completion_ids) & valid_u
-            masked_top1_acc_unshifted = correct_u.sum().float() / valid_u.sum().clamp(min=1).float()
 
         # 5. KL term (skipped when non-variational)
         if self.variational:
@@ -469,8 +372,6 @@ class VFMv2(nn.Module):
             "loss_kl": loss_kl.detach(),
             "mu_norm": mu.detach().norm(dim=-1).mean(),
             "sigma_mean": log_sigma.detach().exp().mean(),
-            "masked_top1_acc": masked_top1_acc.detach(),
-            "masked_top1_acc_unshifted": masked_top1_acc_unshifted.detach(),
             "logits": logits,
         }
 
@@ -541,7 +442,7 @@ class VFMv2(nn.Module):
                 use_cache=False,
                 is_causal=False,
             )
-            logits = outputs.logits.to(next(self.adapter.parameters()).device)  # [B, P+C, V]
+            logits = outputs.logits  # [B, P+C, V]
             if self.ar_shift:
                 # Completion predictions live at logits[P-1 .. P+C-2]
                 completion_logits = logits[:, P - 1:P + completion_len - 1, :]
@@ -554,87 +455,5 @@ class VFMv2(nn.Module):
                 # Replace z with the embedding of the predicted tokens
                 # for the next refinement pass.
                 z = self._embed_tokens(pred_ids)
-
-        return pred_ids
-
-    @torch.no_grad()
-    def generate_refine(
-        self,
-        prompt_ids: torch.Tensor,
-        prompt_attention_mask: torch.Tensor,
-        completion_len: int,
-        max_steps: int = 8,
-        threshold: float = 0.9,
-    ) -> torch.Tensor:
-        """Smart-noise-seeded confidence-threshold refinement decode.
-
-        The companion to refinement_training. Starts every completion
-        position at the adapter's smart noise z (NOT all-[MASK]), then each
-        step commits the still-noisy positions whose max-softmax confidence
-        exceeds `threshold` by re-embedding their argmax token. Committed
-        positions are frozen. Terminates when all positions are committed or
-        after max_steps.
-
-        Because the trajectory begins at smart noise — already a decent guess
-        — far fewer steps converge than the all-[MASK] start of vanilla MDM.
-
-        Returns:
-            completion_ids: [B, completion_len]
-        """
-        B, P = prompt_ids.shape
-        C = completion_len
-        prompt_embeds = self._embed_tokens(prompt_ids)
-        adapter_dtype = next(self.adapter.parameters()).dtype
-        mu, _ = self.adapter(prompt_embeds.to(adapter_dtype), prompt_attention_mask, C)
-        z = mu.to(prompt_embeds.dtype)  # smart-noise init for every position
-
-        current_state = z.clone()
-        committed = torch.zeros(B, C, dtype=torch.bool, device=prompt_ids.device)
-        pred_ids = torch.zeros(B, C, dtype=torch.long, device=prompt_ids.device)
-
-        completion_mask = torch.ones(B, C, device=prompt_ids.device, dtype=prompt_attention_mask.dtype)
-        full_mask = torch.cat([prompt_attention_mask, completion_mask], dim=1)
-
-        for step in range(max_steps):
-            if committed.all():
-                break
-            full_embeds = torch.cat([prompt_embeds, current_state], dim=1)
-            outputs = self.llm(
-                inputs_embeds=full_embeds, attention_mask=full_mask,
-                use_cache=False, is_causal=False,
-            )
-            logits = outputs.logits.to(next(self.adapter.parameters()).device)
-            if self.ar_shift:
-                completion_logits = logits[:, P - 1:P + C - 1, :]
-            else:
-                completion_logits = logits[:, P:P + C, :]
-            probs = torch.softmax(completion_logits.float(), dim=-1)
-            conf, argmax = probs.max(dim=-1)  # [B, C]
-
-            # Candidates to commit this step: not-yet-committed AND confident.
-            newly = (~committed) & (conf > threshold)
-            if not newly.any():
-                # Guarantee progress: commit the single most-confident
-                # uncommitted position per example.
-                masked_conf = conf.masked_fill(committed, -1.0)
-                top = masked_conf.argmax(dim=-1)  # [B]
-                newly = torch.zeros_like(committed)
-                newly[torch.arange(B, device=newly.device), top] = True
-
-            pred_ids = torch.where(newly, argmax, pred_ids)
-            committed = committed | newly
-            # Re-embed committed positions so the next pass reads clean context.
-            new_embeds = self._embed_tokens(pred_ids)
-            current_state = torch.where(committed.unsqueeze(-1), new_embeds.to(current_state.dtype), current_state)
-
-        # Any positions never committed (shouldn't happen with the progress
-        # guarantee) fall back to their last argmax.
-        if not committed.all():
-            full_embeds = torch.cat([prompt_embeds, current_state], dim=1)
-            outputs = self.llm(inputs_embeds=full_embeds, attention_mask=full_mask, use_cache=False, is_causal=False)
-            logits = outputs.logits.to(next(self.adapter.parameters()).device)
-            cl = logits[:, P - 1:P + C - 1, :] if self.ar_shift else logits[:, P:P + C, :]
-            fallback = cl.argmax(dim=-1)
-            pred_ids = torch.where(committed, pred_ids, fallback)
 
         return pred_ids

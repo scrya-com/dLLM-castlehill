@@ -1,0 +1,68 @@
+# VFM v2.1 — joint LoRA + adapter training
+#
+# Three changes from the v2 smoke (vfm_v2_27b_smoke.yaml):
+#  1. Deeper adapter: 3 layers (was 2), intermediate=2x hidden = ~770M params
+#  2. Looser KL: kl_weight_final 0.001 (was 0.01) so the encoder can put more
+#     information into μ without paying high KL cost. The previous run had
+#     loss_data plateau at ~6 with kl=0.01 squeezing the encoder too hard.
+#  3. Joint LoRA training: unfreeze the LLM via LoRA r=8 on attention + MLP
+#     projections. Paper recommends joint (θ, φ) training; smoke v2 froze
+#     the LLM as a sanity check.
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  freeze_llm: false   # joint training
+  lora:
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_rslora: true
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+vfm:
+  # Joint LoRA + adapter at seq_len 256 (128 prompt + 128 completion) on
+  # a 32GB 5090: 3-layer adapter OOMs at 31GB. Cut to 2 layers + smaller
+  # completion budget. Total trainable ≈ 580M (adapter) + 60M (LoRA).
+  adapter_layers: 2
+  adapter_heads: 8
+  adapter_dropout: 0.1
+  adapter_intermediate_size: 10240   # 2x hidden
+  max_completion_len: 128
+  tau: 1.0
+  sigma: 1.0
+  kl_weight_final: 0.001
+  kl_weight_warmup_steps: 200
+  ar_shift: true
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_prompt_len: 128
+  max_completion_len: 128
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v2_1_27b_joint
+  lr: 1e-4
+  weight_decay: 0.01
+  max_steps: 2000
+  micro_batch_size: 1
+  global_batch_size: 1
+  grad_accum_steps: 1
+  log_every: 10
+  save_every: 500
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v2-1-27b-joint-lora-adapter

@@ -1,0 +1,110 @@
+# d3LLM 27B v6 — angular + 16-layer pre-hook subsample + LLRD + curriculum
+#
+# Combined fixes to the v5 plateau:
+#
+# 1. Angular loss + margin (gradient peaks near alignment instead of vanishing)
+# 2. 16 align_layers, k=4 sampled per step (pre-loop subsample patch in
+#    hf_mdm_qlora.py — same VRAM as v4/v5 at 4 layers, but stochastic
+#    coverage over all 16 layers)
+# 3. Drop embed_tokens from LoRA — v5 sanity check showed
+#    lora_embedding_B mean|w|=0.78, max=3.94 vs ~0.01 for every other
+#    LoRA_B. The <M> token row was being pushed by ~80× the network scale
+#    and very plausibly contributing to the repr_align plateau by
+#    perturbing the input layer the teacher can't follow.
+# 4. LLRD 0.85 on LoRA adapters (lower layers get smaller LR — anchors
+#    low-level features, lets high-level ones adapt)
+# 5. Curriculum weight: repr_align_wt 2.0 → 0.5 via cosine decay over the
+#    full run (start strong to break out of the plateau, anneal so MDM
+#    has room to finish converging)
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    target_modules:                # embed_tokens removed; <M> stays at frozen init
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 5
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v6_smoke2
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 0
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 1
+  max_steps: 5
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 2e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  # d3LLM trajectory (unchanged)
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  # Repr-Align — 16 layers, k=4 sampled per step, angular + margin
+  repr_align_wt: 2.0                        # start
+  repr_align_wt_final: 0.5                  # cosine decay to this over full run
+  anchor_cache_dir: /run/media/johndpope/12TB/open_dllm/anchors/qwen3.6-27b-reasoning-500-16L
+  align_layers: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64"
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 4           # pre-loop subsample (NEW) — only k of 16 materialized per step
+  repr_align_layer_exp: 0.0                 # uniform layer weighting
+
+  repr_align_loss_mode: "angular"
+  repr_align_angular_margin: 0.5            # ≈29°, loss reads 0 below this
+
+  # LLRD — layer-wise LR decay on LoRA adapters
+  llrd_decay: 0.85
+
+  min_snr_gamma: 5.0                        # also amplifies angular loss
+
+  gen_sample_every_steps: 0
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: false
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-reasoning-500-v6-angular-16L

@@ -1,0 +1,60 @@
+# VFM v2 joint training — Qwen3.6-27B, RTX 5090 only (single GPU).
+# Option B: VFM noise adapter + LoRA trained together.
+# LoRA warm-started from v11 Repr-Align checkpoint (wandb 9mku5yoy, step 15500).
+#
+# Memory budget on RTX 5090 (32 GB):
+#   NF4 model:       ~14 GB  (27B × 4-bit, actual runtime ≈ 1.5× placement estimate)
+#   Adapter bf16:    ~2.2 GB (1.1B params × 2 bytes)
+#   LoRA bf16:       ~0.2 GB (223 MB warm-started)
+#   Adam states:     ~9.7 GB (fp32 m+v for adapter 8.8 GB + LoRA 0.89 GB)
+#   Activations:     ~3 GB   (bsz=1, seq_len=768, gradient checkpointing)
+#   Total:           ~29 GB  → fits in 32 GB
+#
+# Launch:
+#   cd ~/Documents/GitHub/Open-dLLM
+#   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+#       PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#       nohup .venv/bin/python train_vfm_v2.py vfm_v2_27b_5090-joint.yaml \
+#       > /tmp/vfm_v2_joint.log 2>&1 &
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  freeze_llm: false          # LoRA is trainable alongside the adapter
+  lora_resume_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v11/checkpoints/global_step_15500
+  dual_gpu: false            # single GPU — avoids PRO 4000's crowded VRAM
+
+vfm:
+  adapter_layers: 2
+  adapter_heads: 8
+  adapter_dropout: 0.1
+  adapter_intermediate_size: 10240   # 2x hidden (5120)
+  max_completion_len: 256            # reduced from 512: BNB+FLA saved tensors ∝ seq_len → saves ~6 GB
+  tau: 1.0
+  sigma: 1.0
+  kl_weight_final: 0.01
+  kl_weight_warmup_steps: 200
+  ar_shift: true
+  variational: true
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_prompt_len: 128               # reduced from 256
+  max_completion_len: 256           # reduced from 512; total 384 tokens vs 768
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v2_27b_joint
+  lr: 5e-5           # lower than frozen-LLM run; LoRA was warm-started
+  weight_decay: 0.01
+  max_steps: 2000
+  micro_batch_size: 1
+  global_batch_size: 1
+  grad_accum_steps: 1
+  log_every: 10
+  save_every: 500
+  eval_every: 0
+  seed: 42
+  use_8bit_adam: true      # saves ~8.5 GB vs fp32 Adam (1.1B adapter × fp32 m+v)
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v2-27b-joint-v11-5090

@@ -1,0 +1,118 @@
+# d3LLM 27B v9 — warm-start from v6 + subgoal_align + viz fixes
+#
+# Resumes from v6's converged LoRA adapter (step 5000) instead of fresh
+# random-init, then layers on v8's block-level subgoal alignment. The
+# adapter weights at step 0 of v9 are identical to step 5000 of v6 —
+# direct A/B with one variable changed (the loss).
+#
+# Limitations of this resume (deliberate; see README "Resume what's preserved"):
+#   ✓ LoRA matrix weights restored exactly
+#   ✗ Optimizer (Adam moments) restarts from zero — first ~100 steps oscillate
+#   ✗ global_step restarts at 0 — curriculum schedules would otherwise un-train
+#     the warm-started weights, so we FLATTEN them here:
+#       repr_align_wt: 0.5 (== v6's end value; no schedule)
+#       trajectory_min/max: preserved range to keep mask_ratio diversity
+#   ✗ Dataloader RNG restarts — model re-shuffles the 500 samples
+#
+# What gets to be evaluated: does the subgoal_align loss continue to drive
+# alignment down when starting from v6's already-converged per-token-aligned
+# adapter? If yes → v9 final < 0.218 (v6 floor). If no → v9 floor ≈ 0.218 and
+# the bottleneck is intrinsic to the block formulation, not "head room".
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    # WARM-START: load LoRA from v6's final checkpoint instead of fresh init.
+    # (r / lora_alpha / target_modules above must MATCH the adapter being
+    # loaded, or PEFT will fail. v6 used identical settings.)
+    resume_adapter_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v6/checkpoints/global_step_5000
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 5
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v9_smoke
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 0
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 1
+  max_steps: 5
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 2e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  # d3LLM trajectory — full range preserved so mask_ratio diversity stays
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  # Repr-Align — FLAT at v6's end value (no curriculum to undo warm-start)
+  repr_align_wt: 0.5                # was 2.0 in v6 (start); v6 ended ≈ 0.5
+  repr_align_wt_final: 0.5          # no decay — adapter is already where we want repr_align gradient to be modest
+  anchor_cache_dir: /run/media/johndpope/12TB/open_dllm/anchors/qwen3.6-27b-reasoning-500-16L
+  align_layers: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64"
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 4
+  repr_align_layer_exp: 0.0
+  repr_align_loss_mode: "angular"
+  repr_align_angular_margin: 0.5
+
+  # Block-level subgoal alignment (carried from v8) — this is what we're
+  # measuring v9 against. Should be the active driver now that repr_align
+  # is already converged.
+  subgoal_align_wt: 1.0
+  subgoal_align_n_blocks: 4
+
+  llrd_decay: 0.85
+  min_snr_gamma: 5.0
+  gen_sample_every_steps: 0
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: false
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-reasoning-500-v9-warmstart-from-v6
