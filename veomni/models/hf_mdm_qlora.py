@@ -225,6 +225,51 @@ def _mdm_loss(logits, labels, chunk_size=512, mask_ratio=None, min_snr_gamma=Non
     return mdm + path + anti_rep_term, mdm.detach(), path.detach(), anti_rep_term.detach()
 
 
+class VFMMaskFiller(nn.Module):
+    """VFM smart-noise initializer for the d3llm trajectory-MDM pipeline.
+
+    Replaces the static [MASK] token embedding with a context-aware
+    "smart-noise" embedding so the diffusion decode starts closer to the
+    answer (fewer steps). A small bidirectional Transformer reads the
+    partially-masked sequence (real embeds at unmasked positions, the
+    [MASK] embed at masked positions) and emits a DELTA added on top of the
+    existing embedding. Used ONLY at masked positions.
+
+    Zero-initialized output projection → at step 0 the delta is 0, so the
+    masked positions keep exactly the [MASK] embedding (identical to the
+    pre-VFM pipeline). Training then learns context-aware deltas. This means
+    enabling VFM never destabilizes a known-good d3llm run at the start.
+
+    Trained jointly with the LoRA via the existing mdm-loss gradient flowing
+    back through inputs_embeds. repr_align (anchoring), anti_rep, subgoal,
+    and the trajectory mask schedule are all unchanged — the teacher still
+    sees clean tokens, so anchoring pulls the smart-noise student hiddens
+    toward the clean teacher.
+    """
+
+    def __init__(self, hidden_size, num_layers=2, num_heads=8,
+                 intermediate_size=None, dropout=0.1):
+        super().__init__()
+        inter = intermediate_size or 2 * hidden_size
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size, nhead=num_heads, dim_feedforward=inter,
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.out = nn.Linear(hidden_size, hidden_size)
+        # Zero-init the delta projection → no-op at step 0.
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, inputs_embeds, attention_mask=None):
+        """inputs_embeds: [B, L, D]. Returns delta [B, L, D] (~0 at init)."""
+        pad_mask = (attention_mask == 0) if attention_mask is not None else None
+        h = self.encoder(inputs_embeds, src_key_padding_mask=pad_mask)
+        h = self.norm(h)
+        return self.out(h)
+
+
 class MDMQLoRAWrapper(nn.Module):
     def __init__(self, base):
         super().__init__()
@@ -248,6 +293,11 @@ class MDMQLoRAWrapper(nn.Module):
         self.subgoal_align_n_blocks = 4
         # Anti-repetition penalty (v10) — see _anti_rep_loss docstring
         self.anti_rep_wt = 0.0
+        # VFM smart-noise initializer (set externally by build_foundation_model).
+        # When set, masked-position embeddings are replaced by [MASK]+delta
+        # from the VFMMaskFiller. mask_token_id needed to locate masked slots.
+        self.vfm_adapter = None
+        self.vfm_mask_token_id = None
         # Visualization: set _vis_step=True before a forward to capture tensors
         self._vis_step = False
         self._vis_data = None
@@ -275,9 +325,30 @@ class MDMQLoRAWrapper(nn.Module):
             and mask_ratio is not None  # only during MDM training, not AR / inference
             and self.training
         )
-        out = self.base(input_ids=input_ids, attention_mask=attention_mask,
-                        position_ids=position_ids, use_cache=False,
-                        output_hidden_states=_repr_align_active)
+        # VFM smart-noise injection: replace [MASK] embeddings with
+        # [MASK]+delta(context) at masked positions. Active only when an
+        # adapter is attached and we're doing MDM (mask_ratio set). Inference
+        # / AR (mask_ratio=None) keeps the plain input_ids path.
+        _vfm_active = (
+            self.vfm_adapter is not None
+            and self.vfm_mask_token_id is not None
+            and mask_ratio is not None
+            and input_ids is not None
+        )
+        if _vfm_active:
+            embed_layer = self.base.get_input_embeddings()
+            inputs_embeds = embed_layer(input_ids)            # [B, L, D]
+            mask_pos = (input_ids == self.vfm_mask_token_id)  # [B, L]
+            delta = self.vfm_adapter(inputs_embeds, attention_mask)  # ~0 at init
+            smart = inputs_embeds + delta
+            inputs_embeds = torch.where(mask_pos.unsqueeze(-1), smart, inputs_embeds)
+            out = self.base(inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+                            position_ids=position_ids, use_cache=False,
+                            output_hidden_states=_repr_align_active)
+        else:
+            out = self.base(input_ids=input_ids, attention_mask=attention_mask,
+                            position_ids=position_ids, use_cache=False,
+                            output_hidden_states=_repr_align_active)
         logits = out.logits
         loss = None
         comps = {}
@@ -437,6 +508,7 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 
     cfg = dict(qlorafy_config or {})
+    _qcfg = cfg  # stable ref to the qlorafy dict (cfg is reused for model config below)
     bnb = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
@@ -504,4 +576,24 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
             hidden_size=hs,
         )
         print(f"[hf_mdm_qlora] CachedTeacher from {anchor_cache_dir}")
+
+    # VFM smart-noise initializer — attach when qlorafy_config.vfm_enabled.
+    if _qcfg.get("vfm_enabled", False):
+        _cfg2 = wrapper.config
+        hs2 = getattr(_cfg2, "hidden_size", None) or getattr(getattr(_cfg2, "text_config", None), "hidden_size", None)
+        wrapper.vfm_adapter = VFMMaskFiller(
+            hidden_size=hs2,
+            num_layers=_qcfg.get("vfm_layers", 2),
+            num_heads=_qcfg.get("vfm_heads", 8),
+            intermediate_size=_qcfg.get("vfm_intermediate_size", None),
+            dropout=_qcfg.get("vfm_dropout", 0.1),
+        )
+        wrapper.vfm_mask_token_id = _qcfg.get("vfm_mask_token_id", None)
+        # Match the embedding output dtype/device (NF4 base → bf16 embeds) so
+        # the filler's LayerNorm doesn't hit a dtype mismatch.
+        _emb = wrapper.base.get_input_embeddings()
+        wrapper.vfm_adapter = wrapper.vfm_adapter.to(device=_emb.weight.device, dtype=torch.bfloat16)
+        _np = sum(p.numel() for p in wrapper.vfm_adapter.parameters())
+        print(f"[hf_mdm_qlora] VFMMaskFiller attached: {_np:,} params, "
+              f"mask_token_id={wrapper.vfm_mask_token_id}, layers={_qcfg.get('vfm_layers', 2)}")
     return wrapper

@@ -510,6 +510,12 @@ def build_llrd_param_groups(
         if id(p) in seen_ids:
             continue
         seen_ids.add(id(p))
+        # VFM mask-filler params contain "layers.N" internally but are NOT
+        # LLM layers — keep them at full base_lr (they're zero-init and learn
+        # from scratch; the decayed per-layer LRs would starve them).
+        if "vfm_adapter" in name:
+            no_layer.append(p)
+            continue
         m = layer_pattern.search(name)
         if m:
             idx = int(m.group(1))

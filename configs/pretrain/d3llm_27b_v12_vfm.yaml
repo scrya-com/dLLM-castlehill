@@ -1,0 +1,130 @@
+# d3LLM v12 — VFM smart-noise init INTEGRATED into the d3llm pipeline
+#
+# This is the integration (not standalone VFM). The full v11 recipe —
+# trajectory masking + repr_align anchoring (16 layers, 4 sampled) + the
+# native d3llm losses + all panels — PLUS the VFM mask-filler that replaces
+# the static [MASK] embedding with a context-aware smart-noise embedding at
+# masked positions.
+#
+# Why integrated, not standalone: standalone VFM v2.4 was fast (~200 tok/s)
+# but had a 57-87% token-repetition wall. The mechanisms that fight that —
+# repr_align (clean teacher anchoring), anti_rep, the trajectory schedule —
+# all live HERE. VFM contributes only the smart-noise initialization on top.
+#
+# Warm-start LoRA from v11 step 15500 (the working diffusion model, mdm=1.07,
+# top1=0.50). The VFMMaskFiller is zero-init → at step 0 it's a no-op
+# (masked positions == [MASK] embedding, identical to v11), so we resume a
+# known-good model and the filler learns deltas without destabilizing it.
+#
+# anti_rep ON (0.5) — directly targets the repetition the standalone VFM hit.
+#
+# Single-GPU on the 5090 (CUDA_VISIBLE_DEVICES=1 per PCI order). VFMMaskFiller
+# adds ~150M params (2 layers) on top of the r=8 LoRA — fits alongside.
+#
+# Launch (MSI):
+#   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+#     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     .venv/bin/torchrun --nproc_per_node=1 tasks/train_torch.py \
+#     configs/pretrain/d3llm_27b_v12_vfm.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    resume_adapter_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v11/checkpoints/global_step_15500
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    # VFM smart-noise mask-filler. Kept SMALL: at hidden=5120 a single
+    # encoder layer's self-attn alone is ~105M params; the v1 config (2
+    # layers, 10240 FFN = 446M) OOM'd the 5090 once fp32 AdamW states
+    # (~3.6GB) stacked on v11's 26.5GB peak. 1 layer + 2048 FFN ≈ 150M,
+    # ~1.5GB params+states, fits alongside the 27B.
+    vfm_enabled: true
+    vfm_layers: 1
+    vfm_heads: 8
+    vfm_intermediate_size: 2048
+    vfm_dropout: 0.1
+    vfm_mask_token_id: 248077      # <M> — must match the trajectory collator's mask id
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 500
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v12_vfm
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 500
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 40
+  max_steps: 5000
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 1e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  # repr_align ON — the anchoring that keeps hidden states clean (fights the
+  # repetition standalone VFM suffered). Warm-started weights tolerate 0.5.
+  repr_align_wt: 0.5
+  repr_align_wt_final: 0.5
+  repr_align_loss_mode: "cosine"
+  anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3.6-27b-reasoning-500-16L
+  align_layers: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64"
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 4
+
+  subgoal_align_wt: 0.0
+  anti_rep_wt: 0.5    # directly targets the repetition the standalone VFM hit
+
+  llrd_decay: 0.85
+  min_snr_gamma: 0
+  gen_sample_every_steps: 250
+  gen_sample_steps: 64
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-v12-vfm-smartnoise-integrated
