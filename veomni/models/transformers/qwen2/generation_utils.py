@@ -618,6 +618,7 @@ def mdm_generate_block_cached(
     threshold: float = 0.9,
     max_iters_per_block: int = 32,
     temperature: float = 0.0,
+    kv_cache=None,
 ) -> torch.LongTensor:
     """Block-wise parallel decode WITH KV / DeltaNet cache reuse across
     block iterations.
@@ -654,17 +655,27 @@ def mdm_generate_block_cached(
     x = F.pad(input_ids, (0, max_new_tokens), value=mask_token_id)
 
     # 1. Forward the prompt to fill the cache + capture the prompt-end logit.
-    prompt_out = model(input_ids=input_ids, use_cache=True, is_causal=False)
+    prompt_out = model(input_ids=input_ids, past_key_values=kv_cache, use_cache=True, is_causal=False)
     cache = prompt_out.past_key_values
     # Logit at the last prompt position predicts position prompt_len (= block[0]).
     boundary_logit = prompt_out.logits[:, -1:, :].clone()  # [B, 1, V]
 
     import copy
-    # HF's native DynamicCache has neither snapshot nor restore. Use deepcopy
-    # as a portable fallback. Slow on long prefixes (~hundreds of MB per copy)
-    # but correctness over speed for the first cut.
+    # Use the cache's own snapshot/restore if available (Qwen3_5DynamicCache and
+    # PhaseQuantizedKVCache both implement them). Falls back to deepcopy for any
+    # other cache type. snapshot/restore clone only tensors, skipping Python object
+    # reconstruction — meaningfully faster for long prefixes.
     def _snap():
+        if hasattr(cache, "snapshot"):
+            return cache.snapshot()
         return copy.deepcopy(cache)
+
+    def _restore(snap):
+        if hasattr(cache, "restore"):
+            cache.restore(snap)
+            return cache
+        return copy.deepcopy(snap)
+
     snapshot = _snap()
 
     block_starts = list(range(prompt_len, prompt_len + max_new_tokens, block_size))
@@ -679,7 +690,7 @@ def mdm_generate_block_cached(
                 break
 
             # Restore cache to prefix-only state for this iteration.
-            cache = copy.deepcopy(snapshot)
+            cache = _restore(snapshot)
 
             # Forward block-only with cached prefix.
             block_out = model(input_ids=current_block_ids, past_key_values=cache,
@@ -718,7 +729,7 @@ def mdm_generate_block_cached(
                 x[bi, b_start + pi] = int(chosen_values[k].item())
 
         # Block converged. Forward the final block tokens to bake them into cache.
-        cache = copy.deepcopy(snapshot)
+        cache = _restore(snapshot)
         final_out = model(input_ids=x[:, b_start:b_end], past_key_values=cache,
                           use_cache=True, is_causal=False)
         # Update boundary_logit for next block's first position.

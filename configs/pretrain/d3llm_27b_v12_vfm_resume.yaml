@@ -1,0 +1,114 @@
+# d3LLM v12 RESUME — continue from step 11000
+#
+# Original v12 warm-started LoRA from v11, trained 11,057 steps, then failed.
+# This resumes with the LoRA adapter from step 11000.
+# NOTE: VFM mask-filler weights were not saved in the original run (bug fixed
+# now — vfm_adapter.pt will be saved alongside future checkpoints). This
+# resume starts VFM from scratch (zero-init). The LoRA weights have 11k steps
+# of training and should recover the VFM contribution within ~500 steps.
+#
+# Changes from original d3llm_27b_v12_vfm.yaml:
+#   - resume_adapter_path → v12/step_11000 (not v11/15500)
+#   - max_steps: 20000
+#   - wandb_name updated to indicate resume
+#
+# Launch (MSI):
+#   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+#     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     .venv/bin/torchrun --nproc_per_node=1 tasks/train_torch.py \
+#     configs/pretrain/d3llm_27b_v12_vfm_resume.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    resume_adapter_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v12_vfm/checkpoints/global_step_11000
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    vfm_enabled: true
+    vfm_layers: 1
+    vfm_heads: 8
+    vfm_intermediate_size: 2048
+    vfm_dropout: 0.1
+    vfm_mask_token_id: 248077
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 500
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v12_vfm
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 500
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 200
+  max_steps: 20000
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 1e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  repr_align_wt: 0.5
+  repr_align_wt_final: 0.5
+  repr_align_loss_mode: "cosine"
+  anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3.6-27b-reasoning-500-16L
+  align_layers: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64"
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 4
+
+  subgoal_align_wt: 0.0
+  anti_rep_wt: 0.5
+
+  llrd_decay: 0.85
+  min_snr_gamma: 0
+  gen_sample_every_steps: 250
+  gen_sample_steps: 64
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-v12-vfm-resume-step11000

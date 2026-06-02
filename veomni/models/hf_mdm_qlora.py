@@ -11,6 +11,7 @@ recomputes the masked-diffusion (MDM) loss on top of the logits so the
 veomni training loop interface (.loss / .logits / .loss_components) is
 preserved. repr_align is supported via CachedTeacher (set anchor_cache_dir).
 """
+import os
 from types import SimpleNamespace
 
 import torch
@@ -332,8 +333,8 @@ class MDMQLoRAWrapper(nn.Module):
         _vfm_active = (
             self.vfm_adapter is not None
             and self.vfm_mask_token_id is not None
-            and mask_ratio is not None
             and input_ids is not None
+            and (mask_ratio is not None or (input_ids == self.vfm_mask_token_id).any())
         )
         if _vfm_active:
             embed_layer = self.base.get_input_embeddings()
@@ -593,7 +594,33 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
         # the filler's LayerNorm doesn't hit a dtype mismatch.
         _emb = wrapper.base.get_input_embeddings()
         wrapper.vfm_adapter = wrapper.vfm_adapter.to(device=_emb.weight.device, dtype=torch.bfloat16)
+        # Resume VFM weights if available (vfm_adapter.pt saved alongside adapter)
+        _vfm_path = os.path.join(_resume_path, "vfm_adapter.pt")
+        if _resume_path and os.path.exists(_vfm_path):
+            wrapper.vfm_adapter.load_state_dict(torch.load(_vfm_path, map_location=_emb.weight.device))
+            print(f"[hf_mdm_qlora] VFM weights restored from {_vfm_path}")
         _np = sum(p.numel() for p in wrapper.vfm_adapter.parameters())
         print(f"[hf_mdm_qlora] VFMMaskFiller attached: {_np:,} params, "
               f"mask_token_id={wrapper.vfm_mask_token_id}, layers={_qcfg.get('vfm_layers', 2)}")
+
+        # Register a pre-forward hook on the base model so VFM activates
+        # during generation (mdm_generate calls the raw model, not the wrapper).
+        _mid = wrapper.vfm_mask_token_id
+        _vfm = wrapper.vfm_adapter
+        _get_emb = wrapper.base.get_input_embeddings
+
+        def _vfm_hook(module, args, kwargs):
+            input_ids = kwargs.get("input_ids", args[0] if args else None)
+            if input_ids is None or not (input_ids == _mid).any():
+                return
+            inputs_embeds = _get_emb()(input_ids)
+            mask_pos = (input_ids == _mid)
+            delta = _vfm(inputs_embeds)
+            smart = inputs_embeds + delta
+            inputs_embeds = torch.where(mask_pos.unsqueeze(-1), smart, inputs_embeds)
+            kwargs["inputs_embeds"] = inputs_embeds.to(inputs_embeds.dtype)
+            kwargs["input_ids"] = None
+
+        wrapper._vfm_handle = wrapper.base.register_forward_pre_hook(_vfm_hook, with_kwargs=True)
+        print(f"[hf_mdm_qlora] VFM pre-forward hook registered on base model")
     return wrapper

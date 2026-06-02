@@ -180,7 +180,7 @@ def _prune_old_checkpoints(checkpoint_dir: str, keep: int) -> None:
 
 
 def _save_qlora_checkpoint(model, save_dir, model_assets, logger):
-    """Save QLoRA checkpoint (PEFT adapter + assets). Works with MDMQLoRAWrapper."""
+    """Save QLoRA checkpoint (PEFT adapter + VFM + assets). Works with MDMQLoRAWrapper."""
     from peft import PeftModel
     peft_model = getattr(model, 'base', None)
     if isinstance(peft_model, PeftModel):
@@ -188,6 +188,9 @@ def _save_qlora_checkpoint(model, save_dir, model_assets, logger):
     else:
         adapter_state = {n: p.data for n, p in model.named_parameters() if p.requires_grad}
         save_model_weights(save_dir, adapter_state, model_assets=model_assets)
+    vfm = getattr(model, 'vfm_adapter', None)
+    if vfm is not None:
+        torch.save(vfm.state_dict(), f"{save_dir}/vfm_adapter.pt")
     logger.info_rank0(f"QLoRA checkpoint saved at {save_dir}")
 
 
