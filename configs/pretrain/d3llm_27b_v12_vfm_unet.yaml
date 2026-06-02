@@ -1,0 +1,119 @@
+# d3LLM v12 — VFM U-Net overfit: dual-GPU, paper-aligned architecture
+#
+# GPU allocation:
+#   5090    (cuda:0):  NF4 base model + LoRA r=8 + CachedTeacher + activations
+#   PRO 4000 (cuda:1): VFM U-Net adapter (~600M params, 3 encoder + 3 decoder
+#                      blocks, FFN=4096, bottleneck FFN=8192, Gaussian output)
+#
+# Architecture matches VFM paper (arXiv:2603.07276) §B.2.1.2:
+#   - Multi-scale encoder-decoder with Conv1d(stride=2) downsampling
+#   - Skip connections from encoder to decoder
+#   - Gaussian output: μ + log σ² (reparameterization during training)
+#   - α mixing (vfm_alpha=0.8): 20% steps use plain [MASK], prevents mode collapse
+#   - Joint training: LoRA + VFM trained together in same loop
+#
+# Launch (MSI, no CUDA_VISIBLE_DEVICES — both GPUs visible):
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     python tasks/train_torch.py configs/pretrain/d3llm_27b_v12_vfm_unet.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    resume_adapter_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v12_vfm/checkpoints/global_step_11000
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    # ── VFM U-Net (paper-aligned, dual-GPU) ──
+    vfm_enabled: false           # old VFM off
+    vfm_unet_enabled: true
+    vfm_unet_device: "cuda:1"    # PRO 4000 (24 GB)
+    vfm_unet_blocks: 2           # encoder/decoder depth (reduced from 3)
+    vfm_unet_ffn: 4096           # FFN intermediate (bottleneck = 2×)
+    vfm_unet_hidden: 5120        # NO bottleneck — full dim (was 2048)
+    vfm_unet_lr_mult: 3.0        # VFM LR multiplier (zero-init needs more gradient)
+    vfm_heads: 8
+    vfm_dropout: 0.1
+    vfm_alpha: 0.8               # α mixing rate (paper §3.4)
+    vfm_mask_token_id: 248077
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 500
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v12_vfm_unet
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 200
+  save_total_limit: 5
+  auto_resume: false
+  num_train_epochs: 10
+  max_steps: 5000
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 1e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.90
+  trajectory_max_mask_ratio: 0.90
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  repr_align_wt: 1.0            # Stronger alignment push (v6 used 2.0→0.5 curriculum)
+  repr_align_wt_final: 1.0
+  repr_align_loss_mode: "angular"
+  repr_align_angular_margin: 0.5
+  anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3.6-27b-reasoning-500-16L
+  align_layers: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64"
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 4
+
+  subgoal_align_wt: 0.0
+  anti_rep_wt: 1.0
+
+  llrd_decay: 0.85
+  min_snr_gamma: 0
+  gen_sample_every_steps: 200
+  gen_sample_steps: 2
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-v12-vfm-unet-overfit

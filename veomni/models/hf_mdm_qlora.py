@@ -271,6 +271,156 @@ class VFMMaskFiller(nn.Module):
         return self.out(h)
 
 
+# ── U-Net building blocks ────────────────────────────────────────────────────
+
+class _UNetBlock(nn.Module):
+    """Single encoder/decoder block: PreNorm → SelfAttn → FFN with residual.
+
+    Uses nn.TransformerEncoderLayer internally for the attention + FFN.
+    """
+    def __init__(self, hidden, heads=8, ffn=4096, dropout=0.1):
+        super().__init__()
+        self.layer = nn.TransformerEncoderLayer(
+            d_model=hidden, nhead=heads, dim_feedforward=ffn,
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+        )
+
+    def forward(self, x):
+        return self.layer(x)  # [B, L, D] → [B, L, D]
+
+
+class _GaussianHead(nn.Module):
+    """Gaussian output head: μ + log σ² per position per dim.
+
+    Matches VFM paper §3.1 Eq.11: p(x,y|z) = N(x|f(z), τ²I) N(y|A(f(z)), σ²I)
+    and §B.2.1.2: clamp log σ² ∈ [-10, 2].
+    """
+    def __init__(self, hidden):
+        super().__init__()
+        self.mu_head = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+        )
+        self.logvar_head = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+        )
+        # Zero-init output projections → no-op at step 0.
+        nn.init.zeros_(self.mu_head[1].weight)
+        nn.init.zeros_(self.mu_head[1].bias)
+        nn.init.zeros_(self.logvar_head[1].weight)
+        nn.init.zeros_(self.logvar_head[1].bias)
+
+    def forward(self, x):
+        mu = self.mu_head(x)
+        logvar = self.logvar_head(x).clamp(-10.0, 2.0)
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + std * eps  # z = μ + σ·ε  (reparameterization)
+        return mu  # deterministic at inference
+
+
+# ── VFM U-Net (paper-aligned) ────────────────────────────────────────────────
+
+class VFMMaskFillerUNet(nn.Module):
+    """U-Net noise adapter — paper-aligned architecture for dual-GPU deployment.
+
+    Architecture matching VFM paper §B.2.1.2:
+      - Input projection: hidden → vfm_hidden (bottleneck)
+      - Multi-scale encoder with Conv1d(stride=2) downsampling
+      - Bottleneck with large FFN
+      - Multi-scale decoder with skip connections + upsample
+      - Output projection: vfm_hidden → hidden
+      - Gaussian output: μ + log σ² (reparameterization during training)
+
+    Deployed on a dedicated GPU (PRO 4000 / cuda:0). The base LLM + LoRA
+    live on a separate GPU (5090 / cuda:1). Cross-GPU delta transfer
+    (~2.5 MB per forward) is handled by the wrapper.
+
+    Param scaling: at vfm_hidden=2048, each block is ~34M (vs 147M at 5120).
+    Total ~250M params with blocks=3 — fits 24 GB GPU.
+    """
+
+    def __init__(self, hidden=5120, blocks=3, ffn=4096, vfm_hidden=2048,
+                 heads=8, dropout=0.1):
+        super().__init__()
+        self.vfm_hidden = vfm_hidden
+        self._has_bottleneck = (vfm_hidden != hidden)
+
+        # Input/output projections: hidden ↔ vfm_hidden (skip if same dim)
+        if self._has_bottleneck:
+            self.in_proj = nn.Linear(hidden, vfm_hidden, bias=False)
+            self.out_proj = nn.Linear(vfm_hidden, hidden, bias=False)
+            nn.init.zeros_(self.out_proj.weight)
+            nn.init.xavier_uniform_(self.in_proj.weight)
+            _unet_dim = vfm_hidden
+        else:
+            self.in_proj = None
+            self.out_proj = nn.Linear(hidden, hidden, bias=False)
+            nn.init.zeros_(self.out_proj.weight)
+            _unet_dim = hidden
+
+        # Encoder: Conv1d(stride=2) → UNetBlock (operates at _unet_dim)
+        self.enc_convs = nn.ModuleList([
+            nn.Conv1d(_unet_dim, _unet_dim, kernel_size=4, stride=2, padding=1)
+            for _ in range(blocks)
+        ])
+        self.enc_blocks = nn.ModuleList([
+            _UNetBlock(_unet_dim, heads, ffn, dropout) for _ in range(blocks)
+        ])
+
+        # Bottleneck: larger FFN for compressed representation
+        self.bottleneck = _UNetBlock(_unet_dim, heads, ffn * 2, dropout)
+
+        # Decoder: UNetBlock → upsample (operates at _unet_dim)
+        self.dec_blocks = nn.ModuleList([
+            _UNetBlock(_unet_dim, heads, ffn, dropout) for _ in range(blocks)
+        ])
+
+        # Gaussian output head (at original hidden dim)
+        self.head = _GaussianHead(hidden)
+
+    def forward(self, inputs_embeds, attention_mask=None):
+        orig_len = inputs_embeds.shape[1]
+
+        # Input projection (skip if no bottleneck)
+        if self._has_bottleneck:
+            x = self.in_proj(inputs_embeds)
+        else:
+            x = inputs_embeds
+        skips = []
+
+        # Encoder: downsample + process
+        for conv, block in zip(self.enc_convs, self.enc_blocks):
+            x = conv(x.transpose(1, 2)).transpose(1, 2)  # [B,L,D] → [B,L/2,D]
+            x = block(x)
+            skips.append(x)
+
+        # Bottleneck
+        x = self.bottleneck(x)
+
+        # Decoder: upsample + skip-connect + process
+        for block, skip in zip(reversed(self.dec_blocks), reversed(skips)):
+            x = F.interpolate(
+                x.transpose(1, 2), size=skip.shape[1],
+                mode='linear', align_corners=False
+            ).transpose(1, 2)
+            x = block(x + skip)
+
+        # Restore to original sequence length
+        if x.shape[1] != orig_len:
+            x = F.interpolate(
+                x.transpose(1, 2), size=orig_len,
+                mode='linear', align_corners=False
+            ).transpose(1, 2)
+
+        # Project back to hidden
+        x = self.out_proj(x)  # [B, L, hidden]
+
+        return self.head(x)
+
+
 class MDMQLoRAWrapper(nn.Module):
     def __init__(self, base):
         super().__init__()
@@ -343,11 +493,32 @@ class MDMQLoRAWrapper(nn.Module):
             _alpha = getattr(self, 'vfm_alpha', 1.0)
             if torch.rand(1).item() > _alpha:
                 _vfm_active = False
+        # Track VFM activation rate for wandb
+        if self._vis_step and self.training:
+            if self._vis_data is None:
+                self._vis_data = {}
+            self._vis_data.setdefault("vfm_delta", {})
+            self._vis_data["vfm_delta"]["enabled"] = _vfm_active
         if _vfm_active:
             embed_layer = self.base.get_input_embeddings()
             inputs_embeds = embed_layer(input_ids)            # [B, L, D]
             mask_pos = (input_ids == self.vfm_mask_token_id)  # [B, L]
-            delta = self.vfm_adapter(inputs_embeds, attention_mask)  # ~0 at init
+            # U-Net path: cross-GPU delta transfer (PRO 4000 ↔ 5090)
+            if getattr(self, '_vfm_unet', False):
+                vfm_input = inputs_embeds.to(self.vfm_device)
+                delta = self.vfm_adapter(vfm_input)
+                delta = delta.to(inputs_embeds.device)
+            else:
+                delta = self.vfm_adapter(inputs_embeds, attention_mask)
+            # Log delta statistics for wandb (once per vis step)
+            if self._vis_step and mask_pos.any():
+                dm = delta.detach()
+                if self._vis_data is None:
+                    self._vis_data = {}
+                self._vis_data.setdefault("vfm_delta", {})
+                self._vis_data["vfm_delta"]["mean"] = dm.mean().item()
+                self._vis_data["vfm_delta"]["std"] = dm.std().item()
+                self._vis_data["vfm_delta"]["norm"] = dm.norm().item()
             smart = inputs_embeds + delta
             inputs_embeds = torch.where(mask_pos.unsqueeze(-1), smart, inputs_embeds)
             out = self.base(inputs_embeds=inputs_embeds, attention_mask=attention_mask,
@@ -377,12 +548,20 @@ class MDMQLoRAWrapper(nn.Module):
             teacher_out = self.teacher_model(input_ids=teacher_inputs, position_ids=position_ids)
             teacher_hiddens = teacher_out.hidden_states
 
-            # Build loss_mask from shifted labels — only align on MDM-masked positions,
-            # matching the reference qwen2/qwen3/qwen3_5 implementation.
+            # Build loss_mask from CLEAN (unmasked) positions — align where both
+            # student and teacher see real tokens, not VFM smart-noise.
+            # Previous code aligned at masked positions, forcing cosine match
+            # between teacher(clean tokens) and student(VFM-perturbed tokens),
+            # which structurally diverges (PCA shows 46° gap).
             loss_mask = None
-            if labels is not None:
-                labels_2d = labels if labels.dim() == 2 else labels.view(input_ids.size(0), -1)
-                loss_mask = (labels_2d[:, 1:].reshape(-1) != IGNORE_INDEX)  # [L-1]
+            if input_ids is not None:
+                _id_shifted = input_ids[:, 1:].reshape(-1)  # [L-1]
+                _mid = getattr(self, 'vfm_mask_token_id', None)
+                clean_mask = (_id_shifted != _mid) if _mid is not None else torch.ones_like(_id_shifted, dtype=torch.bool)
+                # Exclude padding
+                if attention_mask is not None:
+                    clean_mask = clean_mask & (attention_mask[:, 1:].reshape(-1) == 1)
+                loss_mask = clean_mask
 
             # Exponential layer weights: later layers weighted more heavily.
             _n_layers = len(self.align_layers)
@@ -494,7 +673,9 @@ class MDMQLoRAWrapper(nn.Module):
                     # old code stored 16 indices for 4 layers' worth of data → PCA
                     # downstream raised "(16,) vs (4,) shape mismatch" and silently
                     # dropped the panel.
-                    self._vis_data = {
+                    # Preserve VFM delta stats already written above
+                    _existing = self._vis_data if isinstance(self._vis_data, dict) else {}
+                    self._vis_data = {**_existing,
                         "s_layers": [s.detach().cpu() for s in _s_layers],
                         "t_layers": [t.detach().cpu() for t in _t_layers],
                         "layer_indices": list(_step_align_layers),
@@ -516,7 +697,17 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 
     cfg = dict(qlorafy_config or {})
-    _qcfg = cfg  # stable ref to the qlorafy dict (cfg is reused for model config below)
+    _qcfg = cfg
+
+    # Dual-GPU: if VFM UNet is enabled on one GPU, place base model on the other.
+    _vfm_unet = _qcfg.get("vfm_unet_enabled", False)
+    if _vfm_unet:
+        _vfm_dev = _qcfg.get("vfm_unet_device", "cuda:0")
+        device = "cuda:1" if _vfm_dev == "cuda:0" else "cuda:0"
+        print(f"[hf_mdm_qlora] dual-GPU: VFM UNet → {_vfm_dev}, base model → {device}")
+    else:
+        _vfm_dev = None
+
     bnb = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
@@ -591,8 +782,55 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
         )
         print(f"[hf_mdm_qlora] CachedTeacher from {anchor_cache_dir}")
 
-    # VFM smart-noise initializer — attach when qlorafy_config.vfm_enabled.
-    if _qcfg.get("vfm_enabled", False):
+    # ── VFM U-Net (paper-aligned, dual-GPU) ─────────────────────────────────
+    if _qcfg.get("vfm_unet_enabled", False):
+        _vfm_dev = _qcfg.get("vfm_unet_device", "cuda:0")
+        _base_dev = "cuda:1" if _vfm_dev == "cuda:0" else "cuda:0"
+        _cfg2 = wrapper.config
+        hs2 = getattr(_cfg2, "hidden_size", None) or getattr(getattr(_cfg2, "text_config", None), "hidden_size", None)
+
+        wrapper.vfm_adapter = VFMMaskFillerUNet(
+            hidden=hs2,
+            blocks=_qcfg.get("vfm_unet_blocks", 3),
+            ffn=_qcfg.get("vfm_unet_ffn", 4096),
+            vfm_hidden=_qcfg.get("vfm_unet_hidden", 2048),
+            heads=_qcfg.get("vfm_heads", 8),
+            dropout=_qcfg.get("vfm_dropout", 0.1),
+        ).to(device=_vfm_dev, dtype=torch.bfloat16)
+        wrapper.vfm_device = _vfm_dev
+        wrapper.vfm_mask_token_id = _qcfg.get("vfm_mask_token_id", None)
+        wrapper.vfm_alpha = _qcfg.get("vfm_alpha", 0.8)
+        wrapper.vfm_lr_mult = _qcfg.get("vfm_unet_lr_mult", 1.0)
+        wrapper._vfm_unet = True
+
+        _np = sum(p.numel() for p in wrapper.vfm_adapter.parameters())
+        print(f"[hf_mdm_qlora] VFM UNet ({_vfm_dev}): {_np:,} params ({_qcfg.get('vfm_unet_blocks',3)} blocks, "
+              f"FFN={_qcfg.get('vfm_unet_ffn',4096)}), base={_base_dev}")
+
+        # Pre-forward hook for inference (cross-GPU delta transfer)
+        _mid = wrapper.vfm_mask_token_id
+        _vfm = wrapper.vfm_adapter
+        _vfm_dev = wrapper.vfm_device
+
+        def _vfm_hook(module, args, kwargs):
+            if module.training:
+                return
+            input_ids = kwargs.get("input_ids")
+            if input_ids is None or not (input_ids == _mid).any():
+                return
+            embed = module.get_input_embeddings()
+            inputs_embeds = embed(input_ids).to(_vfm_dev)
+            with torch.no_grad():
+                delta = _vfm(inputs_embeds)
+            smart = inputs_embeds + delta.to(input_ids.device)
+            kwargs["inputs_embeds"] = smart.to(inputs_embeds.dtype)
+            kwargs["input_ids"] = None
+
+        wrapper.base.register_forward_pre_hook(_vfm_hook, with_kwargs=True)
+        print(f"[hf_mdm_qlora] VFM UNet pre-forward hook registered (cross-GPU)")
+
+    # ── VFM (original, single-GPU) ──────────────────────────────────────────
+    elif _qcfg.get("vfm_enabled", False):
         _cfg2 = wrapper.config
         hs2 = getattr(_cfg2, "hidden_size", None) or getattr(getattr(_cfg2, "text_config", None), "hidden_size", None)
         wrapper.vfm_adapter = VFMMaskFiller(

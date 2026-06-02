@@ -550,6 +550,12 @@ def main():
         _llrd_param_groups = build_llrd_param_groups(
             model, base_lr=args.train.lr, decay=_llrd_decay, weight_decay=args.train.weight_decay
         )
+    # VFM LR multiplier — zero-init UNet adapter needs stronger gradient signal
+    _vfm_lr_mult = float(getattr(args.model, "qlorafy_config", {}).get("vfm_unet_lr_mult", 1.0))
+    if _vfm_lr_mult != 1.0 and _llrd_param_groups is not None:
+        # VFM params go to the last (no_layer) group in build_llrd_param_groups.
+        _llrd_param_groups[-1]["lr"] = _llrd_param_groups[-1]["lr"] * _vfm_lr_mult
+        logger.info_rank0(f"VFM LR {_vfm_lr_mult}× = {_llrd_param_groups[-1]['lr']:.2e}")
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
@@ -1161,6 +1167,16 @@ def main():
                                 plt.close(_vfig)
                         except Exception as e:
                             logger.warning_rank0(f"[step {global_step}] repr_align vis failed: {e}")
+
+                    # VFM delta statistics (from model._vis_data["vfm_delta"])
+                    if _do_vis and getattr(model, "_vis_data", None) is not None:
+                        _vfm_d = model._vis_data.get("vfm_delta", {})
+                        if _vfm_d:
+                            train_metrics["vfm/delta_mean"] = _vfm_d["mean"]
+                            train_metrics["vfm/delta_std"] = _vfm_d["std"]
+                            train_metrics["vfm/delta_norm"] = _vfm_d["norm"]
+                            if "enabled" in _vfm_d:
+                                train_metrics["vfm/active"] = float(_vfm_d["enabled"])
 
                     # d3LLM trajectory visualization
                     if _do_vis and _has_d3llm_vis and _last_micro_batch is not None:

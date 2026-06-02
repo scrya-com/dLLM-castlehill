@@ -228,6 +228,7 @@ def main():
                         input_ids=input_ids,
                         attention_mask=attn_mask,
                         use_cache=False,
+                        is_causal=False,  # bidirectional teacher → no structural mismatch
                     )
                     if has_embed and hasattr(model.model, "embed_tokens"):
                         capture.hiddens[0] = (
