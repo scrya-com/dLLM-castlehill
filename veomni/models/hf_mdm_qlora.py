@@ -485,13 +485,12 @@ class MDMQLoRAWrapper(nn.Module):
             and input_ids is not None
             and (mask_ratio is not None or (input_ids == self.vfm_mask_token_id).any())
         )
-        # α mixing (VFM paper §3.4): with probability 1-α, use plain [MASK]
-        # embeddings instead of VFM smart-noise. Prevents flow map from
-        # forgetting unconditional generation. Only active during training.
+        # α mixing
         if _vfm_active and self.training:
             _alpha = getattr(self, 'vfm_alpha', 1.0)
             if torch.rand(1).item() > _alpha:
                 _vfm_active = False
+        _cons_loss = torch.tensor(0.0, device=input_ids.device)
         # Track VFM activation rate for wandb
         if self._vis_step and self.training:
             if self._vis_data is None:
@@ -525,6 +524,23 @@ class MDMQLoRAWrapper(nn.Module):
                 self._vis_data["vfm_delta"]["norm"] = dm.norm().item()
             smart = inputs_embeds + delta
             inputs_embeds = torch.where(mask_pos.unsqueeze(-1), smart, inputs_embeds)
+
+            # ── VFM delta consistency (cheap, inside _vfm_active) ──────
+            if _consistency_active and mask_pos.any() and mask_pos.sum() >= 2:
+                _dm = delta.detach().reshape(-1, delta.shape[-1])
+                _flat = mask_pos.reshape(-1)
+                _adj = _flat[:-1] & _flat[1:]
+                if _adj.sum() >= 2:
+                    _dl = _dm[:-1][_adj]
+                    _dr = _dm[1:][_adj]
+                    _cos = F.cosine_similarity(_dl, _dr, dim=-1)
+                    _cons_loss = _cos.clamp(min=0.0).mean()
+                    if self._vis_step:
+                        if self._vis_data is None:
+                            self._vis_data = {}
+                        self._vis_data.setdefault("vfm_delta", {})
+                        self._vis_data["vfm_delta"]["consistency"] = _cons_loss.item()
+
             out = self.base(inputs_embeds=inputs_embeds, attention_mask=attention_mask,
                             position_ids=position_ids, use_cache=False,
                             output_hidden_states=_repr_align_active)
@@ -534,48 +550,6 @@ class MDMQLoRAWrapper(nn.Module):
                             position_ids=position_ids, use_cache=False,
                             output_hidden_states=_repr_align_active)
         logits = out.logits
-
-        # ── Consistency regularization ──────────────────────────────────
-        # Two mask patterns → force same predictions at overlapping positions
-        _cons_loss = torch.tensor(0.0, device=input_ids.device)
-        if _consistency_active and self.training and mask_pos is not None and mask_pos.any():
-            _mr = mask_ratio.float().mean() if isinstance(mask_ratio, torch.Tensor) else mask_ratio
-            # Generate mask_B: random subset of same size, overlapping with mask_A
-            _n_masked = mask_pos.sum().item()
-            _mask_B = torch.zeros_like(mask_pos, dtype=torch.bool)
-            _flat = torch.rand(input_ids.numel(), device=input_ids.device)
-            _, _topk = torch.topk(_flat, _n_masked)
-            _mask_B.view(-1).scatter_(0, _topk, True)
-            _both = mask_pos & _mask_B
-            if _both.sum() >= 2:  # need at least 2 overlapping positions
-                # Second VFM pass with mask_B (cheap, on PRO 4000)
-                ids_B = input_ids.clone()
-                ids_B[_mask_B] = self.vfm_mask_token_id
-                embeds_B = embed_layer(ids_B)
-                if getattr(self, '_vfm_unet', False):
-                    vfm_B = self.vfm_adapter(embeds_B.to(self.vfm_device)).to(input_ids.device)
-                else:
-                    vfm_B = self.vfm_adapter(embeds_B, attention_mask)
-                embeds_B = torch.where(_mask_B.unsqueeze(-1), embeds_B + vfm_B, embeds_B)
-                # Second forward (gradient checkpointed to save memory)
-                out_B = self.base(inputs_embeds=embeds_B, attention_mask=attention_mask,
-                                  position_ids=position_ids, use_cache=False)
-                logits_B = out_B.logits
-                # Symmetric KL at overlapping masked positions
-                # AR-shift: logits[i] predicts labels[i+1]
-                _logits_A = logits[:, :-1][_both[:, 1:]]  # [N_overlap, V]
-                _logits_B = logits_B[:, :-1][_both[:, 1:]]
-                _pA = F.softmax(_logits_A.float(), dim=-1).clamp(min=1e-8)
-                _pB = F.softmax(_logits_B.float(), dim=-1).clamp(min=1e-8)
-                _kl_ab = (_pA * (_pA.log() - _pB.log())).sum(dim=-1).mean()
-                _kl_ba = (_pB * (_pB.log() - _pA.log())).sum(dim=-1).mean()
-                _cons_loss = 0.5 * (_kl_ab + _kl_ba)
-                if self._vis_step:
-                    if self._vis_data is None:
-                        self._vis_data = {}
-                    self._vis_data.setdefault("vfm_delta", {})
-                    self._vis_data["vfm_delta"]["consistency"] = _cons_loss.item()
-
         loss = None
         comps = {}
         if labels is not None:
