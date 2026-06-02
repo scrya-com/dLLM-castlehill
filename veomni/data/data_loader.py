@@ -142,7 +142,7 @@ def build_dataloader(
         collate_fn=collate_fn,
         pin_memory=pin_memory,
         drop_last=drop_last,
-        prefetch_factor=prefetch_factor,
+        prefetch_factor=(prefetch_factor if (num_workers or 0) > 0 else None),
     )
     if use_rmpad:
         dataloader = DynamicBatchSizeDataLoader(

@@ -553,10 +553,13 @@ def main():
         )
     # VFM LR multiplier — zero-init UNet adapter needs stronger gradient signal
     _vfm_lr_mult = float(getattr(args.model, "qlorafy_config", {}).get("vfm_unet_lr_mult", 1.0))
+    _vfm_gs = float(getattr(args.model, "qlorafy_config", {}).get("vfm_grad_scale", 1.0))
     if _vfm_lr_mult != 1.0 and _llrd_param_groups is not None:
         # VFM params go to the last (no_layer) group in build_llrd_param_groups.
         _llrd_param_groups[-1]["lr"] = _llrd_param_groups[-1]["lr"] * _vfm_lr_mult
         logger.info_rank0(f"VFM LR {_vfm_lr_mult}× = {_llrd_param_groups[-1]['lr']:.2e}")
+    if _vfm_gs != 1.0:
+        logger.info_rank0(f"VFM grad hook scale {_vfm_gs}× (unstarve deltas through deep stack + direct consistency)")
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
@@ -799,7 +802,7 @@ def main():
                     k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
                 }
                 _do_vis = (args.train.use_wandb and args.train.global_rank == 0
-                           and global_step % 200 == 0 and hasattr(model, "_vis_step"))
+                           and global_step % 50 == 0 and hasattr(model, "_vis_step"))  # lowered for faster VFM delta visibility during inspection
                 if _do_vis:
                     model._vis_step = True
                 with model_fwd_context:
@@ -1064,6 +1067,25 @@ def main():
                         train_metrics["qlora/grad_norm"] = lora_gnorm
                         train_metrics["qlora/grad_to_param_ratio"] = lora_gnorm / max(lora_pnorm, 1e-8)
 
+                    # VFM delta scalars every step (for dense wandb history; fixes "stuck at 0")
+                    # last_vfm_delta is always populated in forward (independent of heavy _vis_step %50)
+                    if hasattr(model, "last_vfm_delta") and getattr(model, "last_vfm_delta", None):
+                        d = model.last_vfm_delta
+                        train_metrics["vfm/delta_mean"] = d.get("mean", 0.0)
+                        train_metrics["vfm/delta_std"] = d.get("std", 0.0)
+                        train_metrics["vfm/delta_norm"] = d.get("norm", 0.0)
+                        train_metrics["vfm/active"] = float(d.get("active", 0))
+                        if "consistency" in d:
+                            train_metrics["vfm/delta_consistency"] = d["consistency"]
+                        # Dedicated log every step so vfm/ curves are dense even if main train_metrics log is vis-gated
+                        wandb.log({
+                            "vfm/delta_mean": d.get("mean", 0.0),
+                            "vfm/delta_std": d.get("std", 0.0),
+                            "vfm/delta_norm": d.get("norm", 0.0),
+                            "vfm/active": float(d.get("active", 0)),
+                            **({"vfm/delta_consistency": d["consistency"]} if "consistency" in d else {}),
+                        }, step=global_step)
+
                     _gen_every = getattr(args.train, "gen_sample_every_steps", 100)
                     if args.model.enable_qlorafy and _gen_every > 0 and global_step % _gen_every == 0:
                         try:
@@ -1178,6 +1200,13 @@ def main():
                             train_metrics["vfm/delta_norm"] = _vfm_d.get("norm", 0.0)
                             if "enabled" in _vfm_d:
                                 train_metrics["vfm/active"] = float(_vfm_d["enabled"])
+                            if "consistency" in _vfm_d:
+                                train_metrics["vfm/delta_consistency"] = _vfm_d["consistency"]
+                            # Also surface to console logs for direct inspection (wandb UI mean always near-0 by design; use norm)
+                            logger.info_rank0(
+                                f"[step {global_step}] VFM delta: mean={_vfm_d.get('mean', 0):.4g} std={_vfm_d.get('std', 0):.3g} "
+                                f"norm={_vfm_d.get('norm', 0):.1f} active={_vfm_d.get('enabled', 0)}"
+                            )
 
                     # d3LLM trajectory visualization
                     if _do_vis and _has_d3llm_vis and _last_micro_batch is not None:

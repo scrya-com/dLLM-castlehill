@@ -235,6 +235,8 @@ def _make_pca_fig(vis_data, global_step):
     else:
         _align_pct = 0.0
 
+    fig, ax = plt.subplots(figsize=(6, 5))
+    colors = np.arange(K)
     sc1 = ax.scatter(t_2d[:, 0], t_2d[:, 1], c=colors, cmap="Blues", marker="*",
                      s=80, alpha=0.7, label="teacher (★)", linewidths=0)
     sc2 = ax.scatter(s_2d[:, 0], s_2d[:, 1], c=colors, cmap="Reds", marker="o",
@@ -242,6 +244,7 @@ def _make_pca_fig(vis_data, global_step):
     ax.set_title(
         f"Student vs Teacher hidden states — PCA [{K} tokens, step {global_step}]\n"
         f"Alignment: {_align_pct:.1f}%  |  Aligned = red circles sit on blue stars  |  Color = sequence position"
+    )
     ax.legend(loc="upper right")
     ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
     plt.tight_layout()

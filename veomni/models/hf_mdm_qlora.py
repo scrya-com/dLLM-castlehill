@@ -116,34 +116,25 @@ def _repr_align_loss(z1, z2, layer_weights=None, contrastive=False, contrastive_
 
 
 def _anti_rep_loss(logits, labels, chunk_size=128):
-    # Smaller default chunk than _mdm_loss (which uses 512). The anti_rep
-    # softmax materializes p_left, p_right, AND their product in fp32,
-    # so each ~chunk × V slab is ~500 MB at chunk=512, V=248k. With backward
-    # retention this hits ~2 GB peak — enough to OOM v6/v9-sized adapters
-    # on a 32 GB Blackwell. chunk=128 drops it to ~125 MB per slab.
-    """Anti-repetition penalty for parallel MDM decoding.
+    # Smaller default chunk than _mdm_loss (which uses 512). 
+    # Hard-margin variant (default): directly attacks argmax repeats at adjacent
+    # positions (the actual inference failure mode for parallel unmasking).
+    # When top-1 token at i == top-1 at i+1 (and GT labels differ), apply
+    # hinge on the logit margin: max(0, logit_winner - logit_2nd).
+    # This gives strong, sparse gradient pushing the offending logit down
+    # (unlike soft p_i·p_j which can be weak once peaked).
+    #
+    # Gated on supervised positions + GT labels different (legit repeats OK).
+    # Chunked to bound memory. Returns (loss_scalar, n_count).
+    """Anti-repetition penalty (hard-margin on argmax collision).
 
-    Repetition in MDM ("Topic Topic", "Initial Initial") is a factorization
-    failure: training optimizes per-position marginals p(x_i | context), but
-    inference decodes adjacent masked positions independently from those
-    marginals. When the marginals at i and i+1 both peak at the same token
-    (which they often do in scaffold-heavy text), the parallel decode emits
-    the repeat. The training objective is *silent* about adjacent-position
-    interaction.
+    MDM loss pushes "predict the token at this position". For adjacent positions
+    with similar local context, that often means the *same* token. Soft product
+    penalty (old) was too weak vs 10-50× stronger MDM grad.
 
-    Fix: penalize the joint probability that adjacent masked positions
-    decode to the same token,
-        L = E_{(i,j) ∈ pairs}[ sum_v p_i(v) * p_j(v) ]
-    gated on (1) both positions being supervised (predicted), (2) the
-    ground-truth tokens at i and j being DIFFERENT — so legitimate
-    repetitions in data ('.', '(', repeated header markers) aren't penalized.
-
-    Same chunked-along-position structure as _mdm_loss so peak fp32 softmax
-    memory stays bounded. Skips pairs that straddle a chunk boundary (~0.2%
-    of pairs at chunk_size=512), simpler than reaching into the next chunk.
-
-    Returns (anti_rep_loss [scalar], n_pairs_seen [int]) — caller decides
-    whether/how to weight.
+    Hard margin: if argmax(logits[i]) == argmax(logits[i+1]) and labels differ,
+    penalize max(0, top_logit - second_best_logit). Directly changes the top-1
+    decision at inference (low-step parallel decode).
     """
     logits_s = logits[:, :-1, :]                              # [B, L-1, V]
     labels_s = labels[:, 1:] if labels.dim() == 2 else labels.view(logits.size(0), -1)[:, 1:]
@@ -166,10 +157,31 @@ def _anti_rep_loss(logits, labels, chunk_size=128):
         valid = pair_mask & pair_diff                               # [c-1]
         if not valid.any():
             continue
-        p = F.softmax(chunk_l, dim=-1)                              # [c, V] fp32
-        joint_same = (p[:-1] * p[1:]).sum(dim=-1)                   # [c-1]
-        total = total + (joint_same * valid.float()).sum()
-        count = count + int(valid.sum().item())
+        # Hard margin on argmax collision (new default; stronger signal)
+        l_left = chunk_l[:-1][valid]   # [nv, V]
+        l_right = chunk_l[1:][valid]
+        top_l = l_left.argmax(dim=-1)
+        top_r = l_right.argmax(dim=-1)
+        same = (top_l == top_r)
+        if same.any():
+            # left position margins
+            n_same = int(same.sum().item())
+            idx_l = torch.arange(l_left.size(0), device=l_left.device)[same]
+            tval_l = l_left[same][torch.arange(n_same), top_l[same]]
+            l_l2 = l_left[same].clone()
+            l_l2[torch.arange(n_same), top_l[same]] = -1e30
+            snd_l = l_l2.max(dim=-1).values
+            marg_l = (tval_l - snd_l).clamp(min=0)
+            # right position margins (symmetric)
+            idx_r = torch.arange(l_right.size(0), device=l_right.device)[same]
+            tval_r = l_right[same][torch.arange(n_same), top_r[same]]
+            l_r2 = l_right[same].clone()
+            l_r2[torch.arange(n_same), top_r[same]] = -1e30
+            snd_r = l_r2.max(dim=-1).values
+            marg_r = (tval_r - snd_r).clamp(min=0)
+            total = total + (marg_l.sum() + marg_r.sum())
+            count = count + 2 * n_same
+        # (old soft product path removed; hard is the active recipe)
 
     if count == 0:
         return logits.sum() * 0.0, 0
@@ -444,9 +456,14 @@ class MDMQLoRAWrapper(nn.Module):
         # from the VFMMaskFiller. mask_token_id needed to locate masked slots.
         self.vfm_adapter = None
         self.vfm_mask_token_id = None
+        # VFM gradient scale (to counteract 64-layer attenuation to input embeds).
+        # Applied via hook on the *delta* tensor (after cross-device to() for UNet).
+        # 1.0 = no scale; 10-50× common for deep stacks when delta stays ~0.
+        self.vfm_grad_scale = 1.0
         # Visualization: set _vis_step=True before a forward to capture tensors
         self._vis_step = False
         self._vis_data = None
+        self.last_vfm_delta = {}  # always-updated scalars for per-step wandb (not gated on heavy vis)
 
     def __getattr__(self, name):
         try:
@@ -513,12 +530,27 @@ class MDMQLoRAWrapper(nn.Module):
                 delta = delta.to(inputs_embeds.device)
             else:
                 delta = self.vfm_adapter(inputs_embeds, attention_mask)
-            # Log delta statistics for wandb (once per vis step)
+            # Amplify grad into VFM to fight 64-layer starvation (applied to delta
+            # tensor so it scales grads coming back from the deep base + MDM loss).
+            _gs = float(getattr(self, 'vfm_grad_scale', 1.0))
+            if self.training and _gs != 1.0 and delta.requires_grad:
+                delta.register_hook(lambda g: g * _gs if g is not None else g)
+            # Always capture last VFM delta stats (scalars) for dense per-step wandb logging.
+            # (Heavy vis panels stay gated on _vis_step %50; scalars now always available.)
+            if self.training:
+                dm = delta.detach() if _vfm_active and mask_pos.any() else torch.zeros(1, device=delta.device)
+                self.last_vfm_delta = {
+                    "mean": dm.mean().item() if dm.numel() > 0 else 0.0,
+                    "std": dm.std().item() if dm.numel() > 1 else 0.0,
+                    "norm": dm.norm().item() if dm.numel() > 0 else 0.0,
+                    "active": bool(_vfm_active),
+                }
+            # Log delta statistics for wandb (once per vis step) -- keep for _vis_data / plots
             if self._vis_step:
                 if self._vis_data is None:
                     self._vis_data = {}
                 self._vis_data.setdefault("vfm_delta", {})
-                dm = delta.detach() if _vfm_active and mask_pos.any() else torch.zeros(1)
+                dm = delta.detach() if _vfm_active and mask_pos.any() else torch.zeros(1, device=delta.device)
                 self._vis_data["vfm_delta"]["mean"] = dm.mean().item()
                 self._vis_data["vfm_delta"]["std"] = dm.std().item()
                 self._vis_data["vfm_delta"]["norm"] = dm.norm().item()
@@ -526,8 +558,12 @@ class MDMQLoRAWrapper(nn.Module):
             inputs_embeds = torch.where(mask_pos.unsqueeze(-1), smart, inputs_embeds)
 
             # ── VFM delta consistency (cheap, inside _vfm_active) ──────
+            # NOTE: NO .detach() — this term must provide *direct* gradient to VFM
+            # (bypasses the 64-layer base entirely). Critical for unstarving VFM.
+            # Current form (min positive cos) encourages orthogonal deltas on adj
+            # masked positions → helps avoid "converge converge" repeats.
             if _consistency_active and mask_pos.any() and mask_pos.sum() >= 2:
-                _dm = delta.detach().reshape(-1, delta.shape[-1])
+                _dm = delta.reshape(-1, delta.shape[-1])
                 _flat = mask_pos.reshape(-1)
                 _adj = _flat[:-1] & _flat[1:]
                 if _adj.sum() >= 2:
@@ -535,6 +571,8 @@ class MDMQLoRAWrapper(nn.Module):
                     _dr = _dm[1:][_adj]
                     _cos = F.cosine_similarity(_dl, _dr, dim=-1)
                     _cons_loss = _cos.clamp(min=0.0).mean()
+                    if self.training:
+                        self.last_vfm_delta["consistency"] = _cons_loss.item()
                     if self._vis_step:
                         if self._vis_data is None:
                             self._vis_data = {}
@@ -795,6 +833,11 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
     wrapper.subgoal_align_n_blocks = subgoal_align_n_blocks
     wrapper.anti_rep_wt = anti_rep_wt
     wrapper.consistency_wt = consistency_wt
+    # vfm_grad_scale may come from qlorafy_config (preferred for VFM runs) or kw
+    _gs = cfg.get("vfm_grad_scale", None) if 'cfg' in locals() else None
+    if _gs is None:
+        _gs = kw.pop("vfm_grad_scale", 1.0)
+    wrapper.vfm_grad_scale = float(_gs)
     if anchor_cache_dir:
         from .cached_teacher import CachedTeacher
         # Qwen3_5Config stores hidden_size inside text_config
@@ -827,11 +870,12 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
         wrapper.vfm_mask_token_id = _qcfg.get("vfm_mask_token_id", None)
         wrapper.vfm_alpha = _qcfg.get("vfm_alpha", 0.8)
         wrapper.vfm_lr_mult = _qcfg.get("vfm_unet_lr_mult", 1.0)
+        wrapper.vfm_grad_scale = float(_qcfg.get("vfm_grad_scale", 20.0))
         wrapper._vfm_unet = True
 
         _np = sum(p.numel() for p in wrapper.vfm_adapter.parameters())
         print(f"[hf_mdm_qlora] VFM UNet ({_vfm_dev}): {_np:,} params ({_qcfg.get('vfm_unet_blocks',3)} blocks, "
-              f"FFN={_qcfg.get('vfm_unet_ffn',4096)}), base={_base_dev}")
+              f"FFN={_qcfg.get('vfm_unet_ffn',4096)}), grad_scale={wrapper.vfm_grad_scale}×, base={_base_dev}")
 
         # Pre-forward hook for inference (cross-GPU delta transfer)
         _mid = wrapper.vfm_mask_token_id
@@ -868,6 +912,7 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
         )
         wrapper.vfm_mask_token_id = _qcfg.get("vfm_mask_token_id", None)
         wrapper.vfm_alpha = _qcfg.get("vfm_alpha", 0.8)  # VFM paper §3.4: α mixing rate
+        wrapper.vfm_grad_scale = float(_qcfg.get("vfm_grad_scale", 20.0))
         # Match the embedding output dtype/device (NF4 base → bf16 embeds) so
         # the filler's LayerNorm doesn't hit a dtype mismatch.
         _emb = wrapper.base.get_input_embeddings()
@@ -879,7 +924,7 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
             print(f"[hf_mdm_qlora] VFM weights restored from {_vfm_path}")
         _np = sum(p.numel() for p in wrapper.vfm_adapter.parameters())
         print(f"[hf_mdm_qlora] VFMMaskFiller attached: {_np:,} params, "
-              f"mask_token_id={wrapper.vfm_mask_token_id}, layers={_qcfg.get('vfm_layers', 2)}")
+              f"mask_token_id={wrapper.vfm_mask_token_id}, layers={_qcfg.get('vfm_layers', 2)}, grad_scale={wrapper.vfm_grad_scale}×")
 
         # Register a pre-forward hook on the base model so VFM activates
         # during generation (mdm_generate calls the raw model, not the wrapper).

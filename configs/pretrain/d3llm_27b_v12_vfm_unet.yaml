@@ -27,7 +27,7 @@ model:
     lora_dropout: 0.05
     use_dora: false
     use_rslora: true
-    resume_adapter_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v12_vfm/checkpoints/global_step_11000
+    resume_adapter_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v12_vfm_unet/checkpoints/global_step_5000
     target_modules:
       - in_proj_qkv
       - in_proj_a
@@ -49,9 +49,10 @@ model:
     vfm_unet_ffn: 4096           # FFN intermediate (bottleneck = 2×)
     vfm_unet_hidden: 5120        # NO bottleneck — full dim (was 2048)
     vfm_unet_lr_mult: 5.0        # VFM LR multiplier (was 3.0, delta still near-zero)
+    vfm_grad_scale: 20.0         # explicit grad hook scale (×) to unstarve through 64-layer path + direct consistency
     vfm_heads: 8
     vfm_dropout: 0.1
-    vfm_alpha: 0.8               # α mixing rate (paper §3.4)
+    vfm_alpha: 1.0               # force always-active VFM for debugging delta (was 0.8; 20% skip chance was causing active=False at vis steps)
     vfm_mask_token_id: 248077
 
 data:
@@ -62,8 +63,8 @@ data:
   data_type: plaintext
   text_keys: text
   drop_last: true
-  num_workers: 2
-  prefetch_factor: 2
+  num_workers: 0
+  prefetch_factor: 2  # numeric for argparse; code now safely turns it to None when num_workers==0
 
 train:
   output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v12_vfm_unet
@@ -83,6 +84,7 @@ train:
   seed: 42
   data_parallel_mode: ddp
   ckpt_manager: dcp
+  save_optimizer_state: false  # avoid dcp/4bit bnb resume issues with Params4bit.absmax etc.
 
   enable_masking: true
 
@@ -102,8 +104,9 @@ train:
   repr_align_num_sample_layers: 4
 
   subgoal_align_wt: 0.0
-  anti_rep_wt: 2.0            # turned up from 1.0 — still stuck at 0.05
-  consistency_wt: 1.0          # was 0.3 — flat at 0.27, needs more gradient
+  anti_rep_wt: 0.5            # hard-margin (start lower: hinge margins ~1-5 vs old joint-prob ~0.05; retune)
+  # anti_rep_wt: 2.0            # hard-margin anti-rep (argmax collision hinge) — replaces weak soft p*p
+  consistency_wt: 1.0          # direct (no-detach) on deltas for VFM unstarve + anti-repeat diversity
 
   llrd_decay: 0.85
   min_snr_gamma: 0
