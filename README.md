@@ -409,6 +409,9 @@ Also carries v9's warm-start mechanism (LoRA loaded from v6 step_5000) + v8's `s
 
 ## 📚 Training-run breadcrumb trail
 
+> **Wandb breadcrumbs**: each run has notes with what it tried and what it taught.
+> See https://wandb.ai/snoozie/open-dllm-27b for the full interactive trail with graphs.
+
 The d3LLM-27B work is a sequence of runs, each isolating a different fix to the previous one's failure mode. Read top-to-bottom:
 
 | Run | Config | Wandb | What it tried | What it taught |

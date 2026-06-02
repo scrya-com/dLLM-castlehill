@@ -67,6 +67,59 @@ Replace selected matrix multiplications (especially attention scores QKᵀ) with
 
 ---
 
+## 🍞 Wandb Breadcrumbs (VFM v12 Series)
+
+**Active run**: https://wandb.ai/snoozie/open-dllm-27b/runs/d4vtb9h7  
+**All VFM runs**: https://wandb.ai/snoozie/open-dllm-27b (filter: "vfm")
+
+### What we're doing
+Overfitting a **VFM (Variational Flow Map) smart-noise adapter** on 500 reasoning samples (`qwen3.6-27b-reasoning-500`) to enable 1-4 step diffusion generation. The goal is to prove VFM CAN work before scaling to more data.
+
+### Architecture (v3 — current)
+```
+PRO 4000 (cuda:1, 24 GB):  VFM UNet adapter (375M params)
+  3 enc/3 dec Conv1d↓ blocks + skip connections
+  Gaussian output: μ + log σ² (reparameterization)
+  5120→2048 input bottleneck, 2048→5120 output  
+  Cross-GPU delta transfer (~2.5 MB/forward)
+
+5090 (cuda:0, 32 GB):  NF4 Qwen3.6-27B base + LoRA r=8 + CachedTeacher
+```
+
+### Key config
+```bash
+# Dual-GPU launch (no CUDA_VISIBLE_DEVICES):
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  python tasks/train_torch.py configs/pretrain/d3llm_27b_v12_vfm_unet.yaml
+```
+
+### Run history (newest first)
+| Run | Wandb ID | Key finding |
+|-----|----------|-------------|
+| **U-Net v3** 🟢 | `d4vtb9h7` | **Unmasked-only alignment** — fix for 46° PCA divergence. Align at clean positions only. |
+| U-Net v2 | `k86nkql8` | repr_align=1.0 angular, crashed step 398 (_vis_data overwrite bug) |
+| U-Net v1 | `rf6zocs3` | 375M dual-GPU. repr_align=0.2 too weak, PCA showed 46° gap |
+| overfit v2 | `z4iaumy3` | α=0.8 mixing. Completed 5k steps, 152M VFM insufficient |
+| overfit v1 | `hz9q9b73` | 152M VFM. 1.6k steps, 2-step gibberish |
+| VFM integrated | `61ny5avw` | 152M VFM, 11k steps, OOM. **VFM save bug found & fixed** |
+
+### Key findings so far
+1. **152M VFM (0.56% adapter/flow) is insufficient** — 14× below paper's 7.7%
+2. **Masked-position alignment is harmful** — forces cosine match where VFM perturbs input → 46° PCA divergence. Fix: align at unmasked positions only.
+3. **Paper-aligned U-Net (375M, Gaussian output) fits dual-GPU** on PRO 4000 + 5090
+4. **α mixing (vfm_alpha=0.8)** from VFM paper §3.4 prevents mode collapse
+5. **Benchmark**: 2-step diffusion = 670 tok/s (65× AR), 8-step = 170 tok/s (17× AR) on NF4 27B
+
+### Benchmarks (scripts/)
+- `bench_d3llm.py` — AR vs MultiBlock vs PhaseKV (NF4-friendly)
+- `bench_steps_sweep.py` — Diffusion step count speed sweep (1-128 steps)
+- `abc_vfm.py` — VFM ON/OFF/Trained A/B/C comparison
+- `vfm_lowsteps.py` — VFM at ultra-low steps (1-8)
+
+See README for full benchmark tables and architecture details.
+
+---
+
 ## Mandatory Principles (never violate)
 1. **Practicality first** — Every suggestion must be implementable today. Prefer working code over theory.
 2. **Hybrid is sacred** — Tropical min-plus is used **selectively** (mainly attention scoring). No-retraining constraint is non-negotiable for the core path.
@@ -234,8 +287,8 @@ the ranked leverages**. Never let it go stale.
 - A new parent → child relationship emerges → redraw the **dependency graph**.
 - A leverage is validated, falsified, completed, or reprioritised → update the
   **Flywheel synthesis → Directions (ranked by leverage)** section.
-- Every commit→ verify README before committing.
-  If stale, amend the same commit with the README update.
+- **New training run** → append to wandb breadcrumbs in CLAUDE.md, update README breadcrumb table.
+  Wandb is the primary record of runs; CLAUDE.md is the pointer.
 
 ### Required README sections (all must be present and current)
 1. **Thesis** — one paragraph restating the tropical-on-tensor-cores bet
@@ -281,48 +334,13 @@ task. A commit that ships code without syncing the README is a defect.
 
 ### Spoonfeed mode (also non-negotiable)
 
-Every commit that introduces a new training run, new precompute step, new cache
-artifact, new wandb metric, or new launch path **must** add the corresponding
-**user-followable breadcrumb** to the README. The default assumption is that a
-reader arriving cold from GitHub knows nothing about prior runs, internal
-chat history, or what changed when.
+**Wandb is the primary breadcrumb store.** Each training run gets a wandb run note
+describing what it tried and what it taught. CLAUDE.md maintains a compact summary
+table with the same information. The README contains the long-form analysis for
+major version milestones (v1-v11 for d3LLM, v12 for VFM).
 
-#### Triggers for breadcrumb updates
-- New training-run version (v3 → v4 → v5 → ...): append a row to the
-  **Training-run breadcrumb trail** table in README (run name, config path,
-  wandb link, what it tried, what it taught). Include the failure mode of the
-  predecessor as the *motivation* for this run.
-- New precompute step (anchor cache, trajectory file, frozen-teacher dump):
-  document **how to calculate it to disk** — the exact command, the expected
-  wall-time, the expected disk size, the layers/dtype/seq_len arguments, and
-  why those values match training.
-- New cache artifact on disk: document the **storage path convention** and the
-  hash-key contract (e.g. `sha256(input_ids)` for anchor cache → both
-  precompute and training tokenizations must produce identical input_ids).
-- New wandb metric: document what it means and what to watch for. If the metric
-  is a curriculum-adjusted version of a yaml setting (e.g. `wt_effective` vs the
-  yaml's `wt`), say so explicitly — the chart is otherwise misleading.
-- New launch path or pipeline: include a 3-step reproduce recipe (precompute →
-  precompute → train) so a reader can rerun the experiment from scratch.
-
-#### What "spoonfeed" means concretely
-- **Exact commands, not pseudo-commands.** Real paths, real flags, real layer
-  lists. Reader should be able to copy-paste.
-- **Estimated wall-time and disk usage** at the recipe step. Saves the reader
-  from finding out the hard way that a precompute takes 4 hours and 80 GB.
-- **The "why" beside the "how".** Each non-default flag gets a one-line
-  rationale (e.g. `--data_type prompt_response  # match training tokenization
-  so CachedTeacher SHA-256 lookups hit`).
-- **Failure modes called out.** If skipping a step degrades silently (e.g.
-  forgetting `--add_mask_token` makes the lookups miss but training continues
-  with no error), name the silent failure explicitly.
-- **Link configs and wandb runs by name.** Each run gets a table row with the
-  exact `configs/pretrain/d3llm_27b_vN.yaml` path and the wandb URL.
-
-A commit that ships a new training run or new cache type **without** the
-matching breadcrumb is a defect, same as a stale Flywheel graph. The README
-is the user manual; if the README doesn't tell a reader how to reproduce the
-run we just shipped, we shipped half the work.
+For the full breadcrumb trail with graphs, metrics, and run comparisons,
+see: https://wandb.ai/snoozie/open-dllm-27b
 
 
 ## Architecture
