@@ -89,17 +89,19 @@ All configs trained on 50 FineWeb examples, 10 epochs. Full reproduce guide in [
 
 **Key takeaway**: All Repr-Align paths have identical inference speed (same architecture). The benefit comes from **fewer denoising steps** needed after training — not from faster per-step execution.
 
-### 27B QLoRA Inference Throughput
+### 27B QLoRA Inference Throughput (v12 checkpoint, step 11000)
 
-| Steps | tok/s (128 new tokens) | Total time |
-|-------|----------------------|------------|
-| 8 | **115** | 1.1s |
-| 16 | **57** | 2.2s |
-| 32 | **29** | 4.4s |
-| 64 | **14** | 8.9s |
-| 128 | **7** | 17.9s |
+| Steps | tok/s (256 new tokens) | Speedup vs AR |
+|-------|----------------------|---------------|
+| 1 | **~1300** | **130×** |
+| 2 | **671** | **65×** |
+| 4 | **346** | **34×** |
+| 8 | **170** | **17×** |
+| 16 | **84** | **8×** |
+| 32 | **42** | **4×** |
+| AR | **10** | **1×** |
 
-Per-step cost: **~138ms** (model-bound, 27B NF4 QLoRA on RTX 5090).
+Per-step cost: **~138ms** (model-bound, 27B NF4 QLoRA on RTX 5090). Quality bottleneck at ≤8 steps is token repetition — anti_rep loss at 1.0+ needed.
 
 All metrics logged to [wandb.ai/snoozie/open-dllm-27b](https://wandb.ai/snoozie/open-dllm-27b) and [wandb.ai/snoozie/open-dllm-compare](https://wandb.ai/snoozie/open-dllm-compare).
 
@@ -423,6 +425,9 @@ The d3LLM-27B work is a sequence of runs, each isolating a different fix to the 
 | **v10** | [`d3llm_27b_v10.yaml`](configs/pretrain/d3llm_27b_v10.yaml) | `d3llm-27b-reasoning-500-v10-antirep-warmstart` | Warm-start from v6 + anti-repetition penalty $\sum_v p_i(v)p_j(v)$ at adjacent masked pairs (gated on differing GT) + v9's subgoal. **20k steps** (4× v5–v9 horizon) to give the anti-rep gradient room to converge | Killed at ~step ~25 — gen-sample hook was hardcoded to 16 diffusion steps, so the anti-rep gradient was being graded against the same coarse parallel-unmask that caused the failure mode in the first place |
 | **v10a** | [`d3llm_27b_v10a.yaml`](configs/pretrain/d3llm_27b_v10a.yaml) | [`092wqyqd`](https://wandb.ai/snoozie/open-dllm-27b/runs/092wqyqd) | Identical training to v10 + `gen_sample_steps: 64` knob | Killed at ~step 13200 looking like collapse (d3llm/prediction = 0/895 correct). **Was a vis bug, not a model bug**: `_correct = (argmax(logits) == labels)` at the call site never applied the AR-shift that `_mdm_loss` uses (logits[i] → labels[i+1]). After the fix the same comparison shows shifted top-1 = 0.947 on a fresh-LoRA 5-sample overfit. v10a was likely working all along. |
 | **v11** (current) | [`d3llm_27b_v11.yaml`](configs/pretrain/d3llm_27b_v11.yaml) | [`33a1ols5`](https://wandb.ai/snoozie/open-dllm-27b/runs/33a1ols5) | Fresh QLoRA (no warm-start chain), fresh 16-layer reasoning-500 anchor cache (every 4th layer 4..64 = all full-attn layers in the hybrid arch), lr=1e-4, repr_align_wt=0.25 cosine, subgoal/anti_rep off. AR-shift fix in d3llm vis. Single-GPU on 5090 (PRO 4000 24GB ceiling can't hold peak 26GB activations). | At step 439: mdm=5.26 (already at v6's converged 5.42), losses/repr_align=0.41, **d3llm/masked_top1_acc=0.667 (shifted) vs 0.000 (unshifted) — confirms the AR-shift was the long-standing vis defect**. r=8 sufficient; capacity is not the bottleneck. |
+| **v12 VFM** | [`d3llm_27b_v12_vfm.yaml`](configs/pretrain/d3llm_27b_v12_vfm.yaml) | [`61ny5avw`](https://wandb.ai/snoozie/open-dllm-27b/runs/61ny5avw) | Warm-start LoRA from v11 step 15500 + VFM smart-noise mask-filler (150M params, 1 layer) + anti_rep 0.5 + repr_align 0.5. Integrated VFM into d3llm pipeline. | Ran 11,057 steps (~7.4h) then OOM'd during gen_sample. **Bug found**: VFM weights never saved — `_save_qlora_checkpoint` only saved LoRA adapter. Fixed in commit `a237248`. After fix: VFM shows zero quality benefit at inference (see §VFM benchmarks). Token repetition still dominant failure mode. |
+| **v12 VFM overfit** | [`d3llm_27b_v12_vfm_overfit.yaml`](configs/pretrain/d3llm_27b_v12_vfm_overfit.yaml) | [`hz9q9b73`](https://wandb.ai/snoozie/open-dllm-27b/runs/hz9q9b73) | Resume LoRA from v12 step 11000, VFM from scratch. mask_ratio locked at 0.90, anti_rep=1.0, repr_align=0.5. 5k steps, single 5090. | 1,600 steps: loss 2.3 (mdm=2.0, anti_rep=0.05). 2-step gen samples still gibberish. VFM cold-start mismatch + constant 0.90 mask too aggressive. |
+| **v12 VFM overfit v2** | [`d3llm_27b_v12_vfm_overfit.yaml`](configs/pretrain/d3llm_27b_v12_vfm_overfit.yaml) (v2 dir) | [`z4iaumy3`](https://wandb.ai/snoozie/open-dllm-27b/runs/z4iaumy3) | VFM paper insights applied: α=0.8 mixing (20% plain [MASK]), repr_align reduced 0.5→0.2 (τ>σ), anti_rep=1.0. 5k steps. | 🟢 Running. Expected: better 2-step quality from α mixing preventing LoRA forgetting unconditional paths. |
 
 ### How to reproduce any run
 
@@ -448,6 +453,51 @@ python scripts/precompute_anchor.py \
 CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     python tasks/train_torch.py configs/pretrain/d3llm_27b_v6.yaml
 ```
+
+### VFM Paper Insights (arXiv:2603.07276)
+
+Applied [Mammadov et al., "Variational Flow Maps"](https://arxiv.org/abs/2603.07276v1) to our text-domain VFM:
+
+| Paper Insight | Our Application |
+|---|---|
+| **Joint training** (Prop 3.1): separate flow map + adapter training almost surely fails | LoRA + VFM trained in same loop ✓ |
+| **α mixing** (§3.4): mix unconditional noise with probability 1-α | `vfm_alpha: 0.8` — 20% steps use plain `[MASK]`, not VFM |
+| **τ > σ**: data loss must dominate observation loss | `repr_align_wt` 0.5→0.2 so MDM dominates |
+| **EMA for obs loss** | CachedTeacher is frozen = implicit EMA ✓ |
+| **Adaptive loss scaling**: ℒ/stopgrad(||ℒ+γ||^p) | Not yet implemented |
+
+### 27B Benchmark Results (NF4 QLoRA, RTX 5090)
+
+#### Diffusion Step Sweep (checkpoint step 11000)
+
+| Steps | tok/s | Speedup vs AR | Quality |
+|-------|-------|---------------|---------|
+| 2 | **671** | **65×** | Heavy repetition |
+| 4 | **346** | **34×** | Heavy repetition |
+| 8 | **170** | **17×** | Some repetition |
+| 16 | 84 | 8× | Moderate |
+| 32 | 42 | 4× | Moderate |
+| AR | 10 | 1× | Baseline |
+
+#### d3LLM Decoder Modes (256 tokens)
+
+| Mode | tok/s | NFE | TPF | Notes |
+|------|-------|-----|-----|-------|
+| AR (baseline) | 11.2 | 256 | 1.00 | Token-by-token |
+| MultiBlock | 11.4 | 178 | 1.44 | 1.02× speedup |
+| MB+PhaseKV (Q=256) | 10.5 | 189 | 1.35 | Phase-quantized 8-bit KV cache |
+
+NF4 quantization overhead dominates — TPF improvement (1.44×) eaten by bitsandbytes dequant math.
+
+#### VFM A/B/C (step 500 trained adapter)
+
+| Variant | AR quality | D8d tok/s | Verdict |
+|---------|-----------|-----------|---------|
+| VFM=OFF | "Paris" ✓ | 111 | Baseline |
+| VFM fresh (zero) | "Germany" ✗ | 113 | **Hurts** quality |
+| VFM trained 500 | "Paris" ✓ | 112 | Recovers to baseline |
+
+**VFM costs 150M params / 1.5 GB VRAM for zero quality benefit.** Token repetition is a training convergence issue, not a smart-noise initialization problem.
 
 ---
 
@@ -498,9 +548,14 @@ Open-dLLM/
 ├── scripts/
 │   ├── benchmark_inference.py     # 27B inference throughput sweep
 │   ├── benchmark_inference_post.py# Post-training benchmark (wandb)
+│   ├── bench_d3llm.py             # AR vs MultiBlock vs PhaseKV benchmark (NF4-friendly)
+│   ├── bench_steps_sweep.py       # Diffusion step count speed sweep
+│   ├── benchmark_checkpoint.py    # Load checkpoint + run inference benchmark
 │   ├── compare_step_quality.py    # Step count vs output quality
 │   ├── precompute_anchor.py       # Repr-Align teacher cache
 │   ├── precompute_trajectories.py # d3LLM trajectories (entropy + LR modes)
+│   ├── ab_vfm.py / abc_vfm.py     # VFM A/B/C comparison tests
+│   ├── vfm_lowsteps.py            # VFM at ultra-low diffusion steps
 │   └── run_comparison.sh          # Orchestrate full 7-config comparison
 │
 ├── docs/
