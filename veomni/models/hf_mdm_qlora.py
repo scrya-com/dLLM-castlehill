@@ -305,11 +305,6 @@ class _GaussianHead(nn.Module):
             nn.LayerNorm(hidden),
             nn.Linear(hidden, hidden),
         )
-        # Zero-init output projections → no-op at step 0.
-        nn.init.zeros_(self.mu_head[1].weight)
-        nn.init.zeros_(self.mu_head[1].bias)
-        nn.init.zeros_(self.logvar_head[1].weight)
-        nn.init.zeros_(self.logvar_head[1].bias)
 
     def forward(self, x):
         mu = self.mu_head(x)
@@ -352,14 +347,14 @@ class VFMMaskFillerUNet(nn.Module):
         if self._has_bottleneck:
             self.in_proj = nn.Linear(hidden, vfm_hidden, bias=False)
             self.out_proj = nn.Linear(vfm_hidden, hidden, bias=False)
-            nn.init.zeros_(self.out_proj.weight)
             nn.init.xavier_uniform_(self.in_proj.weight)
             _unet_dim = vfm_hidden
         else:
             self.in_proj = None
             self.out_proj = nn.Linear(hidden, hidden, bias=False)
-            nn.init.zeros_(self.out_proj.weight)
             _unet_dim = hidden
+        # Xavier init out_proj so delta starts non-zero (not zero-init)
+        nn.init.xavier_uniform_(self.out_proj.weight)
 
         # Encoder: Conv1d(stride=2) → UNetBlock (operates at _unet_dim)
         self.enc_convs = nn.ModuleList([
