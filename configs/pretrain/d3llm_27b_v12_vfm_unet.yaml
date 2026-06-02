@@ -48,8 +48,9 @@ model:
     vfm_unet_blocks: 2           # encoder/decoder depth (reduced from 3)
     vfm_unet_ffn: 4096           # FFN intermediate (bottleneck = 2×)
     vfm_unet_hidden: 5120        # NO bottleneck — full dim (was 2048)
-    vfm_unet_lr_mult: 5.0        # VFM LR multiplier (was 3.0, delta still near-zero)
-    vfm_grad_scale: 20.0         # explicit grad hook scale (×) to unstarve through 64-layer path + direct consistency
+    vfm_unet_lr_mult: 1.5        # dialed back from 5.0 (grad_to_param_ratio hit 0.36 = ~1000x too high; destabilizing)
+    vfm_grad_scale: 3.0
+    vfm_delta_scale: 0.1          # tanh-bound delta to +/-0.1 (nudge, not swamp) — fixes the std~2.1 divergence
     vfm_heads: 8
     vfm_dropout: 0.1
     vfm_alpha: 1.0               # force always-active VFM for debugging delta (was 0.8; 20% skip chance was causing active=False at vis steps)

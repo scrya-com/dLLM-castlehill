@@ -460,6 +460,10 @@ class MDMQLoRAWrapper(nn.Module):
         # Applied via hook on the *delta* tensor (after cross-device to() for UNet).
         # 1.0 = no scale; 10-50× common for deep stacks when delta stays ~0.
         self.vfm_grad_scale = 1.0
+        # VFM delta magnitude bound: delta = vfm_delta_scale * tanh(raw).
+        # 0 = off (legacy unbounded). ~0.1 keeps the smart-noise a nudge on
+        # the [MASK] embedding rather than a swamping replacement.
+        self.vfm_delta_scale = 0.0
         # Visualization: set _vis_step=True before a forward to capture tensors
         self._vis_step = False
         self._vis_data = None
@@ -530,6 +534,16 @@ class MDMQLoRAWrapper(nn.Module):
                 delta = delta.to(inputs_embeds.device)
             else:
                 delta = self.vfm_adapter(inputs_embeds, attention_mask)
+            # Bound the delta magnitude BY CONSTRUCTION: delta = scale * tanh(raw).
+            # Without this the (Xavier-init, unbounded) delta converges to
+            # std ~2.1 — ~20x the token-embedding scale — swamping the [MASK]
+            # embedding rather than nudging it, which drove mdm UP and anti_rep
+            # UP over training (divergence on the overfit). tanh caps |delta| to
+            # `scale`, making the smart-noise an init refinement (nudge), not a
+            # replacement. scale=0.1 ≈ embedding element scale. 0 = off (legacy).
+            _dscale = float(getattr(self, 'vfm_delta_scale', 0.0))
+            if _dscale > 0:
+                delta = _dscale * torch.tanh(delta)
             # Amplify grad into VFM to fight 64-layer starvation (applied to delta
             # tensor so it scales grads coming back from the deep base + MDM loss).
             _gs = float(getattr(self, 'vfm_grad_scale', 1.0))
@@ -539,11 +553,25 @@ class MDMQLoRAWrapper(nn.Module):
             # (Heavy vis panels stay gated on _vis_step %50; scalars now always available.)
             if self.training:
                 dm = delta.detach() if _vfm_active and mask_pos.any() else torch.zeros(1, device=delta.device)
+                _emb_std = inputs_embeds.detach().std().item() if inputs_embeds.numel() > 1 else 1.0
+                _dstd = dm.std().item() if dm.numel() > 1 else 0.0
                 self.last_vfm_delta = {
                     "mean": dm.mean().item() if dm.numel() > 0 else 0.0,
-                    "std": dm.std().item() if dm.numel() > 1 else 0.0,
+                    "std": _dstd,
                     "norm": dm.norm().item() if dm.numel() > 0 else 0.0,
                     "active": bool(_vfm_active),
+                    # nudge-vs-swamp: delta std relative to embedding std. ~1 = a
+                    # genuine nudge; >>1 = the smart-noise is swamping [MASK]
+                    # (the divergence signature). Target after tanh-bound: ~1.
+                    "delta_to_embed_ratio": (_dstd / _emb_std) if _emb_std > 0 else 0.0,
+                    "embed_std": _emb_std,
+                    # tanh saturation: fraction of delta elements pinned near the
+                    # ±scale cap. High → the bound is doing heavy clipping (raw
+                    # pre-tanh too large); near 0 → operating in tanh's linear band.
+                    "tanh_saturation": (
+                        (dm.abs() > 0.99 * _dscale).float().mean().item()
+                        if (_dscale > 0 and dm.numel() > 1) else 0.0
+                    ),
                 }
             # Log delta statistics for wandb (once per vis step) -- keep for _vis_data / plots
             if self._vis_step:
@@ -600,6 +628,20 @@ class MDMQLoRAWrapper(nn.Module):
             comps = {"mdm": float(mdm), "path": float(path)}
             if getattr(self, "anti_rep_wt", 0.0) > 0:
                 comps["anti_rep"] = float(anti_rep)
+            # masked_top1_acc — the headline d3llm learning signal this run was
+            # missing (its absence let the slow divergence hide behind the
+            # mask-ratio-noisy mdm). AR-shift: logits[i] predicts token i+1, so
+            # compare argmax(logits[:, :-1]) to labels[:, 1:] on non-IGNORE
+            # (= MDM-masked) positions only.
+            with torch.no_grad():
+                _lbl2d = labels if labels.dim() == 2 else labels.view(logits.size(0), -1)
+                _pred = logits[:, :-1, :].argmax(dim=-1)      # [B, L-1]
+                _tgt = _lbl2d[:, 1:]                            # [B, L-1]
+                _m = (_tgt != IGNORE_INDEX)
+                if _m.any():
+                    comps["masked_top1_acc"] = ((_pred == _tgt) & _m).sum().float().div(_m.sum().float()).item()
+                else:
+                    comps["masked_top1_acc"] = 0.0
             # Consistency regularization
             if _cons_loss.item() > 0:
                 loss = loss + _consistency_wt * _cons_loss
@@ -871,11 +913,13 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
         wrapper.vfm_alpha = _qcfg.get("vfm_alpha", 0.8)
         wrapper.vfm_lr_mult = _qcfg.get("vfm_unet_lr_mult", 1.0)
         wrapper.vfm_grad_scale = float(_qcfg.get("vfm_grad_scale", 20.0))
+        wrapper.vfm_delta_scale = float(_qcfg.get("vfm_delta_scale", 0.0))
         wrapper._vfm_unet = True
 
         _np = sum(p.numel() for p in wrapper.vfm_adapter.parameters())
         print(f"[hf_mdm_qlora] VFM UNet ({_vfm_dev}): {_np:,} params ({_qcfg.get('vfm_unet_blocks',3)} blocks, "
-              f"FFN={_qcfg.get('vfm_unet_ffn',4096)}), grad_scale={wrapper.vfm_grad_scale}×, base={_base_dev}")
+              f"FFN={_qcfg.get('vfm_unet_ffn',4096)}), grad_scale={wrapper.vfm_grad_scale}×, "
+              f"delta_scale={wrapper.vfm_delta_scale}, base={_base_dev}")
 
         # Pre-forward hook for inference (cross-GPU delta transfer)
         _mid = wrapper.vfm_mask_token_id

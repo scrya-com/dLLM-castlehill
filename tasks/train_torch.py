@@ -1071,20 +1071,20 @@ def main():
                     # last_vfm_delta is always populated in forward (independent of heavy _vis_step %50)
                     if hasattr(model, "last_vfm_delta") and getattr(model, "last_vfm_delta", None):
                         d = model.last_vfm_delta
-                        train_metrics["vfm/delta_mean"] = d.get("mean", 0.0)
-                        train_metrics["vfm/delta_std"] = d.get("std", 0.0)
-                        train_metrics["vfm/delta_norm"] = d.get("norm", 0.0)
-                        train_metrics["vfm/active"] = float(d.get("active", 0))
-                        if "consistency" in d:
-                            train_metrics["vfm/delta_consistency"] = d["consistency"]
-                        # Dedicated log every step so vfm/ curves are dense even if main train_metrics log is vis-gated
-                        wandb.log({
-                            "vfm/delta_mean": d.get("mean", 0.0),
-                            "vfm/delta_std": d.get("std", 0.0),
-                            "vfm/delta_norm": d.get("norm", 0.0),
-                            "vfm/active": float(d.get("active", 0)),
-                            **({"vfm/delta_consistency": d["consistency"]} if "consistency" in d else {}),
-                        }, step=global_step)
+                        # Generic: log every scalar key in last_vfm_delta under
+                        # vfm/. New diagnostics (delta_to_embed_ratio,
+                        # tanh_saturation, embed_std, ...) auto-surface without
+                        # editing this block again.
+                        _vfm_metrics = {}
+                        for _k, _v in d.items():
+                            if isinstance(_v, bool):
+                                _vfm_metrics[f"vfm/{_k}"] = float(_v)
+                            elif isinstance(_v, (int, float)):
+                                _vfm_metrics[f"vfm/{_k}"] = _v
+                        train_metrics.update(_vfm_metrics)
+                        # Dedicated log every step so vfm/ curves stay dense even
+                        # when the main train_metrics log is vis-gated.
+                        wandb.log(_vfm_metrics, step=global_step)
 
                     _gen_every = getattr(args.train, "gen_sample_every_steps", 100)
                     if args.model.enable_qlorafy and _gen_every > 0 and global_step % _gen_every == 0:
