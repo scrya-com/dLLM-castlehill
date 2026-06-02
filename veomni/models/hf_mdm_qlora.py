@@ -494,6 +494,11 @@ class MDMQLoRAWrapper(nn.Module):
                 self._vis_data = {}
             self._vis_data.setdefault("vfm_delta", {})
             self._vis_data["vfm_delta"]["enabled"] = _vfm_active
+            # Also zero-fill delta stats when VFM is inactive
+            if not _vfm_active:
+                self._vis_data["vfm_delta"].setdefault("mean", 0.0)
+                self._vis_data["vfm_delta"].setdefault("std", 0.0)
+                self._vis_data["vfm_delta"].setdefault("norm", 0.0)
         if _vfm_active:
             embed_layer = self.base.get_input_embeddings()
             inputs_embeds = embed_layer(input_ids)            # [B, L, D]
@@ -506,11 +511,11 @@ class MDMQLoRAWrapper(nn.Module):
             else:
                 delta = self.vfm_adapter(inputs_embeds, attention_mask)
             # Log delta statistics for wandb (once per vis step)
-            if self._vis_step and mask_pos.any():
-                dm = delta.detach()
+            if self._vis_step:
                 if self._vis_data is None:
                     self._vis_data = {}
                 self._vis_data.setdefault("vfm_delta", {})
+                dm = delta.detach() if _vfm_active and mask_pos.any() else torch.zeros(1)
                 self._vis_data["vfm_delta"]["mean"] = dm.mean().item()
                 self._vis_data["vfm_delta"]["std"] = dm.std().item()
                 self._vis_data["vfm_delta"]["norm"] = dm.norm().item()

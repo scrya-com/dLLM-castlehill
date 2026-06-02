@@ -1171,12 +1171,12 @@ def main():
                     # VFM delta statistics (from model._vis_data["vfm_delta"])
                     if _do_vis and getattr(model, "_vis_data", None) is not None:
                         _vfm_d = model._vis_data.get("vfm_delta", {})
-                    if _vfm_d:
-                        train_metrics["vfm/delta_mean"] = _vfm_d.get("mean", 0.0)
-                        train_metrics["vfm/delta_std"] = _vfm_d.get("std", 0.0)
-                        train_metrics["vfm/delta_norm"] = _vfm_d.get("norm", 0.0)
-                        if "enabled" in _vfm_d:
-                            train_metrics["vfm/active"] = float(_vfm_d["enabled"])
+                        if _vfm_d:
+                            train_metrics["vfm/delta_mean"] = _vfm_d.get("mean", 0.0)
+                            train_metrics["vfm/delta_std"] = _vfm_d.get("std", 0.0)
+                            train_metrics["vfm/delta_norm"] = _vfm_d.get("norm", 0.0)
+                            if "enabled" in _vfm_d:
+                                train_metrics["vfm/active"] = float(_vfm_d["enabled"])
 
                     # d3LLM trajectory visualization
                     if _do_vis and _has_d3llm_vis and _last_micro_batch is not None:
