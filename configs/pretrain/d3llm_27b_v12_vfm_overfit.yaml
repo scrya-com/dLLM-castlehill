@@ -1,0 +1,110 @@
+# d3LLM v12 — VFM overfit demo: 1-2-4 step generation
+#
+# Based on the WORKING original v12 config. Only changes:
+#   - trajectory min/max locked at 0.90 (skip curriculum, always high mask)
+#   - anti_rep_wt: 1.0 (aggressive anti-repetition)
+#   - gen_sample_steps: 2 (monitor single-pass quality)
+#   - output_dir separate
+#   - VFM starts fresh (no loaded weights — same as original v12)
+#
+# Launch:
+#   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+#     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     .venv/bin/torchrun --nproc_per_node=1 tasks/train_torch.py \
+#     configs/pretrain/d3llm_27b_v12_vfm_overfit.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    resume_adapter_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v12_vfm/checkpoints/global_step_11000
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    vfm_enabled: true
+    vfm_layers: 1
+    vfm_heads: 8
+    vfm_intermediate_size: 2048
+    vfm_dropout: 0.1
+    vfm_alpha: 0.8
+    vfm_mask_token_id: 248077
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 500
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v12_vfm_overfit_v2
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 200
+  save_total_limit: 5
+  auto_resume: false
+  num_train_epochs: 10
+  max_steps: 5000
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 1e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.90
+  trajectory_max_mask_ratio: 0.90
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  repr_align_wt: 0.2
+  repr_align_wt_final: 0.2
+  repr_align_loss_mode: "cosine"
+  anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3.6-27b-reasoning-500-16L
+  align_layers: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64"
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 4
+
+  subgoal_align_wt: 0.0
+  anti_rep_wt: 1.0
+
+  llrd_decay: 0.85
+  min_snr_gamma: 0
+  gen_sample_every_steps: 200
+  gen_sample_steps: 2
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-v12-vfm-overfit-v2-alpha08

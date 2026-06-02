@@ -336,6 +336,13 @@ class MDMQLoRAWrapper(nn.Module):
             and input_ids is not None
             and (mask_ratio is not None or (input_ids == self.vfm_mask_token_id).any())
         )
+        # α mixing (VFM paper §3.4): with probability 1-α, use plain [MASK]
+        # embeddings instead of VFM smart-noise. Prevents flow map from
+        # forgetting unconditional generation. Only active during training.
+        if _vfm_active and self.training:
+            _alpha = getattr(self, 'vfm_alpha', 1.0)
+            if torch.rand(1).item() > _alpha:
+                _vfm_active = False
         if _vfm_active:
             embed_layer = self.base.get_input_embeddings()
             inputs_embeds = embed_layer(input_ids)            # [B, L, D]
@@ -514,10 +521,16 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
         load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
     )
-    print(f"[hf_mdm_qlora] loading {model_path} (NF4, device_map={device})")
+    _dev_map = {"": device}
+    if device == "auto":
+        _max_mem = _qcfg.get("max_memory", {0: "24GiB", 1: "24GiB"})
+        _dev_map = "auto"
+    else:
+        _max_mem = None
+    print(f"[hf_mdm_qlora] loading {model_path} (NF4, device_map={device}, max_memory={_max_mem})")
     base = AutoModelForCausalLM.from_pretrained(
         model_path, quantization_config=bnb,
-        device_map=({"": device} if device != "auto" else "auto"),
+        device_map=_dev_map, max_memory=_max_mem,
         torch_dtype=torch.bfloat16, trust_remote_code=True, low_cpu_mem_usage=True,
     )
     base.config.use_cache = False
@@ -590,6 +603,7 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
             dropout=_qcfg.get("vfm_dropout", 0.1),
         )
         wrapper.vfm_mask_token_id = _qcfg.get("vfm_mask_token_id", None)
+        wrapper.vfm_alpha = _qcfg.get("vfm_alpha", 0.8)  # VFM paper §3.4: α mixing rate
         # Match the embedding output dtype/device (NF4 base → bf16 embeds) so
         # the filler's LayerNorm doesn't hit a dtype mismatch.
         _emb = wrapper.base.get_input_embeddings()
@@ -610,15 +624,18 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
         _get_emb = wrapper.base.get_input_embeddings
 
         def _vfm_hook(module, args, kwargs):
+            # Only activate during inference (training uses the wrapper's forward).
+            if module.training:
+                return
             input_ids = kwargs.get("input_ids", args[0] if args else None)
             if input_ids is None or not (input_ids == _mid).any():
                 return
             inputs_embeds = _get_emb()(input_ids)
             mask_pos = (input_ids == _mid)
-            delta = _vfm(inputs_embeds)
+            with torch.no_grad():
+                delta = _vfm(inputs_embeds)
             smart = inputs_embeds + delta
-            inputs_embeds = torch.where(mask_pos.unsqueeze(-1), smart, inputs_embeds)
-            kwargs["inputs_embeds"] = inputs_embeds.to(inputs_embeds.dtype)
+            kwargs["inputs_embeds"] = smart.to(inputs_embeds.dtype)
             kwargs["input_ids"] = None
 
         wrapper._vfm_handle = wrapper.base.register_forward_pre_hook(_vfm_hook, with_kwargs=True)
