@@ -444,6 +444,7 @@ def main():
         subgoal_align_wt=getattr(args.train, "subgoal_align_wt", 0.0),
         subgoal_align_n_blocks=getattr(args.train, "subgoal_align_n_blocks", 4),
         anti_rep_wt=getattr(args.train, "anti_rep_wt", 0.0),
+        consistency_wt=getattr(args.train, "consistency_wt", 0.0),
         enable_nvfp4_qat=getattr(args.model, "enable_nvfp4_qat", False),
         enable_qlorafy=getattr(args.model, "enable_qlorafy", False),
         qlorafy_config=getattr(args.model, "qlorafy_config", None),

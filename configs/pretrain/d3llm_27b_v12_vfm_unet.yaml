@@ -103,6 +103,7 @@ train:
 
   subgoal_align_wt: 0.0
   anti_rep_wt: 1.0
+  consistency_wt: 0.3          # consistency regularization: KL between two mask patterns
 
   llrd_decay: 0.85
   min_snr_gamma: 0

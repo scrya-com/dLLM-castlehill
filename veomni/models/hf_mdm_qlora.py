@@ -468,13 +468,17 @@ class MDMQLoRAWrapper(nn.Module):
             repr_align_wt > 0
             and self.teacher_model is not None
             and self.align_layers is not None
-            and mask_ratio is not None  # only during MDM training, not AR / inference
+            and mask_ratio is not None
             and self.training
         )
-        # VFM smart-noise injection: replace [MASK] embeddings with
-        # [MASK]+delta(context) at masked positions. Active only when an
-        # adapter is attached and we're doing MDM (mask_ratio set). Inference
-        # / AR (mask_ratio=None) keeps the plain input_ids path.
+        # Consistency regularization weight — set externally
+        _consistency_wt = getattr(self, 'consistency_wt', 0.0)
+        _consistency_active = (
+            _consistency_wt > 0
+            and mask_ratio is not None
+            and self.vfm_mask_token_id is not None
+            and self.training
+        )
         _vfm_active = (
             self.vfm_adapter is not None
             and self.vfm_mask_token_id is not None
@@ -525,10 +529,53 @@ class MDMQLoRAWrapper(nn.Module):
                             position_ids=position_ids, use_cache=False,
                             output_hidden_states=_repr_align_active)
         else:
+            mask_pos = (input_ids == self.vfm_mask_token_id) if input_ids is not None and self.vfm_mask_token_id is not None else None
             out = self.base(input_ids=input_ids, attention_mask=attention_mask,
                             position_ids=position_ids, use_cache=False,
                             output_hidden_states=_repr_align_active)
         logits = out.logits
+
+        # ── Consistency regularization ──────────────────────────────────
+        # Two mask patterns → force same predictions at overlapping positions
+        _cons_loss = torch.tensor(0.0, device=input_ids.device)
+        if _consistency_active and self.training and mask_pos is not None and mask_pos.any():
+            _mr = mask_ratio.float().mean() if isinstance(mask_ratio, torch.Tensor) else mask_ratio
+            # Generate mask_B: random subset of same size, overlapping with mask_A
+            _n_masked = mask_pos.sum().item()
+            _mask_B = torch.zeros_like(mask_pos, dtype=torch.bool)
+            _flat = torch.rand(input_ids.numel(), device=input_ids.device)
+            _, _topk = torch.topk(_flat, _n_masked)
+            _mask_B.view(-1).scatter_(0, _topk, True)
+            _both = mask_pos & _mask_B
+            if _both.sum() >= 2:  # need at least 2 overlapping positions
+                # Second VFM pass with mask_B (cheap, on PRO 4000)
+                ids_B = input_ids.clone()
+                ids_B[_mask_B] = self.vfm_mask_token_id
+                embeds_B = embed_layer(ids_B)
+                if getattr(self, '_vfm_unet', False):
+                    vfm_B = self.vfm_adapter(embeds_B.to(self.vfm_device)).to(input_ids.device)
+                else:
+                    vfm_B = self.vfm_adapter(embeds_B, attention_mask)
+                embeds_B = torch.where(_mask_B.unsqueeze(-1), embeds_B + vfm_B, embeds_B)
+                # Second forward (gradient checkpointed to save memory)
+                out_B = self.base(inputs_embeds=embeds_B, attention_mask=attention_mask,
+                                  position_ids=position_ids, use_cache=False)
+                logits_B = out_B.logits
+                # Symmetric KL at overlapping masked positions
+                # AR-shift: logits[i] predicts labels[i+1]
+                _logits_A = logits[:, :-1][_both[:, 1:]]  # [N_overlap, V]
+                _logits_B = logits_B[:, :-1][_both[:, 1:]]
+                _pA = F.softmax(_logits_A.float(), dim=-1).clamp(min=1e-8)
+                _pB = F.softmax(_logits_B.float(), dim=-1).clamp(min=1e-8)
+                _kl_ab = (_pA * (_pA.log() - _pB.log())).sum(dim=-1).mean()
+                _kl_ba = (_pB * (_pB.log() - _pA.log())).sum(dim=-1).mean()
+                _cons_loss = 0.5 * (_kl_ab + _kl_ba)
+                if self._vis_step:
+                    if self._vis_data is None:
+                        self._vis_data = {}
+                    self._vis_data.setdefault("vfm_delta", {})
+                    self._vis_data["vfm_delta"]["consistency"] = _cons_loss.item()
+
         loss = None
         comps = {}
         if labels is not None:
@@ -541,6 +588,10 @@ class MDMQLoRAWrapper(nn.Module):
             comps = {"mdm": float(mdm), "path": float(path)}
             if getattr(self, "anti_rep_wt", 0.0) > 0:
                 comps["anti_rep"] = float(anti_rep)
+            # Consistency regularization
+            if _cons_loss.item() > 0:
+                loss = loss + _consistency_wt * _cons_loss
+                comps["consistency"] = _cons_loss.item()
 
         if _repr_align_active:
             student_hiddens = out.hidden_states
@@ -691,8 +742,8 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
                         repr_align_contrastive=False, repr_align_contrastive_temp=0.07,
                         repr_align_loss_mode="cosine", repr_align_angular_margin=0.0,
                         repr_align_num_sample_layers=None,
-                        subgoal_align_wt=0.0, subgoal_align_n_blocks=4,
-                        anti_rep_wt=0.0, **kw):
+                         subgoal_align_wt=0.0, subgoal_align_n_blocks=4,
+                         anti_rep_wt=0.0, consistency_wt=0.0, **kw):
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 
@@ -769,6 +820,7 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
     wrapper.subgoal_align_wt = subgoal_align_wt
     wrapper.subgoal_align_n_blocks = subgoal_align_n_blocks
     wrapper.anti_rep_wt = anti_rep_wt
+    wrapper.consistency_wt = consistency_wt
     if anchor_cache_dir:
         from .cached_teacher import CachedTeacher
         # Qwen3_5Config stores hidden_size inside text_config

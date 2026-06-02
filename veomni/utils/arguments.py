@@ -354,6 +354,10 @@ class TrainingArguments:
         default=0.0,
         metadata={"help": "Anti-repetition penalty for parallel MDM decoding. Penalizes sum_v p_i(v)*p_j(v) at adjacent masked positions (i, i+1) when their ground-truth labels differ. Targets the 'Topic Topic' / 'Initial Initial' failure where parallel decode from independent marginals collapses to repeats. Min-SNR scaled. 0 = disabled."},
     )
+    consistency_wt: float = field(
+        default=0.0,
+        metadata={"help": "Consistency regularization: two forward passes with different mask patterns, symmetric KL divergence at overlapping masked positions. Forces model to produce same predictions regardless of which positions are unmasked first."},
+    )
     llrd_decay: float = field(
         default=0.0,
         metadata={"help": "Layer-wise LR decay for LoRA adapters. lr * decay^(layer_depth_fraction). 0=disabled (flat LR). 0.85 is typical for NLP fine-tuning."},

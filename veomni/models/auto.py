@@ -69,6 +69,7 @@ def build_foundation_model(
     subgoal_align_wt: float = 0.0,
     subgoal_align_n_blocks: int = 4,
     anti_rep_wt: float = 0.0,
+    consistency_wt: float = 0.0,
     enable_nvfp4_qat: bool = False,
     enable_qlorafy: bool = False,
     qlorafy_config: Optional[Dict] = None,
@@ -114,6 +115,7 @@ def build_foundation_model(
                 subgoal_align_wt=subgoal_align_wt,
                 subgoal_align_n_blocks=subgoal_align_n_blocks,
                 anti_rep_wt=anti_rep_wt,
+                consistency_wt=consistency_wt,
             )
         from .qlorafy import QLoRAConfig, build_qlorafied_model
 
