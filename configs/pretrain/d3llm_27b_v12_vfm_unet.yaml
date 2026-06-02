@@ -48,7 +48,7 @@ model:
     vfm_unet_blocks: 2           # encoder/decoder depth (reduced from 3)
     vfm_unet_ffn: 4096           # FFN intermediate (bottleneck = 2×)
     vfm_unet_hidden: 5120        # NO bottleneck — full dim (was 2048)
-    vfm_unet_lr_mult: 3.0        # VFM LR multiplier (zero-init needs more gradient)
+    vfm_unet_lr_mult: 5.0        # VFM LR multiplier (was 3.0, delta still near-zero)
     vfm_heads: 8
     vfm_dropout: 0.1
     vfm_alpha: 0.8               # α mixing rate (paper §3.4)
@@ -72,8 +72,8 @@ train:
   save_steps: 200
   save_total_limit: 5
   auto_resume: false
-  num_train_epochs: 10
-  max_steps: 5000
+  num_train_epochs: 40
+  max_steps: 20000
   micro_batch_size: 1
   global_batch_size: 1
   lr: 1e-4
@@ -102,8 +102,8 @@ train:
   repr_align_num_sample_layers: 4
 
   subgoal_align_wt: 0.0
-  anti_rep_wt: 1.0
-  consistency_wt: 0.3          # consistency regularization: KL between two mask patterns
+  anti_rep_wt: 2.0            # turned up from 1.0 — still stuck at 0.05
+  consistency_wt: 1.0          # was 0.3 — flat at 0.27, needs more gradient
 
   llrd_decay: 0.85
   min_snr_gamma: 0

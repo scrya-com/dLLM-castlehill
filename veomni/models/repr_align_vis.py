@@ -220,16 +220,28 @@ def _make_pca_fig(vis_data, global_step):
     s_2d = pc[:K]
     t_2d = pc[K:]
 
-    colors = np.arange(K)
-    fig, ax = plt.subplots(figsize=(7, 6))
+    # Compute mean cosine similarity across captured layers
+    _s_layers = vis_data.get("s_layers", [])
+    _t_layers = vis_data.get("t_layers", [])
+    _mean_cos = 0.0
+    if _s_layers and _t_layers and len(_s_layers) == len(_t_layers):
+        _cos_vals = []
+        for si, ti in zip(_s_layers, _t_layers):
+            _sn = F.normalize(si, p=2, dim=-1)
+            _tn = F.normalize(ti, p=2, dim=-1)
+            _cos_vals.append((_sn * _tn).sum(dim=-1).mean().item())
+        _mean_cos = sum(_cos_vals) / len(_cos_vals) if _cos_vals else 0.0
+        _align_pct = max(0.0, _mean_cos * 100)  # 0-100%
+    else:
+        _align_pct = 0.0
+
     sc1 = ax.scatter(t_2d[:, 0], t_2d[:, 1], c=colors, cmap="Blues", marker="*",
                      s=80, alpha=0.7, label="teacher (★)", linewidths=0)
     sc2 = ax.scatter(s_2d[:, 0], s_2d[:, 1], c=colors, cmap="Reds", marker="o",
                      s=30, alpha=0.7, label="student (●)", linewidths=0)
     ax.set_title(
         f"Student vs Teacher hidden states — PCA [{K} tokens, step {global_step}]\n"
-        "Aligned = red circles sit on blue stars  |  Color = sequence position"
-    )
+        f"Alignment: {_align_pct:.1f}%  |  Aligned = red circles sit on blue stars  |  Color = sequence position"
     ax.legend(loc="upper right")
     ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
     plt.tight_layout()
