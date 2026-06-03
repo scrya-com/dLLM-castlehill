@@ -74,13 +74,13 @@ def _make_alignment_fig(vis_data, global_step):
     fig.suptitle(f"Repr-Align — step {global_step}", fontsize=12)
 
     ax = axes[0]
-    im = ax.imshow(sim_matrix, vmin=-1, vmax=1, cmap="RdBu_r", aspect="auto")
+    im = ax.imshow(sim_matrix, vmin=0.3, vmax=1.0, cmap="RdBu_r", aspect="auto")
     ax.set_title(f"InfoNCE sim matrix [{K}×{K}]\n(diagonal = positive pairs)")
     ax.set_xlabel("teacher token"); ax.set_ylabel("student token")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     ax = axes[1]
-    im2 = ax.imshow(cos_sim.T, vmin=-1, vmax=1, cmap="RdYlGn", aspect="auto")
+    im2 = ax.imshow(cos_sim.T, vmin=0.3, vmax=1.0, cmap="RdYlGn", aspect="auto")
     ax.set_title(f"Cosine sim [{N} tokens × {len(layer_indices)} layers]")
     ax.set_xlabel("token position (subsampled)")
     ax.set_yticks(range(len(layer_indices)))
@@ -283,23 +283,23 @@ def _make_latent_tower_fig(vis_data, global_step):
         ax = axes[row][0]
         toks = e.get("align_cos_tokens")
         strip = (toks.numpy()[None, :] if toks is not None else np.zeros((1, 1)))
-        ax.imshow(strip, vmin=-1, vmax=1, cmap="RdYlGn", aspect="auto", interpolation="nearest")
+        ax.imshow(strip, vmin=0.3, vmax=1.0, cmap="RdYlGn", aspect="auto", interpolation="nearest")
         ax.set_yticks([]); ax.set_xticks([])
         ax.set_ylabel(f"L{li}", rotation=0, ha="right", va="center", fontsize=6)
         ax.text(0.01, 0.5, f"{e.get('align_cos_mean', 0):.2f}", transform=ax.transAxes,
-                fontsize=5.5, va="center", bbox=dict(boxstyle="round,pad=0.05", fc="white", alpha=0.6))
+                fontsize=5.5, va="center", bbox=dict(boxstyle="round,pad=0.05", fc="white", alpha=0.9))
         if row == 0:
             ax.set_title("align h_L↔t_L", fontsize=7)
         if has_casc:
             ax2 = axes[row][1]
             ct = e.get("casc_cos_tokens")
             if ct is not None:
-                ax2.imshow(ct.numpy()[None, :], vmin=-1, vmax=1, cmap="RdYlGn",
+                ax2.imshow(ct.numpy()[None, :], vmin=0.3, vmax=1.0, cmap="RdYlGn",
                            aspect="auto", interpolation="nearest")
                 ax2.text(0.01, 0.5, f"{e.get('casc_cos_mean', 0):.2f}", transform=ax2.transAxes,
-                         fontsize=5.5, va="center", bbox=dict(boxstyle="round,pad=0.05", fc="white", alpha=0.6))
+                         fontsize=5.5, va="center", bbox=dict(boxstyle="round,pad=0.05", fc="white", alpha=0.9))
             else:
-                ax2.imshow(np.zeros((1, 1)), vmin=-1, vmax=1, cmap="RdYlGn", aspect="auto")
+                ax2.imshow(np.zeros((1, 1)), vmin=0.3, vmax=1.0, cmap="RdYlGn", aspect="auto")
             ax2.set_yticks([]); ax2.set_xticks([])
             if row == 0:
                 ax2.set_title(f"cascade →L+{layers[1]-layers[0]}", fontsize=7)
