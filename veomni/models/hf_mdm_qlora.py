@@ -921,10 +921,15 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
               f"FFN={_qcfg.get('vfm_unet_ffn',4096)}), grad_scale={wrapper.vfm_grad_scale}×, "
               f"delta_scale={wrapper.vfm_delta_scale}, base={_base_dev}")
 
-        # Pre-forward hook for inference (cross-GPU delta transfer)
+        # Pre-forward hook for inference (cross-GPU delta transfer). MUST mirror
+        # the training-forward injection exactly or inference is out-of-distribution:
+        #   1. tanh-bound the delta (training uses vfm_delta_scale * tanh(raw)).
+        #   2. add delta ONLY at masked positions (training uses torch.where on
+        #      mask_pos; unmasked positions keep their clean real embedding).
         _mid = wrapper.vfm_mask_token_id
         _vfm = wrapper.vfm_adapter
         _vfm_dev = wrapper.vfm_device
+        _dscale = float(wrapper.vfm_delta_scale)
 
         def _vfm_hook(module, args, kwargs):
             if module.training:
@@ -933,10 +938,13 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
             if input_ids is None or not (input_ids == _mid).any():
                 return
             embed = module.get_input_embeddings()
-            inputs_embeds = embed(input_ids).to(_vfm_dev)
+            inputs_embeds = embed(input_ids)
+            mask_pos = (input_ids == _mid).unsqueeze(-1)
             with torch.no_grad():
-                delta = _vfm(inputs_embeds)
-            smart = inputs_embeds + delta.to(input_ids.device)
+                delta = _vfm(inputs_embeds.to(_vfm_dev)).to(inputs_embeds.device)
+            if _dscale > 0:
+                delta = _dscale * torch.tanh(delta)
+            smart = torch.where(mask_pos, inputs_embeds + delta, inputs_embeds)
             kwargs["inputs_embeds"] = smart.to(inputs_embeds.dtype)
             kwargs["input_ids"] = None
 
