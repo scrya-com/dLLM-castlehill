@@ -844,6 +844,44 @@ class MDMQLoRAWrapper(nn.Module):
                 comps["latent_cascade"] = float(casc_loss.detach())
                 comps["latent_cascade_cos"] = casc_cos
 
+            # 16-story latent tower viz data (vis steps only). Capture per-layer,
+            # ALL 16 cached layers (not subsampled), masked positions:
+            #   - align_cos: student h_l vs teacher t_l  (same-layer anchor)
+            #   - casc_cos:  cascade(h_l) vs teacher t_{l+1} (skip-4 transition)
+            # Rendered as a vertical tower by repr_align_vis._make_latent_tower_fig.
+            if self._vis_step:
+                try:
+                    _layers = list(self.align_layers)
+                    _lbl = labels if (labels is not None and labels.dim() == 2) else (
+                        labels.view(input_ids.size(0), -1) if labels is not None else None)
+                    _mask = (_lbl[:, 1:].reshape(-1) != IGNORE_INDEX) if _lbl is not None else None
+                    _tower = {}
+                    for _i, _li in enumerate(_layers):
+                        s = student_hiddens[_li][:, :-1, :].reshape(-1, student_hiddens[_li].size(-1)).float()
+                        t = teacher_hiddens[_li][:, :-1, :].reshape(-1, teacher_hiddens[_li].size(-1)).float()
+                        if _mask is not None and _mask.any():
+                            s, t = s[_mask], t[_mask]
+                        if s.numel() == 0:
+                            continue
+                        align_cos = (F.normalize(s, dim=-1) * F.normalize(t, dim=-1)).sum(-1)  # [N]
+                        entry = {"align_cos_mean": align_cos.mean().item(),
+                                 "align_cos_tokens": align_cos[:128].detach().cpu()}
+                        # cascade prediction quality for this layer -> next cached layer
+                        if self.latent_cascade is not None and _i < len(_layers) - 1:
+                            t_next = teacher_hiddens[_layers[_i + 1]][:, :-1, :].reshape(-1, t.size(-1)).float()
+                            if _mask is not None and _mask.any():
+                                t_next = t_next[_mask]
+                            pred = self.latent_cascade(s.to(self.latent_cascade.up.weight.dtype), _i).float()
+                            cc = (F.normalize(pred, dim=-1) * F.normalize(t_next, dim=-1)).sum(-1)
+                            entry["casc_cos_mean"] = cc.mean().item()
+                            entry["casc_cos_tokens"] = cc[:128].detach().cpu()
+                        _tower[_li] = entry
+                    if self._vis_data is None or not isinstance(self._vis_data, dict):
+                        self._vis_data = {}
+                    self._vis_data["latent_tower"] = _tower
+                except Exception:
+                    pass
+
                 # Subgoal (block-level) alignment — BDS-inspired auxiliary loss.
                 # Block-average each layer's hidden states across n_blocks chunks
                 # before computing cosine. Washes out per-token causal/bidirectional

@@ -255,6 +255,59 @@ def _make_pca_fig(vis_data, global_step):
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def _make_latent_tower_fig(vis_data, global_step):
+    """16-story latent tower. One horizontal strip per cached layer, stacked
+    bottom (layer 4) -> top (layer 64). Left column: per-token same-layer
+    alignment (student h_l vs teacher t_l). Right column: cascade transition
+    prediction (cascade(h_l) vs teacher t_{l+1}). Color = cosine (RdYlGn,
+    -1..1); mean cos per layer printed on each story."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    tower = vis_data.get("latent_tower")
+    if not tower:
+        return None
+    layers = sorted(tower.keys())
+    n = len(layers)
+    if n == 0:
+        return None
+    has_casc = any("casc_cos_tokens" in tower[li] for li in layers)
+    ncol = 2 if has_casc else 1
+    fig, axes = plt.subplots(n, ncol, figsize=(11 if has_casc else 6, max(6, 0.55 * n)),
+                             squeeze=False)
+    fig.suptitle(f"Latent alignment tower — step {global_step}\n"
+                 f"(bottom=layer {layers[0]} → top=layer {layers[-1]};  green=aligned, red=not)",
+                 fontsize=11)
+    for row, li in enumerate(reversed(layers)):
+        e = tower[li]
+        ax = axes[row][0]
+        toks = e.get("align_cos_tokens")
+        strip = (toks.numpy()[None, :] if toks is not None else np.zeros((1, 1)))
+        ax.imshow(strip, vmin=-1, vmax=1, cmap="RdYlGn", aspect="auto", interpolation="nearest")
+        ax.set_yticks([]); ax.set_xticks([])
+        ax.set_ylabel(f"L{li}", rotation=0, ha="right", va="center", fontsize=8)
+        ax.text(0.01, 0.5, f"align {e.get('align_cos_mean', 0):.2f}", transform=ax.transAxes,
+                fontsize=7, va="center", bbox=dict(boxstyle="round,pad=0.1", fc="white", alpha=0.6))
+        if row == 0:
+            ax.set_title("same-layer align (h_L vs teacher_L)", fontsize=9)
+        if has_casc:
+            ax2 = axes[row][1]
+            ct = e.get("casc_cos_tokens")
+            if ct is not None:
+                ax2.imshow(ct.numpy()[None, :], vmin=-1, vmax=1, cmap="RdYlGn",
+                           aspect="auto", interpolation="nearest")
+                ax2.text(0.01, 0.5, f"casc {e.get('casc_cos_mean', 0):.2f}", transform=ax2.transAxes,
+                         fontsize=7, va="center", bbox=dict(boxstyle="round,pad=0.1", fc="white", alpha=0.6))
+            else:
+                ax2.imshow(np.zeros((1, 1)), vmin=-1, vmax=1, cmap="RdYlGn", aspect="auto")
+                ax2.text(0.5, 0.5, "(top: no next)", transform=ax2.transAxes, fontsize=7, ha="center", va="center")
+            ax2.set_yticks([]); ax2.set_xticks([])
+            if row == 0:
+                ax2.set_title(f"cascade predict-next (→ L+{layers[1]-layers[0]})", fontsize=9)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
 def make_all_vis(model, global_step: int, mdm_history=None):
     """Return dict of {wandb_key: fig} for all available panels.
 
@@ -283,6 +336,10 @@ def make_all_vis(model, global_step: int, mdm_history=None):
     f = _make_pca_fig(vis_data, global_step)
     if f is not None:
         figs["repr_align/pca"] = f
+
+    f = _make_latent_tower_fig(vis_data, global_step)
+    if f is not None:
+        figs["latents/tower"] = f
 
     return figs
 
