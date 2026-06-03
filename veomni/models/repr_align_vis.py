@@ -273,11 +273,11 @@ def _make_latent_tower_fig(vis_data, global_step):
         return None
     has_casc = any("casc_cos_tokens" in tower[li] for li in layers)
     ncol = 2 if has_casc else 1
-    fig, axes = plt.subplots(n, ncol, figsize=(11 if has_casc else 6, max(6, 0.55 * n)),
-                             squeeze=False)
-    fig.suptitle(f"Latent alignment tower — step {global_step}\n"
-                 f"(bottom=layer {layers[0]} → top=layer {layers[-1]};  green=aligned, red=not)",
-                 fontsize=11)
+    # Compact: ~0.22in/row, low dpi → ~520x430 px for 16 rows (was 1100x880).
+    fig, axes = plt.subplots(n, ncol, figsize=(6.5 if has_casc else 3.6, max(2.6, 0.22 * n)),
+                             squeeze=False, dpi=80)
+    fig.suptitle(f"Latent tower s{global_step} (L{layers[0]}↓→L{layers[-1]}↑; green=aligned)",
+                 fontsize=8)
     for row, li in enumerate(reversed(layers)):
         e = tower[li]
         ax = axes[row][0]
@@ -285,26 +285,25 @@ def _make_latent_tower_fig(vis_data, global_step):
         strip = (toks.numpy()[None, :] if toks is not None else np.zeros((1, 1)))
         ax.imshow(strip, vmin=-1, vmax=1, cmap="RdYlGn", aspect="auto", interpolation="nearest")
         ax.set_yticks([]); ax.set_xticks([])
-        ax.set_ylabel(f"L{li}", rotation=0, ha="right", va="center", fontsize=8)
-        ax.text(0.01, 0.5, f"align {e.get('align_cos_mean', 0):.2f}", transform=ax.transAxes,
-                fontsize=7, va="center", bbox=dict(boxstyle="round,pad=0.1", fc="white", alpha=0.6))
+        ax.set_ylabel(f"L{li}", rotation=0, ha="right", va="center", fontsize=6)
+        ax.text(0.01, 0.5, f"{e.get('align_cos_mean', 0):.2f}", transform=ax.transAxes,
+                fontsize=5.5, va="center", bbox=dict(boxstyle="round,pad=0.05", fc="white", alpha=0.6))
         if row == 0:
-            ax.set_title("same-layer align (h_L vs teacher_L)", fontsize=9)
+            ax.set_title("align h_L↔t_L", fontsize=7)
         if has_casc:
             ax2 = axes[row][1]
             ct = e.get("casc_cos_tokens")
             if ct is not None:
                 ax2.imshow(ct.numpy()[None, :], vmin=-1, vmax=1, cmap="RdYlGn",
                            aspect="auto", interpolation="nearest")
-                ax2.text(0.01, 0.5, f"casc {e.get('casc_cos_mean', 0):.2f}", transform=ax2.transAxes,
-                         fontsize=7, va="center", bbox=dict(boxstyle="round,pad=0.1", fc="white", alpha=0.6))
+                ax2.text(0.01, 0.5, f"{e.get('casc_cos_mean', 0):.2f}", transform=ax2.transAxes,
+                         fontsize=5.5, va="center", bbox=dict(boxstyle="round,pad=0.05", fc="white", alpha=0.6))
             else:
                 ax2.imshow(np.zeros((1, 1)), vmin=-1, vmax=1, cmap="RdYlGn", aspect="auto")
-                ax2.text(0.5, 0.5, "(top: no next)", transform=ax2.transAxes, fontsize=7, ha="center", va="center")
             ax2.set_yticks([]); ax2.set_xticks([])
             if row == 0:
-                ax2.set_title(f"cascade predict-next (→ L+{layers[1]-layers[0]})", fontsize=9)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+                ax2.set_title(f"cascade →L+{layers[1]-layers[0]}", fontsize=7)
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
     return fig
 
 

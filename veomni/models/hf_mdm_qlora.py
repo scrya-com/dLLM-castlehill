@@ -865,7 +865,7 @@ class MDMQLoRAWrapper(nn.Module):
                             continue
                         align_cos = (F.normalize(s, dim=-1) * F.normalize(t, dim=-1)).sum(-1)  # [N]
                         entry = {"align_cos_mean": align_cos.mean().item(),
-                                 "align_cos_tokens": align_cos[:128].detach().cpu()}
+                                 "align_cos_tokens": align_cos[:48].detach().cpu()}
                         # cascade prediction quality for this layer -> next cached layer
                         if self.latent_cascade is not None and _i < len(_layers) - 1:
                             t_next = teacher_hiddens[_layers[_i + 1]][:, :-1, :].reshape(-1, t.size(-1)).float()
@@ -874,7 +874,7 @@ class MDMQLoRAWrapper(nn.Module):
                             pred = self.latent_cascade(s.to(self.latent_cascade.up.weight.dtype), _i).float()
                             cc = (F.normalize(pred, dim=-1) * F.normalize(t_next, dim=-1)).sum(-1)
                             entry["casc_cos_mean"] = cc.mean().item()
-                            entry["casc_cos_tokens"] = cc[:128].detach().cpu()
+                            entry["casc_cos_tokens"] = cc[:48].detach().cpu()
                         _tower[_li] = entry
                     if self._vis_data is None or not isinstance(self._vis_data, dict):
                         self._vis_data = {}
