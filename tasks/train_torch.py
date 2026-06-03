@@ -1137,22 +1137,40 @@ def main():
                                     ar_toks_total += ar_new_toks
                                     ar_text = tokenizer.decode(ar_out[0][pids.shape[1]:], skip_special_tokens=True)
 
-                                    # Diffusion generation — timed
+                                    # Diffusion generation — decode at MULTIPLE step
+                                    # counts so we can see whether VFM smart-noise lets
+                                    # 1/2/4 steps already produce coherent text (the
+                                    # core speedup thesis). Each uses the VFM hook.
                                     from veomni.models.transformers.qwen2.generation_utils import mdm_generate
+                                    _diff_by_steps = {}
                                     if tokenizer.mask_token_id is not None:
-                                        _t0 = _time.perf_counter()
-                                        diff_ids = mdm_generate(model, pids, mask_token_id=tokenizer.mask_token_id, max_new_tokens=256, steps=args.train.gen_sample_steps, temperature=0.7)
-                                        torch.cuda.synchronize()
-                                        diff_time_total += _time.perf_counter() - _t0
-                                        diff_new_toks = diff_ids.shape[1] - pids.shape[1]
-                                        diff_toks_total += diff_new_toks
-                                        diff_text = tokenizer.decode(diff_ids[0][pids.shape[1]:], skip_special_tokens=True)
+                                        _step_grid = sorted(set([1, 2, 4, 8, int(args.train.gen_sample_steps)]))
+                                        for _ns in _step_grid:
+                                            _t0 = _time.perf_counter()
+                                            diff_ids = mdm_generate(model, pids, mask_token_id=tokenizer.mask_token_id, max_new_tokens=256, steps=_ns, temperature=0.7)
+                                            torch.cuda.synchronize()
+                                            _dt = _time.perf_counter() - _t0
+                                            _new = diff_ids.shape[1] - pids.shape[1]
+                                            _txt = tokenizer.decode(diff_ids[0][pids.shape[1]:], skip_special_tokens=True)
+                                            _diff_by_steps[_ns] = (_txt, _new / _dt if _dt > 0 else 0.0)
+                                            # Track the configured-step count for the tok/s scalar (back-compat).
+                                            if _ns == int(args.train.gen_sample_steps):
+                                                diff_time_total += _dt
+                                                diff_toks_total += _new
                                     else:
-                                        diff_text = "(no mask token)"
+                                        _diff_by_steps = None
+                                _diff_html = ""
+                                if _diff_by_steps:
+                                    _diff_html = "".join(
+                                        f"<b>Diffusion ({ns}-step, {tps:.0f} tok/s):</b> {txt}<br>"
+                                        for ns, (txt, tps) in sorted(_diff_by_steps.items())
+                                    )
+                                else:
+                                    _diff_html = "<b>Diffusion:</b> (no mask token)<br>"
                                 gen_samples.append(
                                     f"<b>Prompt:</b> {gp}<br>"
                                     f"<b>AR:</b> {ar_text}<br>"
-                                    f"<b>Diffusion ({args.train.gen_sample_steps}-step):</b> {diff_text}"
+                                    f"{_diff_html}"
                                 )
                             train_metrics["generation/sample"] = wandb.Html("<hr>".join(gen_samples))
                             if ar_time_total > 0:
