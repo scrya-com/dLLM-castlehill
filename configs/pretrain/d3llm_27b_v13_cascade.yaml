@@ -1,0 +1,125 @@
+# d3LLM v13 — Latent Cascade: progressive layer-by-layer latent prediction
+#
+# Replaces the VFM noise adapter (which net-degraded the warm-started model:
+# top1 0.82@step250 -> 0.52@step1750, even with the delta tanh-bounded). The
+# adapter is OFF here.
+#
+# Adds (arxiv 2605.27734 "learn from your own latents, not tokens"):
+#   - LatentCascadeHead: predicts the teacher's NEXT cached-layer latent from
+#     the student's current-layer latent (h[4]->t[8], h[8]->t[12], ...,
+#     h[60]->t[64]) — skip-4 transitions across the 16 cached layers.
+#   - Progressive curriculum: cascade pairs unlock shallow->deep over
+#     cascade_curriculum_steps (easy near-layer transitions first).
+#   - Runs ALONGSIDE repr_align (same-layer anchor) — complementary: anchor
+#     stability + transition signal. Both reuse the frozen teacher cache.
+#
+# Why: sample-complexity of latent prediction is ~constant in depth vs
+# exponential for tokens — the binding win on 500 samples. And the skip-4
+# transitions set up a later layer-skip inference speedup.
+#
+# Warm-start LoRA from v11 step 15500 (working diffusion model). Single-GPU
+# on the 5090. Cascade head ~10-20M params (shared low-rank + layer embed).
+#
+# Launch (MSI):
+#   CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     .venv/bin/python tasks/train_torch.py \
+#     configs/pretrain/d3llm_27b_v13_cascade.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    resume_adapter_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v11/checkpoints/global_step_15500
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    # VFM noise adapter OFF (it net-degraded the model)
+    vfm_enabled: false
+    vfm_unet_enabled: false
+    # v13 latent cascade ON
+    latent_cascade_enabled: true
+    cascade_rank: 512
+    cascade_dropout: 0.0
+    cascade_wt: 0.5
+    cascade_curriculum_steps: 1500   # unlock 15 skip-4 pairs shallow->deep over ~1500 steps
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_seq_len: 1024
+  train_size: 500
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v13_cascade
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 500
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 40
+  max_steps: 5000
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 1e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories.jsonl
+  trajectory_min_mask_ratio: 0.05
+  trajectory_max_mask_ratio: 0.95
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  # repr_align ON (same-layer anchor) — runs alongside the cascade
+  repr_align_wt: 0.25
+  repr_align_wt_final: 0.25
+  repr_align_loss_mode: "cosine"
+  anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3.6-27b-reasoning-500-16L
+  align_layers: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64"
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 4
+
+  subgoal_align_wt: 0.0
+  anti_rep_wt: 0.5
+
+  llrd_decay: 0.85
+  min_snr_gamma: 0
+  gen_sample_every_steps: 250
+  gen_sample_steps: 64
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-v13-latent-cascade

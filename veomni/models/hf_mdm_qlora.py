@@ -428,6 +428,40 @@ class VFMMaskFillerUNet(nn.Module):
         return self.head(x)
 
 
+class LatentCascadeHead(nn.Module):
+    """v13: progressive layer-by-layer latent prediction (arxiv 2605.27734).
+
+    Predicts the teacher's NEXT cached-layer latent from the student's
+    current-layer latent (h_ell -> t_{ell+1}), forcing each layer to model the
+    latent *transition*. The paper proves this latent-prediction objective has
+    sample complexity ~constant in depth vs exponential for tokens — the
+    binding win on our 500-sample set. Complements repr_align (same-layer
+    h_ell -> t_ell anchor) with the transition signal.
+
+    ONE shared low-rank predictor + a layer-id embedding (~5-15M params vs
+    64 x Linear = 1.7B). Residual + zero-init up-proj => at step 0 predicts
+    t_next ~= h (identity prior; adjacent-layer latents are similar), then
+    learns the delta. Same no-op-at-init safety the VFM filler had.
+    """
+
+    def __init__(self, hidden_size: int, n_cascade_pairs: int, rank: int = 512, dropout: float = 0.0):
+        super().__init__()
+        self.layer_embed = nn.Embedding(max(1, n_cascade_pairs), hidden_size)
+        self.down = nn.Linear(hidden_size, rank)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.up = nn.Linear(rank, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+        nn.init.normal_(self.layer_embed.weight, std=1e-3)
+
+    def forward(self, h: torch.Tensor, pair_idx: int) -> torch.Tensor:
+        lid = torch.full((h.size(0),), pair_idx, device=h.device, dtype=torch.long)
+        x = self.norm(h + self.layer_embed(lid))
+        return h + self.up(self.drop(self.act(self.down(x))))
+
+
 class MDMQLoRAWrapper(nn.Module):
     def __init__(self, base):
         super().__init__()
@@ -456,6 +490,15 @@ class MDMQLoRAWrapper(nn.Module):
         # from the VFMMaskFiller. mask_token_id needed to locate masked slots.
         self.vfm_adapter = None
         self.vfm_mask_token_id = None
+        # v13 latent cascade (set externally by build_foundation_model).
+        self.latent_cascade = None
+        self.latent_cascade_wt = 0.0
+        # Progressive curriculum: unlock cascade pairs shallow->deep over this
+        # many training steps (0 = all pairs active from the start). The head
+        # masters easy near-layer transitions (4->8) before hard deep ones
+        # (56->64), more stable on a warm-started model.
+        self.cascade_curriculum_steps = 0
+        self._cascade_step = 0
         # VFM gradient scale (to counteract 64-layer attenuation to input embeds).
         # Applied via hook on the *delta* tensor (after cross-device to() for UNet).
         # 1.0 = no scale; 10-50× common for deep stacks when delta stays ~0.
@@ -481,6 +524,45 @@ class MDMQLoRAWrapper(nn.Module):
     def gradient_checkpointing_enable(self, **kw):
         if hasattr(self.base, "gradient_checkpointing_enable"):
             self.base.gradient_checkpointing_enable(**kw)
+
+    def _latent_cascade_loss(self, student_hiddens, teacher_hiddens, labels, input_ids):
+        """v13: predict t[L_{i+1}] from h[L_i] over consecutive cached layers
+        (4->8, 8->12, ..., 60->64). Normalised MSE (1-cos), masked positions
+        only. Reuses the hidden_states repr_align already materialises."""
+        layers = list(self.align_layers)
+        pairs = list(zip(layers[:-1], layers[1:]))
+        # Progressive curriculum: activate pairs shallow->deep over
+        # cascade_curriculum_steps. n_active ramps 1 -> len(pairs); the
+        # shallowest pairs (near-input, easiest skip-4 transitions) train
+        # first, deepest last. 0 => all pairs from the start.
+        if self.training:
+            self._cascade_step += 1
+        cur = getattr(self, "cascade_curriculum_steps", 0)
+        if cur and cur > 0:
+            frac = min(1.0, self._cascade_step / float(cur))
+            n_active = max(1, int(round(frac * len(pairs))))
+            pairs = pairs[:n_active]
+        loss_mask = None
+        if labels is not None:
+            lbl = labels if labels.dim() == 2 else labels.view(input_ids.size(0), -1)
+            loss_mask = (lbl[:, 1:].reshape(-1) != IGNORE_INDEX)
+        total, n, cos_acc = 0.0, 0, 0.0
+        for pair_i, (src, dst) in enumerate(pairs):
+            h = student_hiddens[src][:, :-1, :].reshape(-1, student_hiddens[src].size(-1)).float()
+            t = teacher_hiddens[dst][:, :-1, :].reshape(-1, teacher_hiddens[dst].size(-1)).float()
+            if loss_mask is not None and loss_mask.any():
+                h, t = h[loss_mask], t[loss_mask]
+            if h.numel() == 0:
+                continue
+            pred = self.latent_cascade(h.to(self.latent_cascade.up.weight.dtype), pair_i).float()
+            pred_n = F.normalize(pred, dim=-1)
+            t_n = F.normalize(t, dim=-1)
+            total = total + (1.0 - (pred_n * t_n).sum(-1)).mean()
+            cos_acc += (pred_n * t_n).sum(-1).mean().item()
+            n += 1
+        if n == 0:
+            return torch.tensor(0.0, device=input_ids.device), 0.0
+        return total / n, cos_acc / n
 
     def forward(self, input_ids=None, labels=None, attention_mask=None,
                 position_ids=None, mask_ratio=None, repr_align_wt=0.0,
@@ -751,6 +833,17 @@ class MDMQLoRAWrapper(nn.Module):
                     loss = _align_term
                 comps["repr_align"] = align_loss.detach().item()
 
+            # v13 latent cascade — predict-next latent prediction. Reuses the
+            # student/teacher hidden_states already materialised above. Runs
+            # ALONGSIDE repr_align (anchor) — complementary transition signal.
+            if self.latent_cascade is not None and self.latent_cascade_wt > 0:
+                casc_loss, casc_cos = self._latent_cascade_loss(
+                    student_hiddens, teacher_hiddens, labels, input_ids)
+                _casc_term = self.latent_cascade_wt * casc_loss
+                loss = (_casc_term if loss is None else loss + _casc_term)
+                comps["latent_cascade"] = float(casc_loss.detach())
+                comps["latent_cascade_cos"] = casc_cos
+
                 # Subgoal (block-level) alignment — BDS-inspired auxiliary loss.
                 # Block-average each layer's hidden states across n_blocks chunks
                 # before computing cosine. Washes out per-token causal/bidirectional
@@ -1001,4 +1094,23 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
 
         wrapper._vfm_handle = wrapper.base.register_forward_pre_hook(_vfm_hook, with_kwargs=True)
         print(f"[hf_mdm_qlora] VFM pre-forward hook registered on base model")
+
+    # ── v13 Latent Cascade — progressive layer-by-layer latent prediction ──
+    if _qcfg.get("latent_cascade_enabled", False):
+        if wrapper.align_layers is None or len(wrapper.align_layers) < 2:
+            print("[hf_mdm_qlora] WARN: latent_cascade needs align_layers (>=2) + a teacher; skipping")
+        else:
+            _cfg2 = wrapper.config
+            hs2 = getattr(_cfg2, "hidden_size", None) or getattr(getattr(_cfg2, "text_config", None), "hidden_size", None)
+            n_pairs = len(wrapper.align_layers) - 1
+            wrapper.latent_cascade = LatentCascadeHead(
+                hidden_size=hs2, n_cascade_pairs=n_pairs,
+                rank=int(_qcfg.get("cascade_rank", 512)),
+                dropout=float(_qcfg.get("cascade_dropout", 0.0)),
+            ).to(device=wrapper.base.get_input_embeddings().weight.device, dtype=torch.bfloat16)
+            wrapper.latent_cascade_wt = float(_qcfg.get("cascade_wt", 0.5))
+            wrapper.cascade_curriculum_steps = int(_qcfg.get("cascade_curriculum_steps", 0))
+            _np = sum(p.numel() for p in wrapper.latent_cascade.parameters())
+            print(f"[hf_mdm_qlora] LatentCascadeHead: {_np:,} params, {n_pairs} skip-{wrapper.align_layers[1]-wrapper.align_layers[0]} "
+                  f"pairs, wt={wrapper.latent_cascade_wt}, curriculum={wrapper.cascade_curriculum_steps} steps")
     return wrapper
