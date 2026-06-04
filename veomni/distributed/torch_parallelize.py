@@ -121,6 +121,14 @@ def build_parallelize_model(
         # deepspeed.initialize() + load_hf_weights_zero3() follow in the trainer.
         return model
 
+    # Model-parallel (device_map across GPUs): one process holds the model split
+    # over multiple devices. DDP/FSDP cannot wrap that; autograd handles the
+    # cross-device backward directly. Return unwrapped.
+    _gpu_devs = {p.device.index for p in model.parameters() if p.device.type == "cuda"}
+    if len(_gpu_devs) > 1:
+        logger.info_rank0(f"Model-parallel: model spans GPUs {sorted(_gpu_devs)}; skipping DDP/FSDP wrap.")
+        return model
+
     if parallel_state.fsdp_enabled:
         logger.info_rank0(f"Apply data parallel to the model: {parallel_state.dp_mode}.")
         if parallel_state.dp_mode == "fsdp2":

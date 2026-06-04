@@ -191,7 +191,10 @@ def _save_qlora_checkpoint(model, save_dir, model_assets, logger):
     vfm = getattr(model, 'vfm_adapter', None)
     if vfm is not None:
         torch.save(vfm.state_dict(), f"{save_dir}/vfm_adapter.pt")
-    logger.info_rank0(f"QLoRA checkpoint saved at {save_dir}")
+    casc = getattr(model, 'latent_cascade', None)
+    if casc is not None:
+        torch.save(casc.state_dict(), f"{save_dir}/latent_cascade.pt")
+    logger.info_rank0(f"QLoRA checkpoint saved at {save_dir} (adapter + cascade head)")
 
 
 def main():
@@ -1011,13 +1014,7 @@ def main():
                     # looks constant when it's actually halving.
                     if args.train.repr_align_wt > 0:
                         train_metrics["repr_align/wt_effective"] = _current_repr_align_wt
-                    # LLRD per-layer LR spread (only meaningful when llrd_decay > 0).
-                    # training/lr only reports the base; the actual layers run on different LRs.
-                    if _llrd_param_groups is not None:
-                        _lrs = [g["lr"] for g in _llrd_param_groups if "lr" in g]
-                        if _lrs:
-                            train_metrics["llrd/lr_min"] = min(_lrs)
-                            train_metrics["llrd/lr_max"] = max(_lrs)
+                    # llrd/ wandb metrics removed (clutter for this mode; LLRD still active in optimizer)
                     # ----------------------------------------------------------
                     # Cola DLM extras (only when active). Scalars already
                     # live in step_loss_components → train_metrics; here
@@ -1069,7 +1066,8 @@ def main():
 
                     # VFM delta scalars every step (for dense wandb history; fixes "stuck at 0")
                     # last_vfm_delta is always populated in forward (independent of heavy _vis_step %50)
-                    if hasattr(model, "last_vfm_delta") and getattr(model, "last_vfm_delta", None):
+                    _vfm_on = getattr(getattr(model, "module", model), "vfm_enabled", False) or getattr(getattr(model, "module", model), "vfm_unet_enabled", False)
+                    if _vfm_on and getattr(model, "last_vfm_delta", None):
                         d = model.last_vfm_delta
                         # Generic: log every scalar key in last_vfm_delta under
                         # vfm/. New diagnostics (delta_to_embed_ratio,
@@ -1147,7 +1145,7 @@ def main():
                                         _step_grid = sorted(set([1, 2, 4, 8, int(args.train.gen_sample_steps)]))
                                         for _ns in _step_grid:
                                             _t0 = _time.perf_counter()
-                                            diff_ids = mdm_generate(model, pids, mask_token_id=tokenizer.mask_token_id, max_new_tokens=256, steps=_ns, temperature=0.7)
+                                            diff_ids = mdm_generate(model, pids, mask_token_id=tokenizer.mask_token_id, max_new_tokens=256, steps=_ns, temperature=0.0)
                                             torch.cuda.synchronize()
                                             _dt = _time.perf_counter() - _t0
                                             _new = diff_ids.shape[1] - pids.shape[1]
@@ -1173,6 +1171,12 @@ def main():
                                     f"{_diff_html}"
                                 )
                             train_metrics["generation/sample"] = wandb.Html("<hr>".join(gen_samples))
+                            # Console: readable plain-text dump (strip HTML) so
+                            # generations surface in the log, not only wandb.
+                            import re as _re_gen
+                            for _gs in gen_samples:
+                                _plain = _re_gen.sub(r"<[^>]+>", "", _gs.replace("<br>", "\n"))
+                                logger.info_rank0("[gen @%d]\n%s" % (global_step, _plain[:2000]))
                             if ar_time_total > 0:
                                 train_metrics["inference/ar_tok_per_sec"] = ar_toks_total / ar_time_total
                             if diff_time_total > 0:
@@ -1212,7 +1216,8 @@ def main():
                     # VFM delta statistics (from model._vis_data["vfm_delta"])
                     if _do_vis and getattr(model, "_vis_data", None) is not None:
                         _vfm_d = model._vis_data.get("vfm_delta", {})
-                        if _vfm_d:
+                        _vfm_on2 = getattr(getattr(model, "module", model), "vfm_enabled", False) or getattr(getattr(model, "module", model), "vfm_unet_enabled", False)
+                        if _vfm_d and _vfm_on2:
                             train_metrics["vfm/delta_mean"] = _vfm_d.get("mean", 0.0)
                             train_metrics["vfm/delta_std"] = _vfm_d.get("std", 0.0)
                             train_metrics["vfm/delta_norm"] = _vfm_d.get("norm", 0.0)

@@ -189,64 +189,55 @@ def _make_diffusion_fig(vis_data, global_step, mdm_history=None):
 
 def _make_pca_fig(vis_data, global_step):
     """
-    Student (●) vs teacher (★) hidden states projected to 2D via PCA.
-    A well-aligned model has student points sitting on top of teacher points.
-    Colored by sequence position so you can see positional clustering.
+    Per-layer PCA of student (red dots) vs teacher (blue stars) hidden states.
+    Aligned = red dots sit on blue stars. Color = sequence position. Uses the
+    fixed PCA layer set (deep tail + one shallow) so panels are comparable
+    across steps and focused on the generation-critical layers. Falls back to
+    the old layer-pooled single panel if pca_layers is absent.
     """
     import matplotlib.pyplot as plt
     import numpy as np
 
+    def _panel(ax, s, t, title):
+        s = s.float(); t = t.float()
+        K = min(s.size(0), 200)
+        if K < 4:
+            ax.set_visible(False); return
+        sn = F.normalize(s[:K], p=2, dim=-1).numpy()
+        tn = F.normalize(t[:K], p=2, dim=-1).numpy()
+        comb = np.concatenate([sn, tn], axis=0); comb = comb - comb.mean(axis=0, keepdims=True)
+        _, _, Vt = np.linalg.svd(comb, full_matrices=False)
+        pc = comb @ Vt[:2].T
+        cos = float((F.normalize(s[:K], dim=-1) * F.normalize(t[:K], dim=-1)).sum(-1).mean())
+        col = np.arange(K)
+        ax.scatter(pc[K:, 0], pc[K:, 1], c=col, cmap="Blues", marker="*", s=70, alpha=0.7, linewidths=0)
+        ax.scatter(pc[:K, 0], pc[:K, 1], c=col, cmap="Reds", marker="o", s=22, alpha=0.7, linewidths=0)
+        ax.set_title(f"{title}  cos={cos:.2f}", fontsize=9)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    pca_layers = vis_data.get("pca_layers")
+    if pca_layers:
+        items = sorted(pca_layers.items())
+        n = len(items)
+        fig, axes = plt.subplots(1, n, figsize=(3.0 * n, 3.4), squeeze=False, dpi=95)
+        fig.suptitle(f"PCA per layer - student(o) vs teacher(*)  step {global_step}  (aligned = o on *)", fontsize=10)
+        for col, (li, st) in enumerate(items):
+            _panel(axes[0][col], st[0], st[1], f"L{li}")
+        plt.tight_layout(rect=[0, 0, 1, 0.9])
+        return fig
+
+    # Fallback: old layer-pooled single panel
     s_layers = vis_data.get("s_layers")
     t_layers = vis_data.get("t_layers")
     if not s_layers:
         return None
-
-    # Pool layers → [N, D]
-    s = torch.stack(s_layers, dim=1).mean(dim=1).float()   # [N, D]
-    t = torch.stack(t_layers, dim=1).mean(dim=1).float()
-    N = s.size(0)
-    if N < 4:
+    s = torch.stack(s_layers, dim=1).mean(dim=1)
+    t = torch.stack(t_layers, dim=1).mean(dim=1)
+    if s.size(0) < 4:
         return None
-
-    K = min(N, 200)
-    s_np = F.normalize(s[:K], p=2, dim=-1).numpy()
-    t_np = F.normalize(t[:K], p=2, dim=-1).numpy()
-
-    # PCA on joint cloud [2K, D]
-    combined = np.concatenate([s_np, t_np], axis=0)
-    combined -= combined.mean(axis=0, keepdims=True)
-    _, _, Vt = np.linalg.svd(combined, full_matrices=False)
-    pc = combined @ Vt[:2].T   # [2K, 2]
-    s_2d = pc[:K]
-    t_2d = pc[K:]
-
-    # Compute mean cosine similarity across captured layers
-    _s_layers = vis_data.get("s_layers", [])
-    _t_layers = vis_data.get("t_layers", [])
-    _mean_cos = 0.0
-    if _s_layers and _t_layers and len(_s_layers) == len(_t_layers):
-        _cos_vals = []
-        for si, ti in zip(_s_layers, _t_layers):
-            _sn = F.normalize(si, p=2, dim=-1)
-            _tn = F.normalize(ti, p=2, dim=-1)
-            _cos_vals.append((_sn * _tn).sum(dim=-1).mean().item())
-        _mean_cos = sum(_cos_vals) / len(_cos_vals) if _cos_vals else 0.0
-        _align_pct = max(0.0, _mean_cos * 100)  # 0-100%
-    else:
-        _align_pct = 0.0
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    colors = np.arange(K)
-    sc1 = ax.scatter(t_2d[:, 0], t_2d[:, 1], c=colors, cmap="Blues", marker="*",
-                     s=80, alpha=0.7, label="teacher (★)", linewidths=0)
-    sc2 = ax.scatter(s_2d[:, 0], s_2d[:, 1], c=colors, cmap="Reds", marker="o",
-                     s=30, alpha=0.7, label="student (●)", linewidths=0)
-    ax.set_title(
-        f"Student vs Teacher hidden states — PCA [{K} tokens, step {global_step}]\n"
-        f"Alignment: {_align_pct:.1f}%  |  Aligned = red circles sit on blue stars  |  Color = sequence position"
-    )
-    ax.legend(loc="upper right")
-    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    fig, ax = plt.subplots(figsize=(6, 5), dpi=90)
+    _panel(ax, s, t, "pooled layers")
+    fig.suptitle(f"PCA pooled - student(o) vs teacher(*)  step {global_step}", fontsize=10)
     plt.tight_layout()
     return fig
 
@@ -256,11 +247,10 @@ def _make_pca_fig(vis_data, global_step):
 # ---------------------------------------------------------------------------
 
 def _make_latent_tower_fig(vis_data, global_step):
-    """16-story latent tower. One horizontal strip per cached layer, stacked
-    bottom (layer 4) -> top (layer 64). Left column: per-token same-layer
-    alignment (student h_l vs teacher t_l). Right column: cascade transition
-    prediction (cascade(h_l) vs teacher t_{l+1}). Color = cosine (RdYlGn,
-    -1..1); mean cos per layer printed on each story."""
+    """Latent tower: one horizontal strip per layer, stacked low->high. Columns
+    (when present): clean-position align (what repr_align optimizes; should be
+    greener), masked-position align (the hard case), cascade predict-next.
+    Color = cosine, RdYlGn 0.3..1.0; mean per layer printed."""
     import matplotlib.pyplot as plt
     import numpy as np
 
@@ -271,41 +261,35 @@ def _make_latent_tower_fig(vis_data, global_step):
     n = len(layers)
     if n == 0:
         return None
+    has_clean = any("align_clean_cos_tokens" in tower[li] for li in layers)
     has_casc = any("casc_cos_tokens" in tower[li] for li in layers)
-    ncol = 2 if has_casc else 1
-    # Compact: ~0.22in/row, low dpi → ~520x430 px for 16 rows (was 1100x880).
-    fig, axes = plt.subplots(n, ncol, figsize=(6.5 if has_casc else 3.6, max(2.6, 0.22 * n)),
-                             squeeze=False, dpi=80)
-    fig.suptitle(f"Latent tower s{global_step} (L{layers[0]}↓→L{layers[-1]}↑; green=aligned)",
+    cols = []
+    if has_clean:
+        cols.append(("clean h_L<->t_L", "align_clean_cos_tokens", "align_clean_cos_mean"))
+    cols.append(("masked h_L<->t_L", "align_cos_tokens", "align_cos_mean"))
+    if has_casc:
+        cols.append(("cascade ->next", "casc_cos_tokens", "casc_cos_mean"))
+    ncol = len(cols)
+    fig, axes = plt.subplots(n, ncol, figsize=(2.6 * ncol + 1.0, max(4.5, 0.55 * n)),
+                             squeeze=False, dpi=100)
+    fig.suptitle(f"Latent tower s{global_step} (L{layers[0]} bottom -> L{layers[-1]} top; green=aligned)",
                  fontsize=8)
     for row, li in enumerate(reversed(layers)):
         e = tower[li]
-        ax = axes[row][0]
-        toks = e.get("align_cos_tokens")
-        strip = (toks.numpy()[None, :] if toks is not None else np.zeros((1, 1)))
-        ax.imshow(strip, vmin=0.3, vmax=1.0, cmap="RdYlGn", aspect="auto", interpolation="nearest")
-        ax.set_yticks([]); ax.set_xticks([])
-        ax.set_ylabel(f"L{li}", rotation=0, ha="right", va="center", fontsize=6)
-        ax.text(0.01, 0.5, f"{e.get('align_cos_mean', 0):.2f}", transform=ax.transAxes,
-                fontsize=5.5, va="center", bbox=dict(boxstyle="round,pad=0.05", fc="white", alpha=0.9))
-        if row == 0:
-            ax.set_title("align h_L↔t_L", fontsize=7)
-        if has_casc:
-            ax2 = axes[row][1]
-            ct = e.get("casc_cos_tokens")
-            if ct is not None:
-                ax2.imshow(ct.numpy()[None, :], vmin=0.3, vmax=1.0, cmap="RdYlGn",
-                           aspect="auto", interpolation="nearest")
-                ax2.text(0.01, 0.5, f"{e.get('casc_cos_mean', 0):.2f}", transform=ax2.transAxes,
-                         fontsize=5.5, va="center", bbox=dict(boxstyle="round,pad=0.05", fc="white", alpha=0.9))
-            else:
-                ax2.imshow(np.zeros((1, 1)), vmin=0.3, vmax=1.0, cmap="RdYlGn", aspect="auto")
-            ax2.set_yticks([]); ax2.set_xticks([])
+        for c, (title, tkey, mkey) in enumerate(cols):
+            ax = axes[row][c]
+            toks = e.get(tkey)
+            strip = toks.numpy()[None, :] if toks is not None else np.zeros((1, 1))
+            ax.imshow(strip, vmin=0.3, vmax=1.0, cmap="RdYlGn", aspect="auto", interpolation="nearest")
+            ax.set_yticks([]); ax.set_xticks([])
+            if c == 0:
+                ax.set_ylabel(f"L{li}", rotation=0, ha="right", va="center", fontsize=6)
+            ax.text(0.01, 0.5, f"{e.get(mkey, 0):.2f}", transform=ax.transAxes, fontsize=5.5,
+                    va="center", bbox=dict(boxstyle="round,pad=0.05", fc="white", alpha=0.9))
             if row == 0:
-                ax2.set_title(f"cascade →L+{layers[1]-layers[0]}", fontsize=7)
+                ax.set_title(title, fontsize=7)
     plt.tight_layout(rect=[0, 0, 1, 0.93])
     return fig
-
 
 def make_all_vis(model, global_step: int, mdm_history=None):
     """Return dict of {wandb_key: fig} for all available panels.

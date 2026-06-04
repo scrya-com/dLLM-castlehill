@@ -565,6 +565,9 @@ class VFMv2(nn.Module):
         completion_len: int,
         max_steps: int = 8,
         threshold: float = 0.9,
+        commit_rule: str = "threshold",
+        delta: float = 0.5,
+        prompt_cache: bool = False,
     ) -> torch.Tensor:
         """Smart-noise-seeded confidence-threshold refinement decode.
 
@@ -595,31 +598,62 @@ class VFMv2(nn.Module):
         completion_mask = torch.ones(B, C, device=prompt_ids.device, dtype=prompt_attention_mask.dtype)
         full_mask = torch.cat([prompt_attention_mask, completion_mask], dim=1)
 
+        # Prompt-KV cache (#3): forward prompt[:-1] once; each step reuses it (fresh
+        # copy) and forwards only [last_prompt_tok + completion]. AR-shift needs the
+        # last prompt position's logits, so it stays in the per-step input.
+        import copy as _copy
+        prompt_kv = None
+        if prompt_cache:
+            with torch.no_grad():
+                _pk = self.llm(inputs_embeds=prompt_embeds[:, :-1, :],
+                               attention_mask=prompt_attention_mask[:, :-1],
+                               use_cache=True, is_causal=False)
+            prompt_kv = _pk.past_key_values
+
         for step in range(max_steps):
             if committed.all():
                 break
-            full_embeds = torch.cat([prompt_embeds, current_state], dim=1)
-            outputs = self.llm(
-                inputs_embeds=full_embeds, attention_mask=full_mask,
-                use_cache=False, is_causal=False,
-            )
-            logits = outputs.logits.to(next(self.adapter.parameters()).device)
-            if self.ar_shift:
-                completion_logits = logits[:, P - 1:P + C - 1, :]
+            if prompt_cache:
+                step_in = torch.cat([prompt_embeds[:, -1:, :], current_state], dim=1)  # [B, C+1, H]
+                past = _copy.deepcopy(prompt_kv)
+                outputs = self.llm(
+                    inputs_embeds=step_in, attention_mask=full_mask, past_key_values=past,
+                    use_cache=True, is_causal=False, logits_to_keep=C + 1,
+                )
             else:
-                completion_logits = logits[:, P:P + C, :]
+                full_embeds = torch.cat([prompt_embeds, current_state], dim=1)
+                outputs = self.llm(
+                    inputs_embeds=full_embeds, attention_mask=full_mask,
+                    use_cache=False, is_causal=False, logits_to_keep=C + 1,
+                )
+            _lg = outputs.logits.to(next(self.adapter.parameters()).device)  # [B, C+1, V]
+            completion_logits = _lg[:, :-1, :] if self.ar_shift else _lg[:, 1:, :]
             probs = torch.softmax(completion_logits.float(), dim=-1)
             conf, argmax = probs.max(dim=-1)  # [B, C]
 
-            # Candidates to commit this step: not-yet-committed AND confident.
-            newly = (~committed) & (conf > threshold)
-            if not newly.any():
-                # Guarantee progress: commit the single most-confident
-                # uncommitted position per example.
-                masked_conf = conf.masked_fill(committed, -1.0)
-                top = masked_conf.argmax(dim=-1)  # [B]
+            # Commit set: threshold (Fast-dLLM) or Frechet profile (2606.02955).
+            if commit_rule == "frechet":
                 newly = torch.zeros_like(committed)
-                newly[torch.arange(B, device=newly.device), top] = True
+                for b in range(B):
+                    unc = (~committed[b]).nonzero(as_tuple=False).squeeze(-1)
+                    if unc.numel() == 0:
+                        continue
+                    cv = conf[b, unc]
+                    order = torch.argsort(cv, descending=True); cs = cv[order]
+                    cumprod = torch.cumprod(cs, dim=0)
+                    nidx = torch.arange(1, cs.numel() + 1, device=cs.device, dtype=cs.dtype)
+                    Ln = (cumprod - (1.0 - cs) ** (nidx - 1)).clamp(min=0.0)
+                    Un = 1.0 - cs
+                    qual = (Ln - Un) > delta
+                    nc = int(qual.nonzero().max().item()) + 1 if qual.any() else 1
+                    newly[b, unc[order[:nc]]] = True
+            else:
+                newly = (~committed) & (conf > threshold)
+                if not newly.any():
+                    masked_conf = conf.masked_fill(committed, -1.0)
+                    top = masked_conf.argmax(dim=-1)  # [B]
+                    newly = torch.zeros_like(committed)
+                    newly[torch.arange(B, device=newly.device), top] = True
 
             pred_ids = torch.where(newly, argmax, pred_ids)
             committed = committed | newly
@@ -631,9 +665,9 @@ class VFMv2(nn.Module):
         # guarantee) fall back to their last argmax.
         if not committed.all():
             full_embeds = torch.cat([prompt_embeds, current_state], dim=1)
-            outputs = self.llm(inputs_embeds=full_embeds, attention_mask=full_mask, use_cache=False, is_causal=False)
-            logits = outputs.logits.to(next(self.adapter.parameters()).device)
-            cl = logits[:, P - 1:P + C - 1, :] if self.ar_shift else logits[:, P:P + C, :]
+            outputs = self.llm(inputs_embeds=full_embeds, attention_mask=full_mask, use_cache=False, is_causal=False, logits_to_keep=C + 1)
+            _lg = outputs.logits.to(next(self.adapter.parameters()).device)
+            cl = _lg[:, :-1, :] if self.ar_shift else _lg[:, 1:, :]
             fallback = cl.argmax(dim=-1)
             pred_ids = torch.where(committed, pred_ids, fallback)
 

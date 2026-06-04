@@ -1,0 +1,68 @@
+# VFM v2.4 on 27B — dual-GPU + refinement training + v11 warm-start
+#
+# Combines:
+#   - The dual-GPU sharding (device_map=auto, max_memory) that fits the 27B
+#     joint adapter+QLoRA training across RTX PRO 4000 (cuda:1) + 5090 (cuda:0).
+#   - refinement_training (v2.4): smart-noise init + iterative refinement —
+#     the approach that broke the one-shot multimodality wall on 1.7B.
+#   - Warm-start the LoRA from v11 step 15500 (the working d3llm diffusion
+#     model), so the LLM already knows bidirectional masked prediction; the
+#     adapter learns to produce smart noise on top of it.
+#   - Reconstruction logging (recon_every): decode generate_refine output on
+#     fixed probes every N steps → console + wandb "reconstructions" panel.
+#     This is the LLM-reconstruction signal the d3llm runs surfaced.
+#
+# Launch on MSI (dual-GPU; CUDA order PCI so cuda:0=PRO4000, cuda:1=5090 —
+# but device_map=auto + max_memory handles placement, adapter stays on the
+# device the script calls "device" = cuda:0):
+#   cd ~/Documents/GitHub/Open-dLLM
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#       .venv/bin/python tasks/train_vfm_v2.py \
+#       configs/pretrain/vfm_v2_27b_dual_refine.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  freeze_llm: false
+  lora_resume_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v11/checkpoints/global_step_15500
+  dual_gpu: true
+  gpu1_mem: "13GiB"   # PRO 4000 (24 GB): embedding + most frozen layers
+  gpu0_mem: "16GiB"   # 5090 (32 GB): overflow layers + lm_head + LoRA + adapter + optimizer
+
+vfm:
+  variational: false
+  refinement_training: true   # ← the v2.4 breakthrough, now on 27B
+  adapter_layers: 2
+  adapter_heads: 8
+  adapter_dropout: 0.1
+  adapter_intermediate_size: 10240   # 2x hidden (5120)
+  max_completion_len: 512
+  tau: 1.0
+  sigma: 1.0
+  kl_weight_final: 0.0
+  kl_weight_warmup_steps: 0
+  ar_shift: true
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data_overfit1.jsonl
+  max_prompt_len: 256
+  max_completion_len: 512
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v2_27b_overfit1
+  lr: 2e-4            # LoRA warm-started; don't thrash it
+  weight_decay: 0.01
+  max_steps: 50
+  micro_batch_size: 1
+  global_batch_size: 1
+  use_8bit_adam: true   # saves ~ optimizer-state memory on the joint param set
+  log_every: 10
+  save_every: 30
+  recon_every: 25      # ← LLM reconstructions every 100 steps
+  recon_num_probes: 1
+  recon_steps: 16
+  recon_threshold: 0.7
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v2-27b-overfit1

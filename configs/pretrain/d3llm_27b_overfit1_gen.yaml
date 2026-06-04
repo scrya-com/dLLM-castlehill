@@ -1,0 +1,141 @@
+# d3LLM v14 — Latent RECONSTRUCTION (denoising): per-layer recover clean teacher
+# latent from a corrupted student latent, and decode the reconstructed FINAL
+# latent through the frozen lm_head (token CE) — ties reconstruction to the
+# generation path. Gated by cascade_recon_mode. Reuses ALL v13 plumbing.
+#
+# Replaces the VFM noise adapter (which net-degraded the warm-started model:
+# top1 0.82@step250 -> 0.52@step1750, even with the delta tanh-bounded). The
+# adapter is OFF here.
+#
+# Adds (arxiv 2605.27734 "learn from your own latents, not tokens"):
+#   - LatentCascadeHead: predicts the teacher's NEXT cached-layer latent from
+#     the student's current-layer latent (h[4]->t[8], h[8]->t[12], ...,
+#     h[60]->t[64]) — skip-4 transitions across the 16 cached layers.
+#   - Progressive curriculum: cascade pairs unlock shallow->deep over
+#     cascade_curriculum_steps (easy near-layer transitions first).
+#   - Runs ALONGSIDE repr_align (same-layer anchor) — complementary: anchor
+#     stability + transition signal. Both reuse the frozen teacher cache.
+#
+# Why: sample-complexity of latent prediction is ~constant in depth vs
+# exponential for tokens — the binding win on 500 samples. And the skip-4
+# transitions set up a later layer-skip inference speedup.
+#
+# Warm-start LoRA from v11 step 15500 (working diffusion model). Single-GPU
+# on the 5090. Cascade head ~10-20M params (shared low-rank + layer embed).
+#
+# Launch (MSI):
+#   CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     .venv/bin/python tasks/train_torch.py \
+#     configs/pretrain/d3llm_27b_overfit1.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  enable_qlorafy: true
+  qlorafy_config:
+    use_hf_native: true
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_dora: false
+    use_rslora: true
+    freeze_mlp_lora: true   # attention-only LoRA updates (freeze gate/up/down)
+    device: auto                    # split 27B across both GPUs (device_map)
+    max_memory: {0: "16GiB", 1: "30GiB"}   # 0=RTX4000(24,~4 used), 1=5090(32)
+    resume_adapter_path: /home/johndpope/ds_offload/checkpoints/d3llm_27b_v11/checkpoints/global_step_15500
+    target_modules:
+      - in_proj_qkv
+      - in_proj_a
+      - in_proj_b
+      - in_proj_z
+      - out_proj
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    # VFM noise adapter OFF (it net-degraded the model)
+    vfm_enabled: false
+    vfm_unet_enabled: false
+    # v13 latent cascade ON
+    latent_cascade_enabled: false
+    cascade_rank: 512
+    cascade_dropout: 0.0
+    cascade_wt: 0.5
+    cascade_curriculum_steps: 0      # v14: all pairs (incl. 60->64) live from step 1 so decode-CE fires immediately
+    # v14 latent RECONSTRUCTION (denoising) — reframes the cascade:
+    cascade_recon_mode: true        # corrupt student latent -> reconstruct CLEAN teacher latent (MSE+cos)
+    cascade_corrupt_std: 0.1        # Gaussian noise std (x per-feature std) on student latent
+    cascade_decode_wt: 0.5          # decode reconstructed L64 thru frozen lm_head -> token CE (ties recon to generation)
+    cascade_num_sample_pairs: 6     # 4 dense-tail (always) + 2 sampled lower
+    cascade_tail_pairs: 4           # ALWAYS train last-4-layer dense pairs (60->61->62->63->64)
+    # data2vec EMA self-teacher (arxiv 2605.27734) — in-distribution target
+    cascade_ema_teacher: false
+    ema_lora_alpha: 0.999
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data_overfit1.jsonl
+  max_seq_len: 1024
+  train_size: 1
+  eval_size: 0
+  data_type: plaintext
+  text_keys: text
+  drop_last: true
+  num_workers: 2
+  prefetch_factor: 2
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/d3llm_27b_overfit1
+  save_hf_weights: false
+  save_epochs: 0
+  save_steps: 0
+  save_total_limit: 2
+  auto_resume: false
+  num_train_epochs: 1000
+  max_steps: 1000
+  micro_batch_size: 1
+  global_batch_size: 1
+  lr: 1e-3
+  weight_decay: 0.01
+  optimizer: adamw
+  rmpad: false
+  seed: 42
+  data_parallel_mode: ddp
+  ckpt_manager: dcp
+
+  enable_masking: true
+
+  trajectory_data_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/trajectories_overfit1.jsonl
+  trajectory_min_mask_ratio: 0.70
+  trajectory_max_mask_ratio: 0.90
+  trajectory_entropy_weight: 0.0
+  trajectory_temperature: 1.0
+
+  # repr_align ON (same-layer anchor) — runs alongside the cascade
+  repr_align_wt: 0.0
+  repr_align_wt_final: 0.0
+  repr_align_loss_mode: "cosine"
+  anchor_cache_dir: /home/johndpope/ds_offload/anchors/qwen3.6-27b-reasoning-500-16L
+  align_layers: "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,61,62,63,64"  # dense last-4 tail
+  repr_align_sub_sample_ratio: 0.25
+  repr_align_num_sample_layers: 4
+
+  subgoal_align_wt: 0.0
+  anti_rep_wt: 0.0
+
+  llrd_decay: 0.85
+  min_snr_gamma: 0
+  gen_sample_every_steps: 25
+  gen_sample_steps: 64
+  gen_prompts: ["Describe the construction and update logic for a Persistent Segment Tree. Specifically, if you have an array of size $n$ and perform $m$ updates, how do you ensure that you can query any previous version of the tree in $O(\\log n)$ time without consuming $O(n \\cdot m)$ space? Explain the node-reuse strategy and the resulting space complexity."]
+
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  empty_cache_steps: 1
+  init_device: cuda
+
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: d3llm-27b-overfit1-gen

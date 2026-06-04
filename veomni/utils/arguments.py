@@ -442,6 +442,10 @@ class TrainingArguments:
         default=16,
         metadata={"help": "Number of diffusion denoising steps for the in-training gen-sample hook. More steps = fewer parallel unmaskings per step = less exposure to the joint-marginal factorization failure that anti_rep_wt targets."},
     )
+    gen_prompts: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Override the generation-probe prompt pool; one sampled per gen step. Set to a TRAINING prompt for an in-distribution / overfit generation test."},
+    )
     gen_sample_log_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path for the side JSONL dump of generation samples. Default: {output_dir}/generations.jsonl."},

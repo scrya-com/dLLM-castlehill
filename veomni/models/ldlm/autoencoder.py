@@ -276,23 +276,35 @@ class LDLMAutoencoder(nn.Module):
 
     def encode(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Dict:
         device = self.latent_encoder.latents.device
-        with torch.no_grad():
-            if self._encoder_device_map is not None:
-                encoder_device = self.token_encoder.device
-                outputs = self.token_encoder(
-                    input_ids.to(encoder_device),
-                    attention_mask=attention_mask.to(encoder_device) if attention_mask is not None else None,
-                    output_hidden_states=True,
-                )
-                h = outputs.hidden_states[self.encoder_hidden_layer].to(device)
-            else:
-                outputs = self.token_encoder(
-                    input_ids.cpu(),
-                    attention_mask=attention_mask.cpu() if attention_mask is not None else None,
-                    output_hidden_states=True,
-                )
-                h = outputs.hidden_states[self.encoder_hidden_layer].to(device)
-            del outputs
+        # Lazy frozen-encoder cache: h is deterministic (encoder is frozen), so
+        # cache layer-`encoder_hidden_layer` output keyed by SHA-256 of input_ids.
+        # Epoch 1 runs the (CPU) encoder forward; every later epoch skips it.
+        if not hasattr(self, "_h_cache"):
+            self._h_cache = {}
+        import hashlib
+        _key = hashlib.sha256(input_ids.detach().to("cpu").contiguous().numpy().tobytes()).hexdigest()
+        _cached = self._h_cache.get(_key)
+        if _cached is not None:
+            h = _cached.to(device)
+        else:
+            with torch.no_grad():
+                if self._encoder_device_map is not None:
+                    encoder_device = self.token_encoder.device
+                    outputs = self.token_encoder(
+                        input_ids.to(encoder_device),
+                        attention_mask=attention_mask.to(encoder_device) if attention_mask is not None else None,
+                        output_hidden_states=True,
+                    )
+                    h = outputs.hidden_states[self.encoder_hidden_layer].to(device)
+                else:
+                    outputs = self.token_encoder(
+                        input_ids.cpu(),
+                        attention_mask=attention_mask.cpu() if attention_mask is not None else None,
+                        output_hidden_states=True,
+                    )
+                    h = outputs.hidden_states[self.encoder_hidden_layer].to(device)
+                del outputs
+            self._h_cache[_key] = h.detach().to("cpu")
 
         if self._normalize_hidden_states and self.training:
             h_mean = self._h_mean.to(h.device)

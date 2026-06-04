@@ -105,6 +105,54 @@ Per-step cost: **~138ms** (model-bound, 27B NF4 QLoRA on RTX 5090). Quality bott
 
 All metrics logged to [wandb.ai/snoozie/open-dllm-27b](https://wandb.ai/snoozie/open-dllm-27b) and [wandb.ai/snoozie/open-dllm-compare](https://wandb.ai/snoozie/open-dllm-compare).
 
+### Decode acceleration — the generation wall was the SAMPLER, not training (training-free)
+
+**Key finding:** the v6–v14 garbled generation was a **decode bug, not a training problem**. An overfit-1 test memorized one example to `mdm 0.01 / top1 1.00` (even at 90% mask) yet still generated jumble — perfect per-position prediction ≠ coherent generation. Cause: `mdm_generate`'s default `temperature=0.7` samples independent per-position marginals in parallel (joint-marginal failure). **`temperature=0` + confidence-threshold decode makes generation coherent with zero retraining.**
+
+Two training-free parallel-commit strategies then stack (v11, 27B, 200-tok, **unseen** prompts):
+
+| decode (masked-diffusion) | tok/s | vs threshold | coherence |
+|---|---|---|---|
+| temp-0.7 (old default) | — | — | **jumbled** |
+| threshold-0.9 (temp-0) | 3.7–4.7 | 1× | coherent |
+| **Fréchet profile** (δ=0.3, arXiv:2606.02955) | 4.6–7.3 | **+24–59%** | coherent |
+| **SAID × Fréchet** (arXiv:2606.04974) | 6.4–7.0 | **+49–73%** | coherent |
+
+**VFM v2.4 NAR path** (`generate_refine`, smart-noise + iterative confident-commit, warm-LoRA base):
+
+| steps | tok/s | vs AR |
+|---|---|---|
+| 4 | **73** | **11×** |
+| 8 | 42 | 6.4× |
+| 16 | 18–22 | ~3× |
+| AR | 6.5 | 1× |
+
+- **+9–11%** more from **selective lm_head** (`logits_to_keep`, mathematically exact).
+- FLA + causal-conv1d fused kernels already cover the 75% Gated-DeltaNet layers (only `flash_attn` missing → 25% full-attn on SDPA).
+- **Negative results (do not repeat):** SCD layer-caching breaks coherence in self-generation (32% match @R=2); prompt-KV caching breaks in this bidirectional+DeltaNet model (55% match, +5% only); Fréchet commit is null when fully confident (overfit case).
+
+**Decode functions** (`veomni/models/transformers/qwen2/generation_utils.py`): `mdm_generate_threshold`, `mdm_generate_frechet`, `mdm_generate_said`, `_commit_set`; VFM `generate_refine(commit_rule=..., prompt_cache=...)`. In-training `gen_sample` uses `temperature=0`.
+
+**Reproduce** (27B v11, both GPUs):
+```python
+from veomni.models.hf_mdm_qlora import build_hf_mdm_qlora
+from veomni.models.transformers.qwen2.generation_utils import mdm_generate_frechet, mdm_generate_said
+M = build_hf_mdm_qlora("/path/Qwen3.6-27B", qlorafy_config=dict(
+    resume_adapter_path=".../d3llm_27b_v11/checkpoints/global_step_15500",
+    device="auto", max_memory={0:"20GiB",1:"30GiB"},
+    target_modules=["in_proj_qkv","in_proj_a","in_proj_b","in_proj_z","out_proj",
+                    "q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]), device="auto")
+ids, steps = mdm_generate_frechet(M, prompt_ids, mask_token_id=248077, max_new_tokens=200, delta=0.3)   # +24–59% vs threshold
+ids, steps = mdm_generate_said(M, prompt_ids, mask_token_id=248077, max_new_tokens=200, commit_rule="frechet", delta=0.3)  # +49–73%
+# NOTE: a fresh AutoTokenizer has mask_token_id=None — pass 248077 explicitly.
+```
+
+**Flywheel node** — *Parent:* v6–v14 "fix generation in training" (**falsified** by overfit-1). *Claim:* generation coherence is a **decode** property — `temp-0 + confidence-threshold` solves it with no retraining; Fréchet/SAID parallel-commit add **+49–73%** throughput training-free. Overall confidence **0.85**. *Directions (ranked by leverage):*
+- 🟢 **(1)** temp-0 + Fréchet/SAID default decode — **done** (`generation_utils.py`). target: ≥+50% tok/s @ equal coherence ✅
+- 🟢 **(2)** VFM `generate_refine` 73 tok/s @ 4 steps — **validate generalization** on unseen prompts (overfit-only so far). target: coherent unseen @ ≤8 steps
+- 🟡 **(3)** SemBlock (2606.04964) — residual NAR repetition (quality lever, not speed). target: kill "deep deep" duplications
+- 🔴 SCD-cache / prompt-KV-cache — **falsified** in this bidirectional+DeltaNet architecture
+
 ---
 
 ## 🎯 d3LLM Trajectory Training (27B Qwen3.6)

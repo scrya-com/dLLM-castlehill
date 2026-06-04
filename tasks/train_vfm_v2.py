@@ -334,7 +334,9 @@ def main():
                 if getattr(model, "refinement_training", False):
                     pred = model.generate_refine(p_ids_t, p_mask_t, completion_len=c_len,
                                                  max_steps=t_cfg.get("recon_steps", 16),
-                                                 threshold=t_cfg.get("recon_threshold", 0.7))
+                                                 threshold=t_cfg.get("recon_threshold", 0.7),
+                                                 commit_rule=t_cfg.get("recon_commit_rule", "threshold"),
+                                                 delta=float(t_cfg.get("recon_delta", 0.5)))
                 else:
                     pred = model.generate(p_ids_t, p_mask_t, completion_len=c_len,
                                           num_refinement_steps=t_cfg.get("recon_steps", 1))

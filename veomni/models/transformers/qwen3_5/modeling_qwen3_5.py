@@ -835,6 +835,12 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             causal_mask = None
 
         hidden_states = inputs_embeds
+        # SCD layer-cache: resume from a cached layer-K activation (skips layers 0..K-1).
+        # Guarded by instance attrs so the normal path is untouched.
+        _scd_hidden = getattr(self, '_scd_cached_hidden', None)
+        _scd_start = int(getattr(self, '_scd_start_layer', 0)) if _scd_hidden is not None else 0
+        if _scd_hidden is not None:
+            hidden_states = _scd_hidden
 
         # Position embeddings shared across layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids if position_ids.dim() > 1 else position_ids.squeeze(0))
@@ -842,7 +848,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
 
         all_hidden_states = () if output_hidden_states else None
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for decoder_layer in self.layers[_scd_start : self.config.num_hidden_layers]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 

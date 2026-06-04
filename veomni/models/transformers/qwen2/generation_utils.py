@@ -340,6 +340,155 @@ class MDMGenerationMixin:
 
 
 @torch.no_grad()
+def _commit_set(conf, rule="frechet", delta=0.3, threshold=0.9):
+    """Return a bool mask over `conf` (1-D) of which positions to commit, >=1.
+    rule='frechet': Frechet profile (2606.02955); 'threshold': Fast-dLLM."""
+    if rule == "frechet":
+        order = torch.argsort(conf, descending=True); cs = conf[order]
+        cumprod = torch.cumprod(cs, dim=0)
+        nidx = torch.arange(1, cs.numel() + 1, device=cs.device, dtype=cs.dtype)
+        Ln = (cumprod - (1.0 - cs) ** (nidx - 1)).clamp(min=0.0); Un = 1.0 - cs
+        qual = (Ln - Un) > delta
+        nc = int(qual.nonzero().max().item()) + 1 if qual.any() else 1
+        commit = torch.zeros_like(conf, dtype=torch.bool); commit[order[:nc]] = True
+    else:
+        commit = conf >= threshold
+        if not commit.any():
+            commit = torch.zeros_like(conf, dtype=torch.bool); commit[conf.argmax()] = True
+    return commit
+
+
+def mdm_generate_said(
+    model, input_ids, mask_token_id, max_new_tokens=256,
+    scaffold_steps=128, commit_rule="frechet", delta=0.3, threshold=0.9,
+    chlg=True, chlg_threshold=0.9, chlg_steps=4,
+):
+    """SAID (2606.04974): even completion positions = scaffold, odd = detail.
+    Stage 1 denoises ONLY even positions to convergence (commit via commit_rule);
+    Stage 2 fills ALL odds in one pass; optional CHLG gives low-conf odds a few
+    extra Frechet steps. Training-free. Returns (ids, steps). Batch=1."""
+    device = input_ids.device
+    pad_id = getattr(model.config, "pad_token_id", None)
+    x = F.pad(input_ids, (0, max_new_tokens), value=mask_token_id)
+    attn = (x != pad_id).long() if pad_id is not None else None
+    P = input_ids.shape[1]; C = max_new_tokens; S = x.shape[1]
+    comp = torch.arange(P, P + C, device=device)
+    even_pos = torch.zeros(S, dtype=torch.bool, device=device); even_pos[comp[0::2]] = True
+    odd_pos = torch.zeros(S, dtype=torch.bool, device=device);  odd_pos[comp[1::2]] = True
+    steps = 0
+    def fwd():
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            lg = model(input_ids=x, attention_mask=attn, is_causal=False).logits
+        return torch.cat([lg[:, :1], lg[:, :-1]], 1)  # AR-shift, [1,S,V]
+    def step_commit(target_pos, use_chlg_easy=False):
+        # target_pos: [S] bool. Returns # committed; mutates x.
+        mi = (x[0] == mask_token_id) & target_pos          # [S]
+        if not mi.any(): return 0
+        logits = fwd()[0]                                   # [S,V]
+        ml = logits[mi.to(logits.device)].float()           # [N,V]
+        probs = torch.softmax(ml, -1); conf, tk = probs.max(-1)
+        if use_chlg_easy:
+            commit = conf >= chlg_threshold
+            if not commit.any(): commit = torch.zeros_like(conf, dtype=torch.bool); commit[conf.argmax()] = True
+        else:
+            commit = _commit_set(conf, commit_rule, delta, threshold)
+        idx = mi.nonzero(as_tuple=False).squeeze(-1)         # [N] positions
+        commit_c = commit.to(idx.device)
+        x[0, idx[commit_c]] = tk[commit.to(tk.device)].to(x.dtype).to(x.device)
+        return int(commit_c.sum().item())
+    # Stage 1: scaffold (even)
+    for _ in range(scaffold_steps):
+        if not ((x[0] == mask_token_id) & even_pos).any(): break
+        steps += 1; step_commit(even_pos)
+    # Stage 2: all odds, one pass (CHLG: easy only)
+    if ((x[0] == mask_token_id) & odd_pos).any():
+        steps += 1; step_commit(odd_pos, use_chlg_easy=chlg)
+    # CHLG: extra Frechet steps for hard odds
+    if chlg:
+        for _ in range(chlg_steps):
+            if not ((x[0] == mask_token_id) & odd_pos).any(): break
+            steps += 1; step_commit(odd_pos)
+    return x, steps
+
+
+def mdm_generate_frechet(
+    model, input_ids, mask_token_id, max_new_tokens=256, max_steps=256,
+    delta=0.5, temperature=0.0,
+):
+    """Fréchet Profile Decoding (Fast-dLLM++ 2606.02955, exact rule). Sort the
+    still-masked positions by top-1 confidence c_(1)>=...>=c_(n). For prefix n:
+      L_n = max(0, prod(c_(1..n)) - (1-c_(n))^(n-1))   (Frechet lower bound)
+      U_n = 1 - c_(n)
+    Commit the LARGEST n with L_n - U_n > delta (>=1 for progress). Recovers
+    Fast-dLLM's weakest-token rule at equal confidence; heterogeneity bonus when
+    confidences are uneven. Returns (ids, steps)."""
+    device=input_ids.device
+    pad_id=getattr(model.config,"pad_token_id",None)
+    x=F.pad(input_ids,(0,max_new_tokens),value=mask_token_id)
+    attn=(x!=pad_id).long() if pad_id is not None else None
+    steps=0
+    for _ in range(max_steps):
+        mi=(x==mask_token_id)
+        if not mi.any(): break
+        steps+=1
+        with torch.autocast(device_type="cuda",dtype=torch.bfloat16):
+            logits=model(input_ids=x,attention_mask=attn,is_causal=False).logits
+        logits=torch.cat([logits[:,:1],logits[:,:-1]],1)  # AR-shift
+        mi_l=mi.to(logits.device); ml=logits[mi_l].float()
+        probs=torch.softmax(ml,dim=-1); conf,tk=probs.max(dim=-1)
+        order=torch.argsort(conf,descending=True); cs=conf[order]
+        cumprod=torch.cumprod(cs,dim=0)
+        nidx=torch.arange(1,cs.numel()+1,device=cs.device,dtype=cs.dtype)
+        Ln=(cumprod-(1.0-cs)**(nidx-1)).clamp(min=0.0)
+        Un=1.0-cs
+        qual=(Ln-Un)>delta
+        ncommit=int(qual.nonzero().max().item())+1 if qual.any() else 1
+        commit=torch.zeros_like(conf,dtype=torch.bool); commit[order[:ncommit]]=True
+        commit_c=commit.to(x.device); tk_c=tk.to(x.device)
+        idx=mi.nonzero(as_tuple=False); sel=idx[commit_c]; x[sel[:,0],sel[:,1]]=tk_c[commit_c].to(x.dtype)
+    return x, steps
+
+
+def mdm_generate_threshold(
+    model, input_ids, mask_token_id, max_new_tokens=256, max_steps=256,
+    threshold=0.9, temperature=0.0,
+):
+    """Fast-dLLM-style confidence-threshold MDM decode. Each step, commit every
+    masked position whose top-1 prob >= threshold (at least one, to guarantee
+    progress); defer the rest. Adaptively unmasks confident tokens -> far fewer
+    steps and avoids the parallel joint-marginal jumble that fixed-fraction
+    unmasking causes. Returns (ids, steps_taken)."""
+    device = input_ids.device
+    pad_token_id = getattr(model.config, "pad_token_id", None)
+    x = F.pad(input_ids, (0, max_new_tokens), value=mask_token_id)
+    attn = (x != pad_token_id).long() if pad_token_id is not None else None
+    steps_taken = 0
+    for _ in range(max_steps):
+        mask_index = (x == mask_token_id)
+        if not mask_index.any():
+            break
+        steps_taken += 1
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = model(input_ids=x, attention_mask=attn, is_causal=False).logits
+        logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)  # AR-shift
+        ml = logits[mask_index].float()
+        if temperature and temperature > 0:
+            probs = torch.softmax(ml / temperature, dim=-1)
+            tok = torch.multinomial(probs, 1).squeeze(-1)
+            conf = probs.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
+        else:
+            probs = torch.softmax(ml, dim=-1)
+            conf, tok = probs.max(dim=-1)
+        commit = conf >= threshold
+        if not commit.any():
+            commit = torch.zeros_like(conf, dtype=torch.bool)
+            commit[conf.argmax()] = True
+        idx = mask_index.nonzero(as_tuple=False)
+        sel = idx[commit]
+        x[sel[:, 0], sel[:, 1]] = tok[commit].to(x.dtype)
+    return x, steps_taken
+
+
 def mdm_generate(
     model: torch.nn.Module,
     input_ids: torch.LongTensor,

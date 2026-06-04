@@ -1,0 +1,81 @@
+# LDLM AE-reconstruction validation — Qwen3-1.7B, autoencoder-focused.
+#
+# Tests the LDLM precondition: can a Perceiver autoencoder round-trip text
+# through a compressed continuous latent?  text -> h -> z0 -> h_hat -> tokens.
+# If recon_w_loss (token CE) drops low and the logged reconstructions are
+# coherent, the latent-denoising bet is sound and we scale to 27B. If not,
+# LDLM has the decode problem one level down — learned cheaply.
+#
+# AE-FOCUSED: warmup_steps is set huge so the sigmoid diff_weight stays ~0
+# (gamma_min=0.001) for the whole run — the loss is dominated by the
+# reconstruction terms (L_h + L_w). We are NOT yet training the diffusion
+# head; we're validating the autoencoder alone.
+#
+# 1.7B encoder (bf16 ~3.4GB) + Perceiver AE fit easily on one 5090.
+#
+# Launch (MSI, single GPU):
+#   CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     .venv/bin/torchrun --nproc_per_node=1 tasks/train_ldlm.py \
+#     --config configs/pretrain/vfm_v2_1_7b_ldlm_ae.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3-1.7B
+  attn_implementation: eager
+  ldlm:
+    enabled: true
+    encoder_model_name: /home/johndpope/ds_offload/models/Qwen3-1.7B
+    seq_len: 64               # latent tokens (compress 128-tok input -> 64 latents)
+    depth: 4                  # Perceiver resampler layers
+    decoder_noise_std: 0.0    # NO decoder-input noise for a clean recon test
+    encoder_hidden_layer: -3
+    decoder_num_layers: 3
+    diffusion_head_depth: 4
+    warmup_steps: 1000000     # huge -> diff_weight stays ~0 (AE-only validation)
+    warmup_gamma_min: 0.0     # diffusion fully off during the validation
+    self_condition_prob: 0.5
+    recon_h_weight: 1.0
+    recon_token_weight: 1.0
+    log_interval: 25
+    gen_eval_interval: 250    # log reconstruction samples often
+    log_latent_histograms: true
+    log_samples: true
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data_text.jsonl
+  train_size: 500
+  dataloader_type: native
+  data_type: plaintext
+  max_seq_len: 128
+  text_keys: text
+  drop_last: true
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/ldlm_1.7b_ae_validation
+  data_parallel_mode: ddp
+  ulysses_parallel_size: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  rmpad: false
+  rmpad_with_pos_ids: false
+  optimizer: adamw
+  lr: 3.0e-4
+  lr_warmup_ratio: 0.02
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_steps: 3000
+  num_train_epochs: 100
+  enable_mixed_precision: false
+  enable_gradient_checkpointing: false
+  enable_full_shard: false
+  enable_fsdp_offload: false
+  init_device: cuda
+  empty_cache_steps: 50
+  ckpt_manager: dcp
+  save_steps: 1000
+  save_hf_weights: false
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: ldlm-1.7b-AE-recon-tower

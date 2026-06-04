@@ -234,6 +234,8 @@ def ldlm_forward(autoencoder, diffusion_head, sampler, input_ids, attention_mask
         "t_mean": t.mean(),
         "z0": z0,
         "logits": logits,
+        "h": h,
+        "h_hat": h_hat,
     }
 
 
@@ -622,7 +624,7 @@ def main():
                         )
 
                 # Log reconstruction text samples
-                text_interval = ldlm_cfg.get("log_interval", 50) * 5
+                text_interval = ldlm_cfg.get("log_interval", 50) * 1
                 if global_step % text_interval == 0:
                     try:
                         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -635,10 +637,20 @@ def main():
                                     pred_text = tokenizer.decode(pred_ids[0, :min_t], skip_special_tokens=True)
                                     target_text = tokenizer.decode(target_ids[0, :min_t], skip_special_tokens=True)
                                     match_pct = (pred_ids[0, :min_t] == target_ids[0, :min_t]).float().mean().item() * 100
+                                    logger.info_rank0(f"[recon @{global_step}] match={match_pct:.1f}% | TGT: {target_text[:120]!r} | PRED: {pred_text[:120]!r}")
                                     log_dict["samples/target"] = wandb.Html(
                                         f"<b>Target:</b> {target_text}<br><b>Predicted:</b> {pred_text}<br><b>Token match:</b> {match_pct:.1f}%",
                                         inject=False,
                                     )
+                                    try:
+                                        from veomni.models.ldlm.vis import make_ldlm_tower_fig
+                                        import matplotlib.pyplot as _plt
+                                        _tf = make_ldlm_tower_fig(target_ids, logits, fwd_out.get("h"), fwd_out.get("h_hat"), fwd_out.get("z0"), global_step)
+                                        if _tf is not None:
+                                            log_dict["latents/tower"] = wandb.Image(_tf)
+                                            _plt.close(_tf)
+                                    except Exception as _e:
+                                        logger.info_rank0(f"[tower] skipped: {_e}")
                     except Exception:
                         pass
 

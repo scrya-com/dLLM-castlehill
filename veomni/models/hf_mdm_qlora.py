@@ -499,6 +499,16 @@ class MDMQLoRAWrapper(nn.Module):
         # (56->64), more stable on a warm-started model.
         self.cascade_curriculum_steps = 0
         self._cascade_step = 0
+        # v14 latent reconstruction (denoising) — OFF unless enabled.
+        self.cascade_recon_mode = False
+        self.cascade_corrupt_std = 0.0
+        self.cascade_decode_wt = 0.0
+        self.cascade_num_sample_pairs = 0
+        # data2vec EMA self-teacher (arxiv 2605.27734) — paper-aligned target
+        self.cascade_ema_teacher = False
+        self.ema_lora_alpha = 0.999
+        self._ema_lora = None
+        self.cascade_tail_pairs = 1   # # of final (dense tail) pairs always trained
         # VFM gradient scale (to counteract 64-layer attenuation to input embeds).
         # Applied via hook on the *delta* tensor (after cross-device to() for UNet).
         # 1.0 = no scale; 10-50× common for deep stacks when delta stays ~0.
@@ -563,6 +573,106 @@ class MDMQLoRAWrapper(nn.Module):
         if n == 0:
             return torch.tensor(0.0, device=input_ids.device), 0.0
         return total / n, cos_acc / n
+
+    def _latent_recon_loss(self, student_hiddens, teacher_hiddens, labels, input_ids):
+        """v14: per-layer latent RECONSTRUCTION (denoising). Corrupt the student
+        latent at L_i with Gaussian noise (cascade_corrupt_std x per-feature std)
+        and reconstruct the CLEAN teacher latent t[L_{i+1}] (MSE + 1-cos). When
+        cascade_decode_wt>0, also decode the reconstructed FINAL-layer latent
+        through the frozen lm_head and return token CE — this ties the
+        reconstruction to the generation path (the layer that feeds lm_head)."""
+        layers = list(self.align_layers)
+        all_pairs = list(zip(layers[:-1], layers[1:]))
+        if self.training:
+            self._cascade_step += 1
+        # Carry the ORIGINAL pair index (= layer_embed id) through curriculum
+        # and sampling so the cascade head's per-pair embedding stays correct.
+        ipairs = list(enumerate(all_pairs))   # [(orig_i, (src, dst))]
+        cur = getattr(self, "cascade_curriculum_steps", 0)
+        if cur and cur > 0:
+            frac = min(1.0, self._cascade_step / float(cur))
+            ipairs = ipairs[:max(1, int(round(frac * len(ipairs))))]
+        # Memory: sample k pairs/step but ALWAYS keep the final pair (->L64) so
+        # the decode-CE term stays live every step. Over training all pairs are
+        # covered (same trick as repr_align layer subsampling).
+        k = getattr(self, "cascade_num_sample_pairs", 0)
+        tail = max(1, int(getattr(self, "cascade_tail_pairs", 1)))
+        if self.training and k and 0 < k < len(ipairs):
+            n_p = len(ipairs)
+            keep = set(range(max(0, n_p - tail), n_p))   # dense tail (last `tail` pairs) — always trained
+            pool = [j for j in range(n_p) if j not in keep]
+            n_extra = max(0, k - len(keep))
+            if pool and n_extra > 0:
+                pick = torch.randperm(len(pool))[:n_extra].tolist()
+                keep |= {pool[j] for j in pick}
+            ipairs = [ipairs[j] for j in sorted(keep)]
+        lbl, loss_mask = None, None
+        if labels is not None:
+            lbl = labels if labels.dim() == 2 else labels.view(input_ids.size(0), -1)
+            loss_mask = (lbl[:, 1:].reshape(-1) != IGNORE_INDEX)
+        std = getattr(self, "cascade_corrupt_std", 0.0)
+        final_layer = layers[-1]
+        # Cap masked positions/pair to bound activations + the [<=128, vocab] decode.
+        _max_pos = 128
+        total, n, cos_acc, decode_ce = 0.0, 0, 0.0, None
+        for pair_i, (src, dst) in ipairs:
+            h = student_hiddens[src][:, :-1, :].reshape(-1, student_hiddens[src].size(-1)).float()
+            t = teacher_hiddens[dst][:, :-1, :].reshape(-1, teacher_hiddens[dst].size(-1)).float()
+            h = h.to(t.device)  # device_map: src layer may live on another GPU
+            tgt = lbl[:, 1:].reshape(-1) if lbl is not None else None
+            if loss_mask is not None and loss_mask.any():
+                h, t = h[loss_mask], t[loss_mask]
+                if tgt is not None:
+                    tgt = tgt[loss_mask]
+            if h.numel() == 0:
+                continue
+            if h.size(0) > _max_pos:
+                _sel = torch.randperm(h.size(0), device=h.device)[:_max_pos]
+                h, t = h[_sel], t[_sel]
+                if tgt is not None:
+                    tgt = tgt[_sel]
+            if std > 0 and self.training and h.size(0) >= 2:
+                h = h + torch.randn_like(h) * (std * h.std(dim=0, unbiased=False, keepdim=True).clamp(min=1e-6))
+            pred = self.latent_cascade(h.to(self.latent_cascade.up.weight.dtype), pair_i).float()
+            cos = (F.normalize(pred, dim=-1) * F.normalize(t, dim=-1)).sum(-1)
+            total = total + F.mse_loss(pred, t) + (1.0 - cos).mean()
+            cos_acc += cos.mean().item(); n += 1
+            if dst == final_layer and getattr(self, "cascade_decode_wt", 0.0) > 0 and tgt is not None and tgt.numel() > 0:
+                _dn = min(128, pred.size(0))
+                _td = tgt[:_dn]
+                if (_td != IGNORE_INDEX).any():   # all-IGNORE (zero-mask step) -> CE is NaN; skip
+                    lm_head = self.base.get_output_embeddings()
+                    _ldev = lm_head.weight.device
+                    logits_r = lm_head(pred[:_dn].to(device=_ldev, dtype=lm_head.weight.dtype)).float()
+                    decode_ce = F.cross_entropy(logits_r, _td.to(_ldev))
+        if n == 0:
+            return torch.tensor(0.0, device=input_ids.device), 0.0, None
+        return total / n, cos_acc / n, decode_ce
+
+    def _ema_teacher_forward(self, input_ids, attention_mask, position_ids):
+        """data2vec EMA self-teacher (arxiv 2605.27734). Target latents = an EMA
+        of the student's own LoRA adapters, run no-grad on the CLEAN input. The
+        base is frozen/shared, so the EMA teacher is just an EMA of the (tiny)
+        LoRA params. In-distribution target, unlike the frozen AR anchor cache."""
+        lp = [(n, p) for n, p in self.base.named_parameters() if p.requires_grad]
+        a = float(getattr(self, "ema_lora_alpha", 0.999))
+        if self._ema_lora is None:
+            self._ema_lora = {n: p.detach().clone() for n, p in lp}
+        elif self.training:
+            for n, p in lp:
+                self._ema_lora[n].mul_(a).add_(p.detach(), alpha=1.0 - a)
+        backup = {n: p.detach().clone() for n, p in lp}
+        try:
+            for n, p in lp:
+                p.data.copy_(self._ema_lora[n])
+            with torch.no_grad():
+                out = self.base(input_ids=input_ids, attention_mask=attention_mask,
+                                position_ids=position_ids, use_cache=False,
+                                output_hidden_states=True)
+            return [h.detach() for h in out.hidden_states]
+        finally:
+            for n, p in lp:
+                p.data.copy_(backup[n])
 
     def forward(self, input_ids=None, labels=None, attention_mask=None,
                 position_ids=None, mask_ratio=None, repr_align_wt=0.0,
@@ -700,13 +810,16 @@ class MDMQLoRAWrapper(nn.Module):
         logits = out.logits
         loss = None
         comps = {}
+        # device_map: logits sit on the lm_head GPU; labels arrive on cuda:0.
+        _labels_ld = labels.to(logits.device) if labels is not None else None
         if labels is not None:
             loss, mdm, path, anti_rep = _mdm_loss(
-                logits, labels,
+                logits, _labels_ld,
                 mask_ratio=mask_ratio,
                 min_snr_gamma=getattr(self, "min_snr_gamma", None),
                 anti_rep_wt=getattr(self, "anti_rep_wt", 0.0),
             )
+            loss = loss.to(input_ids.device)  # canonical loss device for accumulation
             comps = {"mdm": float(mdm), "path": float(path)}
             if getattr(self, "anti_rep_wt", 0.0) > 0:
                 comps["anti_rep"] = float(anti_rep)
@@ -716,7 +829,7 @@ class MDMQLoRAWrapper(nn.Module):
             # compare argmax(logits[:, :-1]) to labels[:, 1:] on non-IGNORE
             # (= MDM-masked) positions only.
             with torch.no_grad():
-                _lbl2d = labels if labels.dim() == 2 else labels.view(logits.size(0), -1)
+                _lbl2d = _labels_ld if _labels_ld.dim() == 2 else _labels_ld.view(logits.size(0), -1)
                 _pred = logits[:, :-1, :].argmax(dim=-1)      # [B, L-1]
                 _tgt = _lbl2d[:, 1:]                            # [B, L-1]
                 _m = (_tgt != IGNORE_INDEX)
@@ -732,8 +845,12 @@ class MDMQLoRAWrapper(nn.Module):
         if _repr_align_active:
             student_hiddens = out.hidden_states
             teacher_inputs = casual_input_ids if casual_input_ids is not None else input_ids
-            teacher_out = self.teacher_model(input_ids=teacher_inputs, position_ids=position_ids)
-            teacher_hiddens = teacher_out.hidden_states
+            if getattr(self, "cascade_ema_teacher", False):
+                # data2vec EMA self-teacher: in-distribution target (paper 2605.27734)
+                teacher_hiddens = self._ema_teacher_forward(teacher_inputs, attention_mask, position_ids)
+            else:
+                teacher_out = self.teacher_model(input_ids=teacher_inputs, position_ids=position_ids)
+                teacher_hiddens = teacher_out.hidden_states
 
             # Build loss_mask from CLEAN (unmasked) positions — align where both
             # student and teacher see real tokens, not VFM smart-noise.
@@ -787,6 +904,7 @@ class MDMQLoRAWrapper(nn.Module):
             for layer_idx in _step_align_layers:
                 s = student_hiddens[layer_idx][:, :-1, :].float().squeeze(0)  # [L-1, D]
                 t = teacher_hiddens[layer_idx][:, :-1, :].float().squeeze(0)
+                s = s.to(t.device)  # device_map: late student layers on another GPU
                 if loss_mask is not None and loss_mask.any():
                     s = s[loss_mask]
                     t = t[loss_mask]
@@ -837,12 +955,21 @@ class MDMQLoRAWrapper(nn.Module):
             # student/teacher hidden_states already materialised above. Runs
             # ALONGSIDE repr_align (anchor) — complementary transition signal.
             if self.latent_cascade is not None and self.latent_cascade_wt > 0:
-                casc_loss, casc_cos = self._latent_cascade_loss(
-                    student_hiddens, teacher_hiddens, labels, input_ids)
+                if getattr(self, "cascade_recon_mode", False):
+                    casc_loss, casc_cos, _decode_ce = self._latent_recon_loss(
+                        student_hiddens, teacher_hiddens, labels, input_ids)
+                else:
+                    casc_loss, casc_cos = self._latent_cascade_loss(
+                        student_hiddens, teacher_hiddens, labels, input_ids)
+                    _decode_ce = None
                 _casc_term = self.latent_cascade_wt * casc_loss
                 loss = (_casc_term if loss is None else loss + _casc_term)
                 comps["latent_cascade"] = float(casc_loss.detach())
                 comps["latent_cascade_cos"] = casc_cos
+                if _decode_ce is not None:
+                    _dwt = getattr(self, "cascade_decode_wt", 0.0)
+                    loss = loss + _dwt * _decode_ce.to(loss.device)
+                    comps["cascade_decode_ce"] = float(_decode_ce.detach())
 
             # 16-story latent tower viz data (vis steps only). Capture per-layer,
             # ALL 16 cached layers (not subsampled), masked positions:
@@ -856,26 +983,34 @@ class MDMQLoRAWrapper(nn.Module):
                         labels.view(input_ids.size(0), -1) if labels is not None else None)
                     _mask = (_lbl[:, 1:].reshape(-1) != IGNORE_INDEX) if _lbl is not None else None
                     _tower = {}
+                    # clean positions = what repr_align actually optimizes (loss_mask);
+                    # fall back to "not masked" if unavailable.
+                    _clean = loss_mask if loss_mask is not None else ((~_mask) if _mask is not None else None)
+                    def _cos48(a, b):
+                        ac = (F.normalize(a, dim=-1) * F.normalize(b, dim=-1)).sum(-1)
+                        return ac.mean().item(), ac[:48].detach().cpu()
                     for _i, _li in enumerate(_layers):
                         s = student_hiddens[_li][:, :-1, :].reshape(-1, student_hiddens[_li].size(-1)).float()
-                        t = teacher_hiddens[_li][:, :-1, :].reshape(-1, teacher_hiddens[_li].size(-1)).float()
-                        if _mask is not None and _mask.any():
-                            s, t = s[_mask], t[_mask]
-                        if s.numel() == 0:
-                            continue
-                        align_cos = (F.normalize(s, dim=-1) * F.normalize(t, dim=-1)).sum(-1)  # [N]
-                        entry = {"align_cos_mean": align_cos.mean().item(),
-                                 "align_cos_tokens": align_cos[:48].detach().cpu()}
-                        # cascade prediction quality for this layer -> next cached layer
-                        if self.latent_cascade is not None and _i < len(_layers) - 1:
-                            t_next = teacher_hiddens[_layers[_i + 1]][:, :-1, :].reshape(-1, t.size(-1)).float()
-                            if _mask is not None and _mask.any():
-                                t_next = t_next[_mask]
-                            pred = self.latent_cascade(s.to(self.latent_cascade.up.weight.dtype), _i).float()
-                            cc = (F.normalize(pred, dim=-1) * F.normalize(t_next, dim=-1)).sum(-1)
-                            entry["casc_cos_mean"] = cc.mean().item()
-                            entry["casc_cos_tokens"] = cc[:48].detach().cpu()
-                        _tower[_li] = entry
+                        t = teacher_hiddens[_li][:, :-1, :].reshape(-1, teacher_hiddens[_li].size(-1)).float().to(s.device)
+                        _mk = _mask.to(s.device) if _mask is not None else None
+                        _ck = _clean.to(s.device) if _clean is not None else None
+                        entry = {}
+                        # masked-position alignment (the hard case)
+                        if _mk is not None and _mk.any():
+                            _m, _c = _cos48(s[_mk], t[_mk])
+                            entry["align_cos_mean"], entry["align_cos_tokens"] = _m, _c
+                        # clean-position alignment (what the loss optimizes -> should be greener)
+                        if _ck is not None and _ck.any():
+                            _m, _c = _cos48(s[_ck], t[_ck])
+                            entry["align_clean_cos_mean"], entry["align_clean_cos_tokens"] = _m, _c
+                        # cascade predict-next (masked positions)
+                        if self.latent_cascade is not None and _i < len(_layers) - 1 and _mk is not None and _mk.any():
+                            t_next = teacher_hiddens[_layers[_i + 1]][:, :-1, :].reshape(-1, t.size(-1)).float().to(s.device)[_mk]
+                            pred = self.latent_cascade(s[_mk].to(self.latent_cascade.up.weight.dtype), _i).float()
+                            _m, _c = _cos48(pred, t_next)
+                            entry["casc_cos_mean"], entry["casc_cos_tokens"] = _m, _c
+                        if entry:
+                            _tower[_li] = entry
                     if self._vis_data is None or not isinstance(self._vis_data, dict):
                         self._vis_data = {}
                     self._vis_data["latent_tower"] = _tower
@@ -916,6 +1051,19 @@ class MDMQLoRAWrapper(nn.Module):
                         "t_layers": [t.detach().cpu() for t in _t_layers],
                         "layer_indices": list(_step_align_layers),
                     }
+                    # Fixed-layer capture for per-layer PCA panels: consistent
+                    # across vis steps + focused on the generation-critical tail.
+                    _pca = {}
+                    for _pl in [8, 60, 62, 64]:
+                        if _pl < len(student_hiddens) and _pl < len(teacher_hiddens):
+                            _ps = student_hiddens[_pl][:, :-1, :].reshape(-1, student_hiddens[_pl].size(-1)).float()
+                            _pt = teacher_hiddens[_pl][:, :-1, :].reshape(-1, teacher_hiddens[_pl].size(-1)).float().to(_ps.device)
+                            if loss_mask is not None and loss_mask.any():
+                                _lm = loss_mask.to(_ps.device)
+                                _ps, _pt = _ps[_lm], _pt[_lm]
+                            if _ps.numel() > 0:
+                                _pca[_pl] = (_ps[:200].detach().cpu(), _pt[:200].detach().cpu())
+                    self._vis_data["pca_layers"] = _pca
                     self._vis_step = False
 
         return SimpleNamespace(loss=loss, logits=logits, loss_components=comps)
@@ -951,6 +1099,7 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
     _dev_map = {"": device}
     if device == "auto":
         _max_mem = _qcfg.get("max_memory", {0: "24GiB", 1: "24GiB"})
+        _max_mem = {int(k): v for k, v in _max_mem.items()}  # JSON round-trip stringifies int keys; from_pretrained needs ints
         _dev_map = "auto"
     else:
         _max_mem = None
@@ -991,6 +1140,12 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
             bias=cfg.get("bias", "none"),
         )
         base = get_peft_model(base, lora)
+    if cfg.get("freeze_mlp_lora", False):
+        _fr = 0
+        for _n, _p in base.named_parameters():
+            if _p.requires_grad and any(_m in _n for _m in ("gate_proj", "up_proj", "down_proj")):
+                _p.requires_grad_(False); _fr += 1
+        print(f"[hf_mdm_qlora] freeze_mlp_lora: froze {_fr} MLP LoRA tensors -> attention-only updates")
     base.print_trainable_parameters()
     wrapper = MDMQLoRAWrapper(base)
     if align_layers is not None:
@@ -1148,6 +1303,13 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
             ).to(device=wrapper.base.get_input_embeddings().weight.device, dtype=torch.bfloat16)
             wrapper.latent_cascade_wt = float(_qcfg.get("cascade_wt", 0.5))
             wrapper.cascade_curriculum_steps = int(_qcfg.get("cascade_curriculum_steps", 0))
+            wrapper.cascade_recon_mode = bool(_qcfg.get("cascade_recon_mode", False))
+            wrapper.cascade_corrupt_std = float(_qcfg.get("cascade_corrupt_std", 0.0))
+            wrapper.cascade_decode_wt = float(_qcfg.get("cascade_decode_wt", 0.0))
+            wrapper.cascade_num_sample_pairs = int(_qcfg.get("cascade_num_sample_pairs", 0))
+            wrapper.cascade_ema_teacher = bool(_qcfg.get("cascade_ema_teacher", False))
+            wrapper.ema_lora_alpha = float(_qcfg.get("ema_lora_alpha", 0.999))
+            wrapper.cascade_tail_pairs = int(_qcfg.get("cascade_tail_pairs", 1))
             _np = sum(p.numel() for p in wrapper.latent_cascade.parameters())
             print(f"[hf_mdm_qlora] LatentCascadeHead: {_np:,} params, {n_pairs} skip-{wrapper.align_layers[1]-wrapper.align_layers[0]} "
                   f"pairs, wt={wrapper.latent_cascade_wt}, curriculum={wrapper.cascade_curriculum_steps} steps")

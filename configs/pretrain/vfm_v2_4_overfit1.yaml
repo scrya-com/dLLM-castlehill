@@ -1,0 +1,77 @@
+# VFM v2.4 — smart-noise-seeded iterative refinement (the hybrid)
+#
+# THE key idea: the adapter produces smart initial embeddings (smart noise),
+# then the model iteratively refines them — committing high-confidence
+# completion positions and re-reading — instead of trying to one-shot the
+# whole answer. This is masked-diffusion / iterative-refinement training,
+# but seeded from the adapter's smart noise instead of all-[MASK].
+#
+# Why this breaks the loss_data≈5 one-shot ceiling:
+#   - One-shot NAR (v2.0-v2.3) must commit to all C tokens in a single pass
+#     → can't resolve multimodality → ~5% top-1 ceiling.
+#   - Refinement lets the model commit the easy/confident tokens first, then
+#     re-read them as clean context to disambiguate the hard ones. Each pass
+#     fixes the previous pass's errors.
+#   - Seeding from smart noise (vs all-[MASK]) means the FIRST pass is already
+#     a good guess, so few steps converge → the speedup is preserved.
+#
+# Training: each step randomly commits a U(0,1) fraction of completion
+# positions to their true token embeddings (context); the rest stay smart
+# noise; loss is on the noisy positions only. Inference: generate_refine()
+# starts all-smart-noise, commits confident positions per step.
+#
+# Uses the v2.3 self-attention decoder adapter (kept — it composes with
+# refinement; self-attn lets the adapter produce a coherent smart-noise init).
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3-1.7B
+  attn_implementation: sdpa
+  freeze_llm: false
+  lora:
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+    use_rslora: true
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+vfm:
+  variational: false
+  refinement_training: true   # ← v2.4 key change
+  adapter_layers: 4
+  adapter_heads: 8
+  adapter_dropout: 0.1
+  adapter_intermediate_size: 8192
+  max_completion_len: 512
+  tau: 1.0
+  sigma: 1.0
+  kl_weight_final: 0.0
+  kl_weight_warmup_steps: 0
+  ar_shift: true
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data_overfit1.jsonl
+  max_prompt_len: 256
+  max_completion_len: 512
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v2_4_overfit1
+  lr: 1e-3
+  weight_decay: 0.01
+  max_steps: 800
+  micro_batch_size: 1
+  global_batch_size: 1
+  log_every: 10
+  recon_every: 25
+  recon_num_probes: 1
+  save_every: 100000
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v2-4-overfit1
