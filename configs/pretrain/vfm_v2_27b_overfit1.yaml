@@ -30,7 +30,7 @@ model:
   gpu0_mem: "16GiB"   # 5090 (32 GB): overflow layers + lm_head + LoRA + adapter + optimizer
 
 vfm:
-  variational: false
+  variational: true
   refinement_training: true   # ← the v2.4 breakthrough, now on 27B
   adapter_layers: 2
   adapter_heads: 8
@@ -39,8 +39,9 @@ vfm:
   max_completion_len: 512
   tau: 1.0
   sigma: 1.0
-  kl_weight_final: 0.0
-  kl_weight_warmup_steps: 0
+  kl_weight_final: 0.001    # Fix 2: small KL anchors mu near N(0,I) — prevents off-manifold explosion
+  kl_weight_warmup_steps: 0   # 50-step run — no warmup needed
+  mu_reg_lambda: 0.001      # Fix 1: L2 penalty on mu_norm (config-driven, not hard-coded)
   ar_shift: true
 
 data:

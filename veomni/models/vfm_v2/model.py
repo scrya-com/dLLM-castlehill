@@ -227,6 +227,7 @@ class VFMv2(nn.Module):
         ar_shift: bool = True,
         variational: bool = True,
         refinement_training: bool = False,
+        mu_reg_lambda: float = 0.0,
     ):
         """
         Args:
@@ -243,6 +244,9 @@ class VFMv2(nn.Module):
                 matches Qwen3.6's AR-pretrained LM head + the MDM loss in
                 hf_mdm_qlora.py. If your LLM has a non-shifted (BERT-like)
                 head, set False.
+            mu_reg_lambda: L2 penalty weight on the mean μ-vector norm.
+                Prevents mu_norm explosion when variational=False removes
+                the KL anchor. Set in config (vfm.mu_reg_lambda). 0 = off.
         """
         super().__init__()
         self.llm = llm
@@ -258,6 +262,15 @@ class VFMv2(nn.Module):
         self.tau = tau
         self.sigma = sigma
         self.kl_weight = kl_weight
+        self.mu_reg_lambda = mu_reg_lambda
+
+        # Mean L2 norm of the token embedding table — the target zone for mu.
+        # Computed once at init; stored as a plain float to avoid device issues
+        # in dual-GPU mode (LLM on cuda:1, adapter on cuda:0).
+        with torch.no_grad():
+            embed_norms = llm.get_input_embeddings().weight.float().norm(dim=-1)
+            self._embed_norm = float(embed_norms.mean().item())
+        print(f"[VFMv2] token embedding mean norm: {self._embed_norm:.3f}")
         self.ar_shift = ar_shift
         # variational=False: use μ directly, no sampling, no KL. The model
         # becomes a deterministic encoder-decoder where the adapter directly
@@ -456,10 +469,17 @@ class VFMv2(nn.Module):
             loss_kl = torch.zeros((), device=logits.device, dtype=loss_data.dtype)
 
         # 6. Total — paper's eq 19 with our hyperparameter naming
+        # Target-norm regularization: penalize squared deviation of mu's L2 norm
+        # from the token embedding manifold scale. This creates a basin of
+        # attraction at the right scale — pulls up when too small (prev fix went
+        # from norm=54 to 1.64, both off-manifold), pulls down when too large.
+        # Unlike the pure L2 penalty (which always pulls toward 0), this is stable.
+        loss_mu_reg = (mu.norm(dim=-1) - self._embed_norm).pow(2).mean()
         total = (
             (1.0 / (2.0 * self.tau ** 2)) * loss_data
             + (1.0 / (2.0 * self.sigma ** 2)) * loss_obs
             + self.kl_weight * loss_kl
+            + self.mu_reg_lambda * loss_mu_reg
         )
 
         return {
@@ -467,6 +487,7 @@ class VFMv2(nn.Module):
             "loss_data": loss_data.detach(),
             "loss_obs": loss_obs.detach(),
             "loss_kl": loss_kl.detach(),
+            "loss_mu_reg": loss_mu_reg.detach(),
             "mu_norm": mu.detach().norm(dim=-1).mean(),
             "sigma_mean": log_sigma.detach().exp().mean(),
             "masked_top1_acc": masked_top1_acc.detach(),
@@ -568,6 +589,7 @@ class VFMv2(nn.Module):
         commit_rule: str = "threshold",
         delta: float = 0.5,
         prompt_cache: bool = False,
+        vocab_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Smart-noise-seeded confidence-threshold refinement decode.
 
@@ -628,6 +650,8 @@ class VFMv2(nn.Module):
                 )
             _lg = outputs.logits.to(next(self.adapter.parameters()).device)  # [B, C+1, V]
             completion_logits = _lg[:, :-1, :] if self.ar_shift else _lg[:, 1:, :]
+            if vocab_bias is not None:
+                completion_logits = completion_logits + vocab_bias.to(completion_logits.device)
             probs = torch.softmax(completion_logits.float(), dim=-1)
             conf, argmax = probs.max(dim=-1)  # [B, C]
 

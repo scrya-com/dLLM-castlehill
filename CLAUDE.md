@@ -8,7 +8,16 @@ Before implementing:
 - If a simpler approach exists, say so. Push back when warranted.
 - If something is unclear, stop. Name what's confusing. Ask.
 
-## 2. Simplicity First
+## 2. Config-Driven Values
+
+**No magic numbers in equations. Every tunable scalar lives in a config.**
+
+- Loss weights, learning rates, regularization lambdas, thresholds, scales — all in YAML.
+- Model code reads from `self.mu_reg_lambda`, `self.kl_weight`, etc. — never literal `0.001`.
+- The only acceptable literals in equations are mathematical constants (0.5, 2.0 for the KL formula) and documented paper constants.
+- When adding a new loss term, add the weight to the config first, then wire it in code.
+
+## 3. Simplicity First
 
 **Minimum code that solves the problem. Nothing speculative.**
 

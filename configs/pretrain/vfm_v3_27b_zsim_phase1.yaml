@@ -1,0 +1,61 @@
+# VFM v3 z_sim Phase 1 — z_proj convergence (frozen LoRA)
+#
+# Goal: train z_proj to output z ≈ embed(true_token) for every position.
+# LoRA is frozen so it can't be disrupted. Only z_proj (26M params) trains.
+# z_sim_lambda=1.0 gives strong direct signal; CE loss is there but LoRA
+# can't update, so CE degrading is irrelevant.
+#
+# Expected: zsim drops from ~0.986 → ~0.1 within 200 steps.
+#
+# Launch:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#       .venv/bin/python tasks/train_vfm_v2.py \
+#       configs/pretrain/vfm_v3_27b_zsim_phase1.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  freeze_llm: false
+  lora_resume_path: /home/johndpope/ds_offload/checkpoints/vfm_v3_27b_zsim_phase1/checkpoints/lora_step_200
+  freeze_lora: true               # frozen — z_proj gets clean z_sim signal
+  adapter_resume_path: /home/johndpope/ds_offload/checkpoints/vfm_v3_27b_zsim_phase1/checkpoints/adapter_step_200.pt
+  dual_gpu: true
+  gpu1_mem: "13GiB"
+  gpu0_mem: "16GiB"
+
+vfm:
+  version: 3
+  z_layer: 32
+  refinement_training: false
+  ar_shift: true
+  z_norm_lambda: 0.0
+  z_sim_lambda: 1.0               # strong direct signal: z_proj → embed(true_token)
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_prompt_len: 256
+  max_completion_len: 512
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v3_27b_zsim_phase1
+  lr: 5e-4
+  warmup_steps: 0
+  weight_decay: 0.01
+  max_steps: 500
+  micro_batch_size: 1
+  global_batch_size: 1
+  use_8bit_adam: true
+  log_every: 10
+  save_every: 500                 # save once at end
+  recon_every: 100
+  recon_num_probes: 2
+  recon_steps: 8
+  recon_threshold: 0.7
+  recon_early_exit_steps: 2
+  recon_prior_rounds: 0
+  recon_vocab_restrict: true
+  recon_vocab_min_freq: 5
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v3-27b-zsim-phase1

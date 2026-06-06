@@ -1,0 +1,62 @@
+# VFM v3 — LLM hidden-state prior, 27B overfit probe
+#
+# Key difference from v2: no separate 1.1B adapter.
+# Pass 1 (no-grad): [prompt | mask_embed*C] → LLM → hidden_states[z_layer=32]
+# Pass 2 (grad):    [prompt | z_proj(hidden)] → LLM → CE loss
+# Trainable: mask_embed (5k) + z_proj (26M) + LoRA (58M) = ~84M total
+#
+# Overfit test: same 500 samples as v2, same prompts.
+# Expect fast convergence (no 1B adapter to warm up), and crucially:
+# held-out generalization should work because pass 1 uses pretrained LLM knowledge.
+#
+# Launch:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#       .venv/bin/python tasks/train_vfm_v2.py \
+#       configs/pretrain/vfm_v3_27b_overfit1.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  freeze_llm: false
+  lora_resume_path: /home/johndpope/ds_offload/checkpoints/vfm_v2_27b_dual_refine/checkpoints/lora_step_12000
+  dual_gpu: true
+  gpu1_mem: "13GiB"
+  gpu0_mem: "16GiB"
+
+vfm:
+  version: 3                    # ← VFMv3
+  z_layer: 32                   # middle of 64 Qwen3.6-27B layers
+  refinement_training: true
+  ar_shift: true
+  z_norm_lambda: 0.00001
+  # v2-only keys below are ignored for v3 but kept for reference
+  adapter_layers: 2
+  adapter_heads: 8
+  max_completion_len: 512
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_prompt_len: 256
+  max_completion_len: 512
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v3_27b_overfit1
+  lr: 2e-4
+  warmup_steps: 50   # linear 0→lr over 50 steps; prevents Adam cold-start explosion on warm-started LoRA
+  weight_decay: 0.01
+  max_steps: 500      # overfit probe: converge fast or fail fast
+  micro_batch_size: 1
+  global_batch_size: 1
+  use_8bit_adam: true
+  log_every: 10
+  save_every: 250
+  recon_every: 100
+  recon_num_probes: 2
+  recon_steps: 8
+  recon_threshold: 0.7
+  recon_early_exit_steps: 2   # stop when all Voronoi cells stable for N steps (0=off)
+  recon_prior_rounds: 2       # iterative Pass 1 rounds before refinement (breaks chicken-and-egg)
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v3-27b-overfit1

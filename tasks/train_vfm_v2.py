@@ -25,7 +25,7 @@ from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_t
 
 # Make `veomni` importable when launching from the repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from veomni.models.vfm_v2 import VFMv2
+from veomni.models.vfm_v2 import VFMv2, VFMv3
 
 
 def load_config(path):
@@ -78,12 +78,16 @@ def collate(batch):
 
 
 def _save_checkpoint(model, out_dir, step):
-    """Save VFM adapter state dict + LoRA adapter (if trainable) at the given step."""
+    """Save prior params + LoRA adapter at the given step. Handles both VFMv2 and VFMv3."""
     ckpt_dir = out_dir / "checkpoints"
     ckpt = ckpt_dir / f"adapter_step_{step}.pt"
-    torch.save(model.adapter.state_dict(), ckpt)
-    print(f"[vfm_v2] saved VFM adapter → {ckpt}")
-    # If the LLM has trainable LoRA weights, save them alongside the adapter.
+    if isinstance(model, VFMv3):
+        torch.save({"mask_embed": model.mask_embed.data,
+                    "z_proj": model.z_proj.state_dict()}, ckpt)
+        print(f"[vfm_v3] saved prior params → {ckpt}")
+    else:
+        torch.save(model.adapter.state_dict(), ckpt)
+        print(f"[vfm_v2] saved VFM adapter → {ckpt}")
     from peft import PeftModel as _PeftModel
     if isinstance(model.llm, _PeftModel):
         lora_dir = ckpt_dir / f"lora_step_{step}"
@@ -143,8 +147,12 @@ def main():
         # We set up the necessary pieces manually:
         base_llm.config.use_cache = False
         if lora_resume_path:
-            print(f"[vfm_v2] WARM-START LoRA from {lora_resume_path}")
-            llm = PeftModel.from_pretrained(base_llm, lora_resume_path, is_trainable=True)
+            freeze_lora = m_cfg.get("freeze_lora", False)
+            print(f"[vfm_v2] {'FROZEN' if freeze_lora else 'WARM-START'} LoRA from {lora_resume_path}")
+            llm = PeftModel.from_pretrained(base_llm, lora_resume_path, is_trainable=not freeze_lora)
+            if freeze_lora:
+                for p in llm.parameters():
+                    p.requires_grad = False
         else:
             lora_cfg = m_cfg.get("lora", {})
             targets = lora_cfg.get("target_modules", [
@@ -183,28 +191,41 @@ def main():
     )
     print(f"[vfm_v2] hidden_size={hidden_size}")
 
-    model = VFMv2(
-        llm=llm,
-        hidden_size=hidden_size,
-        adapter_layers=v_cfg["adapter_layers"],
-        adapter_heads=v_cfg["adapter_heads"],
-        adapter_dropout=v_cfg.get("adapter_dropout", 0.1),
-        adapter_intermediate_size=v_cfg.get("adapter_intermediate_size", None),
-        max_completion_len=v_cfg["max_completion_len"],
-        tau=v_cfg.get("tau", 1.0),
-        sigma=v_cfg.get("sigma", 1.0),
-        kl_weight=0.0,  # we anneal manually below; start at 0
-        ar_shift=v_cfg.get("ar_shift", True),
-        variational=v_cfg.get("variational", True),
-        refinement_training=v_cfg.get("refinement_training", False),
-    )
-    # Move ONLY the adapter to GPU — the LLM is already device-mapped via NF4.
-    # Keep the adapter in bf16 to match the LLM's bf16 embedding outputs. The
-    # earlier fp32 cast caused a LayerNorm dtype mismatch (fp32 weight vs
-    # bf16 input). For more numerical headroom, switch to fused AdamW with
-    # bf16 master weights or upgrade to amp later.
-    model.adapter.to(device=device, dtype=torch.bfloat16)
-    print(f"[vfm_v2] adapter params: {sum(p.numel() for p in model.adapter.parameters() if p.requires_grad):,}")
+    vfm_version = int(v_cfg.get("version", 2))
+    if vfm_version == 3:
+        model = VFMv3(
+            llm=llm,
+            hidden_size=hidden_size,
+            z_layer=int(v_cfg.get("z_layer", 32)),
+            ar_shift=v_cfg.get("ar_shift", True),
+            refinement_training=v_cfg.get("refinement_training", False),
+            z_norm_lambda=float(v_cfg.get("z_norm_lambda", 0.001)),
+            z_sim_lambda=float(v_cfg.get("z_sim_lambda", 0.0)),
+        )
+        # Move only the tiny trainable params to device; LLM is already placed.
+        model.mask_embed.data = model.mask_embed.data.to(device=device, dtype=torch.bfloat16)
+        model.z_proj.to(device=device, dtype=torch.bfloat16)
+        n_adapter = sum(p.numel() for p in [model.mask_embed] + list(model.z_proj.parameters()))
+        print(f"[vfm_v3] trainable prior params: {n_adapter:,}  (mask_embed + z_proj)")
+    else:
+        model = VFMv2(
+            llm=llm,
+            hidden_size=hidden_size,
+            adapter_layers=v_cfg["adapter_layers"],
+            adapter_heads=v_cfg["adapter_heads"],
+            adapter_dropout=v_cfg.get("adapter_dropout", 0.1),
+            adapter_intermediate_size=v_cfg.get("adapter_intermediate_size", None),
+            max_completion_len=v_cfg["max_completion_len"],
+            tau=v_cfg.get("tau", 1.0),
+            sigma=v_cfg.get("sigma", 1.0),
+            kl_weight=0.0,  # we anneal manually below; start at 0
+            ar_shift=v_cfg.get("ar_shift", True),
+            variational=v_cfg.get("variational", True),
+            refinement_training=v_cfg.get("refinement_training", False),
+            mu_reg_lambda=float(v_cfg.get("mu_reg_lambda", 0.0)),
+        )
+        model.adapter.to(device=device, dtype=torch.bfloat16)
+        print(f"[vfm_v2] adapter params: {sum(p.numel() for p in model.adapter.parameters() if p.requires_grad):,}")
 
     # Data
     ds = PromptResponseDataset(
@@ -212,6 +233,20 @@ def main():
         d_cfg["max_prompt_len"], d_cfg["max_completion_len"],
     )
     print(f"[vfm_v2] dataset: {len(ds)} rows")
+
+    # Build active vocab tensor from training completions (for restricted argmax)
+    active_vocab_ids = None
+    if t_cfg.get("recon_vocab_restrict", False):
+        import collections as _col
+        _min_freq = int(t_cfg.get("recon_vocab_min_freq", 1))
+        _counts = _col.Counter()
+        for i in range(len(ds)):
+            _counts.update(ds[i]["completion_ids"].tolist())
+        _active = sorted(tid for tid, cnt in _counts.items() if tid > 0 and cnt >= _min_freq)
+        active_vocab_ids = torch.tensor(_active, dtype=torch.long)
+        print(f"[vfm_v2] vocab restriction: {len(_active):,} active tokens "
+              f"(freq≥{_min_freq}, {100*len(_active)/tok.vocab_size:.1f}% of vocab={tok.vocab_size:,})")
+
     bsz = t_cfg.get("micro_batch_size", 1)
     loader = torch.utils.data.DataLoader(
         ds, batch_size=bsz, shuffle=True, num_workers=2,
@@ -237,6 +272,9 @@ def main():
             lr=float(t_cfg["lr"]), weight_decay=float(t_cfg.get("weight_decay", 0.0)),
         )
 
+    warmup_steps = int(t_cfg.get("warmup_steps", 0))
+    base_lr = float(t_cfg["lr"])
+
     use_wandb = t_cfg.get("use_wandb", True)
     if use_wandb:
         import wandb
@@ -249,6 +287,18 @@ def main():
     out_dir = Path(t_cfg["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "checkpoints").mkdir(exist_ok=True)
+
+    # Resume prior/adapter weights from a previous run's checkpoint.
+    _adapter_resume = m_cfg.get("adapter_resume_path", None)
+    if _adapter_resume:
+        _sd = torch.load(_adapter_resume, map_location=device)
+        if isinstance(model, VFMv3):
+            model.mask_embed.data.copy_(_sd["mask_embed"])
+            model.z_proj.load_state_dict(_sd["z_proj"])
+            print(f"[vfm_v3] prior params resumed from {_adapter_resume}")
+        else:
+            model.adapter.load_state_dict(_sd)
+            print(f"[vfm_v2] VFM adapter resumed from {_adapter_resume}")
 
     kl_w_final = v_cfg.get("kl_weight_final", 0.01)
     kl_w_warmup = v_cfg.get("kl_weight_warmup_steps", 200)
@@ -282,13 +332,18 @@ def main():
         c_t = torch.tensor([c_ids], dtype=torch.long, device=device)
         P, C = p_t.size(1), c_t.size(1)
         pe = model._embed_tokens(p_t)
-        ad = next(model.adapter.parameters()).dtype
-        mu, _ = model.adapter(pe.to(ad), torch.ones_like(p_t), C)
-        z = mu.to(pe.dtype)
-        full = torch.cat([pe, z], dim=1)
         fmask = torch.ones(1, P + C, device=device, dtype=torch.long)
+        if isinstance(model, VFMv3):
+            z = model._masked_pass(pe, torch.ones(1, P, device=device, dtype=torch.long), C)
+            out_dev = model.mask_embed.device
+        else:
+            ad = next(model.adapter.parameters()).dtype
+            mu, _ = model.adapter(pe.to(ad), torch.ones_like(p_t), C)
+            z = mu.to(pe.dtype)
+            out_dev = next(model.adapter.parameters()).device
+        full = torch.cat([pe, z], dim=1)
         logits = model.llm(inputs_embeds=full, attention_mask=fmask, use_cache=False, is_causal=False).logits
-        logits = logits.to(next(model.adapter.parameters()).device)
+        logits = logits.to(out_dev)
         comp_logits = logits[:, P - 1:P + C - 1, :] if model.ar_shift else logits[:, P:P + C, :]
         probs = torch.softmax(comp_logits[0].float(), dim=-1)
         conf, pred = probs.max(dim=-1)
@@ -331,12 +386,20 @@ def main():
             c_len = min(128, d_cfg["max_completion_len"])
             # --- Diffusion (VFM refinement) reconstruction ---
             try:
-                if getattr(model, "refinement_training", False):
+                if hasattr(model, "generate_refine"):
+                    _refine_kwargs = dict(
+                        max_steps=t_cfg.get("recon_steps", 16),
+                        threshold=t_cfg.get("recon_threshold", 0.7),
+                        commit_rule=t_cfg.get("recon_commit_rule", "threshold"),
+                        delta=float(t_cfg.get("recon_delta", 0.5)),
+                    )
+                    # VFMv3-only params — VFMv2 generate_refine doesn't accept these
+                    if isinstance(model, VFMv3):
+                        _refine_kwargs["early_exit_steps"] = t_cfg.get("recon_early_exit_steps", 2)
+                        _refine_kwargs["prior_rounds"] = int(t_cfg.get("recon_prior_rounds", 0))
+                        _refine_kwargs["active_ids"] = active_vocab_ids
                     pred = model.generate_refine(p_ids_t, p_mask_t, completion_len=c_len,
-                                                 max_steps=t_cfg.get("recon_steps", 16),
-                                                 threshold=t_cfg.get("recon_threshold", 0.7),
-                                                 commit_rule=t_cfg.get("recon_commit_rule", "threshold"),
-                                                 delta=float(t_cfg.get("recon_delta", 0.5)))
+                                                 **_refine_kwargs)
                 else:
                     pred = model.generate(p_ids_t, p_mask_t, completion_len=c_len,
                                           num_refinement_steps=t_cfg.get("recon_steps", 1))
@@ -377,13 +440,19 @@ def main():
         model.train()
 
     model.train()  # sets LLM + adapter to train mode; required for HF gradient checkpointing to activate inside transformer layers
-    step = 0
+    step = int(t_cfg.get("start_step", 0))
     t_last = time.perf_counter()
     while step < max_steps:
         for batch in loader:
             if step >= max_steps:
                 break
             batch = {k: v.to(device) for k, v in batch.items()}
+
+            # Linear LR warmup — prevents Adam cold-start explosion on fresh/resumed params
+            if warmup_steps > 0 and step <= warmup_steps:
+                warmup_lr = base_lr * (step + 1) / warmup_steps
+                for pg in optimizer.param_groups:
+                    pg["lr"] = warmup_lr
 
             # Linear KL anneal
             model.kl_weight = kl_w_final * min(1.0, step / max(1, kl_w_warmup))
@@ -403,22 +472,44 @@ def main():
                     "loss": loss.item(),
                     "loss_data": out["loss_data"].item(),
                     "loss_obs": out["loss_obs"].item(),
-                    "loss_kl": out["loss_kl"].item(),
-                    "kl_weight": model.kl_weight,
-                    "mu_norm": out["mu_norm"].item(),
-                    "sigma_mean": out["sigma_mean"].item(),
                     "masked_top1_acc": out["masked_top1_acc"].item(),
                     "masked_top1_acc_unshifted": out["masked_top1_acc_unshifted"].item(),
                     "grad_norm": float(grad_norm),
                     "sec_per_step": dt / max(1, log_every),
                 }
-                print(
-                    f"step {step:>5}  loss={rec['loss']:.3f}  "
-                    f"data={rec['loss_data']:.3f}  obs={rec['loss_obs']:.3f}  "
-                    f"kl={rec['loss_kl']:.4f}  top1={rec['masked_top1_acc']:.3f}  "
-                    f"|grad|={rec['grad_norm']:.2f}  "
-                    f"{rec['sec_per_step']:.2f}s/it"
-                )
+                if isinstance(model, VFMv3):
+                    rec["z_norm"] = out["z_norm"].item()
+                    rec["z_norm_target"] = model._embed_norm
+                    rec["loss_z_reg"] = out["loss_z_reg"].item()
+                    rec["loss_z_sim"] = out["loss_z_sim"].item()
+                else:
+                    rec.update({
+                        "loss_kl": out["loss_kl"].item(),
+                        "loss_mu_reg": out["loss_mu_reg"].item(),
+                        "kl_weight": model.kl_weight,
+                        "mu_norm": out["mu_norm"].item(),
+                        "mu_norm_target": model._embed_norm,
+                        "sigma_mean": out["sigma_mean"].item(),
+                    })
+                if isinstance(model, VFMv3):
+                    print(
+                        f"step {step:>5}  loss={rec['loss']:.3f}  "
+                        f"data={rec['loss_data']:.3f}  obs={rec['loss_obs']:.3f}  "
+                        f"zreg={rec['loss_z_reg']:.4f}  zsim={rec['loss_z_sim']:.4f}  "
+                        f"top1={rec['masked_top1_acc']:.3f}  "
+                        f"z={rec['z_norm']:.3f}(tgt={rec['z_norm_target']:.3f})  "
+                        f"|grad|={rec['grad_norm']:.2f}  "
+                        f"{rec['sec_per_step']:.2f}s/it"
+                    )
+                else:
+                    print(
+                        f"step {step:>5}  loss={rec['loss']:.3f}  "
+                        f"data={rec['loss_data']:.3f}  obs={rec['loss_obs']:.3f}  "
+                        f"kl={rec.get('loss_kl',0):.4f}  top1={rec['masked_top1_acc']:.3f}  "
+                        f"mu={rec.get('mu_norm',0):.3f}(tgt={rec.get('mu_norm_target',0):.3f})  "
+                        f"|grad|={rec['grad_norm']:.2f}  "
+                        f"{rec['sec_per_step']:.2f}s/it"
+                    )
                 if use_wandb:
                     wandb.log(rec, step=step)
 
