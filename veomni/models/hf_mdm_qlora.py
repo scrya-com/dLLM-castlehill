@@ -238,6 +238,57 @@ def _mdm_loss(logits, labels, chunk_size=512, mask_ratio=None, min_snr_gamma=Non
     return mdm + path + anti_rep_term, mdm.detach(), path.detach(), anti_rep_term.detach()
 
 
+def _ddo_loss(student_logits, ref_logits, labels, beta=1.0, alpha=0.5):
+    """DDO reverse-KL preference loss (T3D, arXiv:2602.12262).
+
+    Student logits come from the trainable model (LoRA + VFM).
+    Reference logits come from a frozen forward pass (torch.no_grad(),
+    same architecture) — matches T3D's ref_model after round 0.
+
+    Args:
+        student_logits: [B, L, V] from student (trainable)
+        ref_logits: [B, L, V] from reference (frozen forward)
+        labels: [B, L] ground truth
+        beta: temperature scale for logit differences
+        alpha: weight for fake/penalty term (0 = pure real-only)
+
+    Returns:
+        ddo_loss scalar (float32)
+    """
+    s = student_logits[:, :-1, :].float()
+    r = ref_logits[:, :-1, :].float()
+    lbl = labels[:, 1:] if labels.dim() == 2 else labels.view(student_logits.size(0), -1)[:, 1:]
+    L = min(s.size(1), lbl.size(1))
+    s_flat = s[:, :L].reshape(-1, s.size(-1))
+    r_flat = r[:, :L].reshape(-1, r.size(-1))
+    y = lbl[:, :L].reshape(-1)
+
+    valid = y != IGNORE_INDEX
+    if not valid.any():
+        return torch.zeros((), device=student_logits.device)
+
+    s_lp = F.log_softmax(s_flat[valid], dim=-1)
+    r_lp = F.log_softmax(r_flat[valid], dim=-1)
+    y_v = y[valid]
+
+    s_real = s_lp[torch.arange(len(y_v)), y_v]
+    r_real = r_lp[torch.arange(len(y_v)), y_v]
+    d = beta * (s_real - r_real)
+    loss_real = -F.logsigmoid(d).mean()
+
+    s_pred = s_lp.argmax(dim=-1)
+    wrong = s_pred != y_v
+    if wrong.sum() > 0:
+        s_fake = s_lp[wrong][torch.arange(wrong.sum()), s_pred[wrong]]
+        r_fake = r_lp[wrong][torch.arange(wrong.sum()), s_pred[wrong]]
+        d_fake = beta * (s_fake - r_fake)
+        loss_fake = -alpha * F.logsigmoid(-d_fake).mean()
+    else:
+        loss_fake = torch.zeros((), device=student_logits.device)
+
+    return loss_real + loss_fake
+
+
 class VFMMaskFiller(nn.Module):
     """VFM smart-noise initializer for the d3llm trajectory-MDM pipeline.
 
@@ -509,6 +560,12 @@ class MDMQLoRAWrapper(nn.Module):
         self.ema_lora_alpha = 0.999
         self._ema_lora = None
         self.cascade_tail_pairs = 1   # # of final (dense tail) pairs always trained
+        # DDO (Direct Discriminative Optimization) reverse-KL preference loss.
+        # T3D (arXiv:2602.12262). 0 = disabled (default). Requires a reference
+        # forward pass (torch.no_grad) each training step when > 0.
+        self.ddo_wt = 0.0
+        self.ddo_beta = 1.0
+        self.ddo_alpha = 0.5
         # VFM gradient scale (to counteract 64-layer attenuation to input embeds).
         # Applied via hook on the *delta* tensor (after cross-device to() for UNet).
         # 1.0 = no scale; 10-50× common for deep stacks when delta stays ~0.
@@ -842,6 +899,24 @@ class MDMQLoRAWrapper(nn.Module):
                 loss = loss + _consistency_wt * _cons_loss
                 comps["consistency"] = _cons_loss.item()
 
+            # ── DDO reverse-KL preference loss (T3D, arXiv:2602.12262) ──────
+            # Condition: ddo_wt > 0, training, and labels present.
+            # Reference: frozen forward pass (torch.no_grad) on the SAME base
+            # model — matches T3D's "reference model" which starts from
+            # identical weights and is frozen throughout each round.
+            _ddo_wt = getattr(self, 'ddo_wt', 0.0)
+            if _ddo_wt > 0 and self.training:
+                _ref_ids = casual_input_ids if casual_input_ids is not None else input_ids
+                with torch.no_grad():
+                    ref_out = self.base(input_ids=_ref_ids, attention_mask=attention_mask,
+                                        position_ids=position_ids, use_cache=False)
+                ref_logits = ref_out.logits
+                _ddo = _ddo_loss(logits, ref_logits.to(logits.device), _labels_ld,
+                                 beta=getattr(self, 'ddo_beta', 1.0),
+                                 alpha=getattr(self, 'ddo_alpha', 0.5))
+                comps["ddo"] = _ddo.item()
+                loss = loss + _ddo_wt * _ddo
+
         if _repr_align_active:
             student_hiddens = out.hidden_states
             teacher_inputs = casual_input_ids if casual_input_ids is not None else input_ids
@@ -1076,7 +1151,8 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
                         repr_align_loss_mode="cosine", repr_align_angular_margin=0.0,
                         repr_align_num_sample_layers=None,
                          subgoal_align_wt=0.0, subgoal_align_n_blocks=4,
-                         anti_rep_wt=0.0, consistency_wt=0.0, **kw):
+                         anti_rep_wt=0.0, consistency_wt=0.0,
+                         ddo_wt=0.0, ddo_beta=1.0, ddo_alpha=0.5, **kw):
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 
@@ -1161,6 +1237,11 @@ def build_hf_mdm_qlora(model_path, qlorafy_config=None, device="cuda:0",
     wrapper.subgoal_align_n_blocks = subgoal_align_n_blocks
     wrapper.anti_rep_wt = anti_rep_wt
     wrapper.consistency_wt = consistency_wt
+    wrapper.ddo_wt = ddo_wt
+    wrapper.ddo_beta = ddo_beta
+    wrapper.ddo_alpha = ddo_alpha
+    if ddo_wt > 0:
+        print(f"[hf_mdm_qlora] DDO active: wt={ddo_wt}, beta={ddo_beta}, alpha={ddo_alpha} (T3D arXiv:2602.12262)")
     # vfm_grad_scale may come from qlorafy_config (preferred for VFM runs) or kw
     _gs = cfg.get("vfm_grad_scale", None) if 'cfg' in locals() else None
     if _gs is None:

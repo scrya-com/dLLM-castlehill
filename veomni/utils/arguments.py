@@ -358,6 +358,18 @@ class TrainingArguments:
         default=0.0,
         metadata={"help": "Consistency regularization: two forward passes with different mask patterns, symmetric KL divergence at overlapping masked positions. Forces model to produce same predictions regardless of which positions are unmasked first."},
     )
+    ddo_wt: float = field(
+        default=0.0,
+        metadata={"help": "DDO (Direct Discriminative Optimization) reverse-KL preference loss weight. T3D (arXiv:2602.12262). Compares student log-probs against a frozen reference forward pass. 0 = disabled."},
+    )
+    ddo_beta: float = field(
+        default=1.0,
+        metadata={"help": "DDO temperature: scales the logit-difference before sigmoid. Higher = sharper preference signal."},
+    )
+    ddo_alpha: float = field(
+        default=0.5,
+        metadata={"help": "DDO fake-penalty weight: 0 = real-only (maximize GT logp), 0.5 = balanced, 1.0 = equal real/fake. Matches T3D alpha parameter."},
+    )
     llrd_decay: float = field(
         default=0.0,
         metadata={"help": "Layer-wise LR decay for LoRA adapters. lr * decay^(layer_depth_fraction). 0=disabled (flat LR). 0.85 is typical for NLP fine-tuning."},

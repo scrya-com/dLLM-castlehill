@@ -1,0 +1,73 @@
+# VFM v4a — Clifford Rolling Attention adapter, overfit test
+#
+# Architecture change vs VFMv2:
+#   completion_decoder self-attention: O(C²) → O(C × num_shifts) rolling
+#   num_seq_shifts=16: bidirectional log-spaced [0,1,-1,3,-3,11,-11,38,-38,64,-64,...]
+#   num_channel_shifts=0: no Clifford geometric terms (pure rolling for first test)
+#
+# Training areas:
+#   TRAINABLE:  VFMv4aNoiseAdapter (prompt_encoder, CliffordDecoderLayer ×2,
+#                                   mu_head, log_sigma_head, completion_pos_embed)
+#   FROZEN:     LLM + LoRA (loaded from step 12000, not updated)
+#
+# Goal: overfit 500 reasoning examples in ~500 steps. Compare DIFF quality
+# vs VFMv2 step_12000 to answer: does rolling attention learn as well with
+# the same adapter parameter count?
+#
+# Launch:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#       .venv/bin/python tasks/train_vfm_v2.py \
+#       configs/pretrain/vfm_v4a_27b.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  freeze_llm: true                  # adapter-only training — clean test
+  lora_resume_path: /home/johndpope/ds_offload/checkpoints/vfm_v2_27b_dual_refine/checkpoints/lora_step_12000
+  adapter_resume_path: null         # fresh adapter — tests if rolling can learn from scratch
+  dual_gpu: true
+  gpu1_mem: "13GiB"
+  gpu0_mem: "16GiB"
+
+vfm:
+  version: "4a"
+  variational: false
+  refinement_training: false
+  adapter_layers: 2
+  adapter_heads: 8
+  adapter_dropout: 0.1
+  adapter_intermediate_size: 10240
+  max_completion_len: 512
+  tau: 1.0
+  sigma: 1.0
+  kl_weight_final: 0.0
+  kl_weight_warmup_steps: 0
+  mu_reg_lambda: 0.01
+  ar_shift: true
+  num_seq_shifts: 16
+  num_channel_shifts: 0             # pure rolling (no Clifford geometric terms)
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_prompt_len: 256
+  max_completion_len: 512
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v4a_27b
+  lr: 1e-4                          # higher LR vs v2b — fresh adapter needs faster convergence
+  warmup_steps: 20
+  weight_decay: 0.01
+  max_steps: 500
+  micro_batch_size: 1
+  global_batch_size: 1
+  use_8bit_adam: true
+  log_every: 10
+  save_every: 500
+  recon_every: 100
+  recon_num_probes: 2
+  recon_steps: 8
+  recon_threshold: 0.5
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v4a-27b-clifford

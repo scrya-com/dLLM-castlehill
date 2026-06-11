@@ -109,6 +109,13 @@ train:
   # anti_rep_wt: 2.0            # hard-margin anti-rep (argmax collision hinge) — replaces weak soft p*p
   consistency_wt: 1.0          # direct (no-detach) on deltas for VFM unstarve + anti-repeat diversity
 
+  # ── DDO reverse-KL preference loss (T3D, arXiv:2602.12262) ──
+  # Compares student log-probs against a frozen reference forward pass.
+  # 0 = disabled (default). Set > 0 to enable (e.g. 0.1 for gentle signal).
+  ddo_wt: 0.1                   # weight in total loss
+  ddo_beta: 1.0                 # temperature: scales logit-diff before sigmoid
+  ddo_alpha: 0.5                # fake-penalty weight: 0=real-only, 0.5=balanced
+
   llrd_decay: 0.85
   min_snr_gamma: 0
   gen_sample_every_steps: 200

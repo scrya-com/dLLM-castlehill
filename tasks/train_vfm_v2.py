@@ -25,7 +25,7 @@ from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_t
 
 # Make `veomni` importable when launching from the repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from veomni.models.vfm_v2 import VFMv2, VFMv3
+from veomni.models.vfm_v2 import VFMv2, VFMv3, VFMv4a, VFMv5
 
 
 def load_config(path):
@@ -191,8 +191,8 @@ def main():
     )
     print(f"[vfm_v2] hidden_size={hidden_size}")
 
-    vfm_version = int(v_cfg.get("version", 2))
-    if vfm_version == 3:
+    vfm_version = v_cfg.get("version", 2)
+    if str(vfm_version) == "3":
         model = VFMv3(
             llm=llm,
             hidden_size=hidden_size,
@@ -207,6 +207,49 @@ def main():
         model.z_proj.to(device=device, dtype=torch.bfloat16)
         n_adapter = sum(p.numel() for p in [model.mask_embed] + list(model.z_proj.parameters()))
         print(f"[vfm_v3] trainable prior params: {n_adapter:,}  (mask_embed + z_proj)")
+    elif str(vfm_version) == "4a":
+        model = VFMv4a(
+            llm=llm,
+            hidden_size=hidden_size,
+            adapter_layers=v_cfg["adapter_layers"],
+            adapter_heads=v_cfg["adapter_heads"],
+            adapter_dropout=v_cfg.get("adapter_dropout", 0.1),
+            adapter_intermediate_size=v_cfg.get("adapter_intermediate_size", None),
+            max_completion_len=v_cfg["max_completion_len"],
+            tau=v_cfg.get("tau", 1.0),
+            sigma=v_cfg.get("sigma", 1.0),
+            kl_weight=0.0,
+            ar_shift=v_cfg.get("ar_shift", True),
+            variational=v_cfg.get("variational", False),
+            refinement_training=v_cfg.get("refinement_training", False),
+            mu_reg_lambda=float(v_cfg.get("mu_reg_lambda", 0.0)),
+            num_seq_shifts=int(v_cfg.get("num_seq_shifts", 16)),
+            num_channel_shifts=int(v_cfg.get("num_channel_shifts", 0)),
+        )
+        model.adapter.to(device=device, dtype=torch.bfloat16)
+        print(f"[vfm_v4a] adapter params: {sum(p.numel() for p in model.adapter.parameters() if p.requires_grad):,}")
+    elif str(vfm_version) == "5":
+        model = VFMv5(
+            llm=llm,
+            hidden_size=hidden_size,
+            adapter_layers=v_cfg["adapter_layers"],
+            adapter_heads=v_cfg["adapter_heads"],
+            adapter_dropout=v_cfg.get("adapter_dropout", 0.1),
+            adapter_intermediate_size=v_cfg.get("adapter_intermediate_size", None),
+            max_completion_len=v_cfg["max_completion_len"],
+            tau=v_cfg.get("tau", 1.0),
+            sigma=v_cfg.get("sigma", 1.0),
+            kl_weight=0.0,
+            ar_shift=v_cfg.get("ar_shift", True),
+            variational=v_cfg.get("variational", False),
+            refinement_training=v_cfg.get("refinement_training", False),
+            num_seq_shifts=int(v_cfg.get("num_seq_shifts", 16)),
+            num_channel_shifts=int(v_cfg.get("num_channel_shifts", 0)),
+            anchor_wt=float(v_cfg.get("anchor_wt", 0.0)),
+            anchor_entropy_threshold=float(v_cfg.get("anchor_entropy_threshold", 2.0)),
+        )
+        model.adapter.to(device=device, dtype=torch.bfloat16)
+        print(f"[vfm_v5] adapter params: {sum(p.numel() for p in model.adapter.parameters() if p.requires_grad):,}")
     else:
         model = VFMv2(
             llm=llm,
@@ -424,16 +467,24 @@ def main():
             true_preview = response[:200].replace("\n", " ")
             ar_preview = ar_recon[:200].replace("\n", " ")
             diff_preview = diff_recon[:200].replace("\n", " ")
+            # Bigram repetition rate: fraction of consecutive identical tokens.
+            # >0.15 = noticeable loops; >0.30 = degenerate. Log to wandb for early signal.
+            diff_ids = tok.encode(diff_recon, add_special_tokens=False)
+            rep_rate = (sum(1 for a, b in zip(diff_ids, diff_ids[1:]) if a == b) /
+                        max(len(diff_ids) - 1, 1))
             print(f"  [recon @ {step}] PROMPT: {prompt[:70]}")
             print(f"               TRUE: {true_preview[:110]}")
             print(f"               AR:   {ar_preview[:110]}")
-            print(f"               DIFF: {diff_preview[:110]}")
+            print(f"               DIFF: {diff_preview[:110]}  [rep={rep_rate:.2f}]")
             html_blocks.append(
                 f"<b>PROMPT:</b> {prompt[:120]}<br>"
                 f"<b>TRUE:</b> {true_preview}<br>"
                 f"<b>AR:</b> {ar_preview}<br>"
-                f"<b>Diffusion (VFM refine):</b> {diff_preview}<br><hr>"
+                f"<b>Diffusion (VFM refine):</b> {diff_preview}  [rep={rep_rate:.2f}]<br><hr>"
             )
+            if use_wandb:
+                import wandb as _wb
+                _wb.log({"vfm/rep_rate": rep_rate}, step=step)
         if use_wandb:
             import wandb as _wb
             _wb.log({"reconstructions": _wb.Html("".join(html_blocks))}, step=step)
@@ -491,6 +542,8 @@ def main():
                         "mu_norm_target": model._embed_norm,
                         "sigma_mean": out["sigma_mean"].item(),
                     })
+                if "loss_anchor" in out:
+                    rec["loss_anchor"] = out["loss_anchor"].item()
                 if isinstance(model, VFMv3):
                     print(
                         f"step {step:>5}  loss={rec['loss']:.3f}  "
@@ -505,7 +558,8 @@ def main():
                     print(
                         f"step {step:>5}  loss={rec['loss']:.3f}  "
                         f"data={rec['loss_data']:.3f}  obs={rec['loss_obs']:.3f}  "
-                        f"kl={rec.get('loss_kl',0):.4f}  top1={rec['masked_top1_acc']:.3f}  "
+                        f"kl={rec.get('loss_kl',0):.4f}  anc={rec.get('loss_anchor',0):.4f}  "
+                        f"top1={rec['masked_top1_acc']:.3f}  "
                         f"mu={rec.get('mu_norm',0):.3f}(tgt={rec.get('mu_norm_target',0):.3f})  "
                         f"|grad|={rec['grad_norm']:.2f}  "
                         f"{rec['sec_per_step']:.2f}s/it"

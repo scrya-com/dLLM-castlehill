@@ -1,14 +1,17 @@
-"""Inference speed benchmark for VFM v2.
+"""Inference speed benchmark for VFM v2/v4a/v5.
 
 Measures throughput for:
   - AR baseline (KV-cache autoregressive generate)
-  - VFM generate()  — fixed K-step refinement
+  - VFM generate()  — fixed K-step refinement with rep_rate quality
   - VFM generate_refine() — confidence-threshold refinement
 
 Run after training finishes (needs both GPUs free):
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
         .venv/bin/python scripts/bench_vfm_v2_inference.py \\
-        [--adapter <path>] [--lora <path>]
+        [--adapter <path>] [--lora <path>] [--version v2|v4a|v5]
+
+Quality metric: rep_rate = fraction of consecutive bigram repeats in output.
+  rep_rate < 0.15 → clean;  0.15–0.30 → degraded;  > 0.30 → repetition loop
 """
 import argparse, sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,11 +19,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
-from veomni.models.vfm_v2 import VFMv2
+from veomni.models.vfm_v2 import VFMv2, VFMv4a, VFMv5
 
 MODEL_PATH  = "/home/johndpope/ds_offload/models/Qwen3.6-27B"
-ADAPTER_DEFAULT = "/home/johndpope/ds_offload/checkpoints/vfm_v2_27b_dual_refine/checkpoints/adapter_step_8000.pt"
-LORA_DEFAULT    = "/home/johndpope/ds_offload/checkpoints/vfm_v2_27b_dual_refine/checkpoints/lora_step_8000"
+ADAPTER_DEFAULT = "/home/johndpope/ds_offload/checkpoints/vfm_v2_27b_dual_refine/checkpoints/adapter_step_12000.pt"
+LORA_DEFAULT    = "/home/johndpope/ds_offload/checkpoints/vfm_v2_27b_dual_refine/checkpoints/lora_step_12000"
 
 PROMPT = (
     "Describe the construction and update logic for a Persistent Segment Tree, "
@@ -31,6 +34,11 @@ REFINE_STEPS    = [1, 2, 4, 8, 16]
 THRESHOLD       = 0.7
 WARMUP          = 1
 REPEAT          = 3
+
+
+def rep_rate(tok, ids):
+    toks = ids.tolist() if hasattr(ids, "tolist") else ids
+    return sum(1 for a, b in zip(toks, toks[1:]) if a == b) / max(len(toks) - 1, 1)
 
 
 def time_op(fn, warmup=WARMUP, repeat=REPEAT):
@@ -49,9 +57,14 @@ def main():
     ap.add_argument("--adapter", default=ADAPTER_DEFAULT)
     ap.add_argument("--lora",    default=LORA_DEFAULT)
     ap.add_argument("--no-lora", action="store_true", help="frozen LLM, no LoRA")
+    ap.add_argument("--version", default="2", choices=["2", "4a", "5"],
+                    help="VFM version: 2 (standard), 4a (Clifford), 5 (Clifford+spherical)")
+    ap.add_argument("--spherical", action="store_true",
+                    help="Post-hoc: normalize mu to embedding sphere at inference (no retraining)")
     args = ap.parse_args()
 
     device = "cuda:0"
+    print(f"[bench] VFM v{args.version}  adapter={args.adapter}")
     print(f"[bench] loading {MODEL_PATH}  (dual-GPU NF4)")
     bnb = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
@@ -84,16 +97,24 @@ def main():
         if hasattr(llm.config, "text_config")
         else llm.config.hidden_size
     )
-    model = VFMv2(
-        llm=llm, hidden_size=hidden_size,
-        adapter_layers=2, adapter_heads=8,
-        adapter_intermediate_size=10240,
-        max_completion_len=512, ar_shift=True,
-        variational=False,
-    )
+    common = dict(llm=llm, hidden_size=hidden_size,
+                  adapter_layers=2, adapter_heads=8,
+                  adapter_intermediate_size=10240,
+                  max_completion_len=512, ar_shift=True,
+                  variational=False)
+    if args.version == "5":
+        model = VFMv5(num_seq_shifts=16, **common)
+    elif args.version == "4a":
+        model = VFMv4a(num_seq_shifts=16, **common)
+    else:
+        model = VFMv2(**common)
     model.adapter.to(device=device, dtype=torch.bfloat16)
     sd = torch.load(args.adapter, map_location=device)
     model.adapter.load_state_dict(sd)
+    if args.spherical and args.version == "2":
+        model.adapter.spherical = True
+        model.adapter.embed_norm = model._embed_norm
+        print(f"[bench] spherical=True — mu normalized to norm={model._embed_norm:.3f} at inference")
     model.eval()
     print(f"[bench] adapter loaded from {args.adapter}")
     print(f"[bench] token embedding mean norm: {model._embed_norm:.3f}")
@@ -123,8 +144,8 @@ def main():
     print()
 
     # ── VFM generate (fixed K steps) ──────────────────────────────────────────
-    print("── VFM generate() — fixed K-step refinement ───────────────────────")
-    print(f"{'C tokens':>10}  {'K':>4}  {'time':>8}  {'tok/s':>8}  {'vs AR':>7}")
+    print("── VFM generate() — fixed K-step  [tok/s | vs_AR | rep_rate] ───────")
+    print(f"{'C tokens':>10}  {'K':>4}  {'tok/s':>8}  {'vs AR':>7}  {'rep':>6}  sample")
     ar_times = {}
     llm.config.use_cache = True
     for c_len in COMPLETION_LENS:
@@ -142,32 +163,38 @@ def main():
             p_ids = prompt_ids
             p_mask = prompt_mask
             def vfm_fn():
-                return model.generate(p_ids, p_mask, c_len,
-                                      num_refinement_steps=K, sample_noise=False)
+                with torch.no_grad():
+                    return model.generate(p_ids, p_mask, c_len,
+                                          num_refinement_steps=K, sample_noise=False)
             dt = time_op(vfm_fn)
             speedup = ar_times[c_len] / dt
-            print(f"  {c_len:>8}  {K:>4}  {dt*1000:>7.1f}ms  {c_len/dt:>7.1f}  {speedup:>6.1f}×")
+            with torch.no_grad():
+                out = model.generate(p_ids, p_mask, c_len,
+                                     num_refinement_steps=K, sample_noise=False)
+            rr = rep_rate(tok, out[0])
+            sample = tok.decode(out[0].tolist(), skip_special_tokens=True).replace("\n", " ")[:60]
+            print(f"  {c_len:>8}  {K:>4}  {c_len/dt:>7.1f}  {speedup:>6.1f}×  {rr:>5.2f}  {sample}")
         print()
 
     # ── VFM generate_refine (confidence-threshold) ────────────────────────────
-    print("── VFM generate_refine() — confidence-threshold ───────────────────")
-    print(f"{'C tokens':>10}  {'threshold':>9}  {'time':>8}  {'tok/s':>8}  {'vs AR':>7}  sample")
+    print("── VFM generate_refine() — threshold  [tok/s | vs_AR | rep_rate] ───")
+    print(f"{'C tokens':>10}  {'thresh':>6}  {'tok/s':>8}  {'vs AR':>7}  {'rep':>6}  sample")
     for c_len in COMPLETION_LENS:
         p_ids = prompt_ids
         p_mask = prompt_mask
         def refine_fn():
-            return model.generate_refine(
-                p_ids, p_mask, c_len,
-                max_steps=16, threshold=THRESHOLD,
-            )
+            with torch.no_grad():
+                return model.generate_refine(
+                    p_ids, p_mask, c_len,
+                    max_steps=16, threshold=THRESHOLD,
+                )
         dt = time_op(refine_fn)
         speedup = ar_times[c_len] / dt
-
-        # one sample for quality check
         with torch.no_grad():
             out = model.generate_refine(p_ids, p_mask, c_len, max_steps=16, threshold=THRESHOLD)
-        text = tok.decode(out[0].tolist(), skip_special_tokens=True).replace("\n", " ")[:80]
-        print(f"  {c_len:>8}  {THRESHOLD:>9.2f}  {dt*1000:>7.1f}ms  {c_len/dt:>7.1f}  {speedup:>6.1f}×  {text}")
+        rr = rep_rate(tok, out[0])
+        text = tok.decode(out[0].tolist(), skip_special_tokens=True).replace("\n", " ")[:60]
+        print(f"  {c_len:>8}  {THRESHOLD:>6.2f}  {c_len/dt:>7.1f}  {speedup:>6.1f}×  {rr:>5.2f}  {text}")
     print()
 
 

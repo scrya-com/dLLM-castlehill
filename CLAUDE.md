@@ -63,6 +63,84 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
+## 5. VFM Architecture Verification — Fail Fast
+
+**Never commit to a 12k-step run without passing the 500-step gate.**
+
+A full VFMv2/v4x training run takes 8-10 hours. Architecture bugs (repetition loops,
+mu_norm explosion, mode collapse) are detectable at step 500 in under 30 minutes.
+
+### 500-step gate (mandatory before continuing to 12k)
+
+Run 500 steps with `max_steps: 500`, then check all three:
+
+| Signal | Healthy | Kill early |
+|--------|---------|------------|
+| `vfm/rep_rate` (wandb) | < 0.15 on both probes | > 0.30 on either probe |
+| `mu_norm` | oscillating < 30 | monotonically exploding → ∞ |
+| DIFF text | coherent structure, no loops | "the the the" or "!!!!!" |
+
+If any column is "kill early": stop, diagnose, fix before continuing.
+
+### 6-probe diverse eval (after 500-step gate passes)
+
+Run the eval script on step-500 checkpoint before training to 12k:
+```bash
+.venv/bin/python scripts/eval_vfm_v2_compare.py v2_step12000  # baseline
+# add new checkpoint to CHECKPOINTS dict first, then:
+.venv/bin/python scripts/eval_vfm_v2_compare.py v4a_step500
+```
+If DIFF is worse than AR on >2/6 diverse probes at step 500, the architecture
+won't recover at 12k — it will overfit badly instead.
+
+### Known failure modes (what they mean)
+
+- **"the the the" loop**: z vectors carry insufficient directional signal. Causes:
+  (a) mu_norm too high (embeddings off-manifold), (b) attention pattern too local
+  (rolling shifts too small for the sequence length), (c) adapter undertrained.
+- **"!!!!" or punctuation loops**: vocab restriction applied to an undertrained adapter.
+  The narrow vocab concentrates probability on punctuation tokens.
+- **mu_norm > 50**: `mu_reg_lambda` too weak. Bump 10× (e.g. 0.001 → 0.01).
+- **rep_rate rising over training**: overfitting to training distribution. Stop at
+  first sign; the best checkpoint is before the rise, not after.
+- **"((((" or domain-specific repetition loop**: Fresh adapter + warm-start LoRA mismatch.
+  The LoRA was trained for a different adapter's mu distribution (e.g., v2 off-sphere mu
+  for v5 spherical adapter). The adapter overfits a training-domain direction; the LoRA
+  amplifies it → collapse. **Fix**: start both LoRA and adapter fresh (null warm-start),
+  OR resume both from the same checkpoint version. Never mix fresh adapter with a LoRA
+  trained for a different adapter version.
+
+### VFM warm-start rules (non-negotiable)
+
+For any new VFMv5/v4a architecture variant:
+- If changing adapter architecture (e.g., spherical normalization, Clifford attention): start with **null LoRA + null adapter**
+- If fine-tuning same architecture: ok to warm-start both from the same version's checkpoint
+- Never warm-start LoRA from vN but adapter from scratch when going to vM ≠ vN
+
+Quick test before committing to 12k steps:
+```bash
+.venv/bin/python scripts/sanity_vfm.py configs/pretrain/vfm_v5_27b_fresh.yaml
+```
+Passes if: loss drops 50%+, mu_norm stable, rep_rate < 0.15, top1 > 5%. Takes 3 minutes.
+
+### Inference speed metrics (what to benchmark)
+
+Rep_rate IS the inference speed metric. Lower rep_rate at fewer steps = faster real-world inference.
+
+```bash
+# After training, benchmark tok/s and quality at 1-16 steps:
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python scripts/bench_vfm_v2_inference.py \
+  --adapter <path> --lora <path> --version 2
+```
+
+Output: tok/s + rep_rate per K at 64/128/256/512 completion lengths. Good: rep_rate < 0.15 at K≤4.
+
+Post-hoc test (does spherical help v2's inference directions?):
+```bash
+.venv/bin/python scripts/bench_vfm_v2_inference.py ... --spherical
+```
+
 
 
 

@@ -183,6 +183,8 @@ class VFMv2NoiseAdapter(nn.Module):
 
         # 4. Project to (μ, log σ²)
         mu = self.mu_head(attended)
+        if getattr(self, "spherical", False):
+            mu = F.normalize(mu, p=2, dim=-1) * getattr(self, "embed_norm", 0.859)
         log_sigma = self.log_sigma_head(attended)
 
         # Clamp log σ to a reasonable range to prevent kernel pathologies
@@ -228,6 +230,8 @@ class VFMv2(nn.Module):
         variational: bool = True,
         refinement_training: bool = False,
         mu_reg_lambda: float = 0.0,
+        anchor_wt: float = 0.0,
+        anchor_entropy_threshold: float = 2.0,
     ):
         """
         Args:
@@ -280,6 +284,8 @@ class VFMv2(nn.Module):
         # too much information; the LLM was pretrained on token embeddings
         # which live on a manifold, and random Gaussian draws are off-manifold.
         self.variational = variational
+        self.anchor_wt = anchor_wt
+        self.anchor_entropy_threshold = anchor_entropy_threshold
         # refinement_training: instead of one-shot (all completion positions
         # = smart noise z), randomly "commit" a fraction of completion
         # positions to their TRUE token embeddings and train the model to
@@ -468,18 +474,47 @@ class VFMv2(nn.Module):
         else:
             loss_kl = torch.zeros((), device=logits.device, dtype=loss_data.dtype)
 
+        # 5b. Anchor supervision — single-pass, no preprocessing.
+        # Ground truth anchors are derived inline from a teacher forward on the
+        # CLEAN completion. Low-entropy positions (LLM is confident given clean
+        # context) are labelled as anchors. The adapter learns to predict these
+        # from the noisy z, so generate_refine can commit them first.
+        loss_anchor = torch.zeros((), device=logits.device, dtype=loss_data.dtype)
+        if self.anchor_wt > 0:
+            anchor_pred = getattr(self.adapter, '_last_anchor', None)
+            if anchor_pred is not None:
+                completion_embeds_clean = self._embed_tokens(completion_ids)
+                clean_full = torch.cat(
+                    [prompt_embeds, completion_embeds_clean.to(prompt_embeds.dtype)], dim=1
+                )
+                with torch.no_grad():
+                    teacher_out = self.llm(
+                        inputs_embeds=clean_full,
+                        attention_mask=full_attention_mask,
+                        use_cache=False,
+                        is_causal=False,
+                    )
+                t_logits = teacher_out.logits.to(anchor_pred.device).float()  # [B, P+C, V]
+                if self.ar_shift:
+                    t_comp = t_logits[:, P - 1:P + C - 1, :]
+                else:
+                    t_comp = t_logits[:, P:P + C, :]
+                probs = torch.softmax(t_comp, dim=-1)
+                entropy = -(probs * probs.clamp(min=1e-9).log()).sum(dim=-1)  # [B, C]
+                anchor_gt = (entropy < self.anchor_entropy_threshold).float()
+                valid = completion_attention_mask.bool()
+                loss_anchor = F.binary_cross_entropy_with_logits(
+                    anchor_pred.squeeze(-1)[valid], anchor_gt[valid]
+                )
+
         # 6. Total — paper's eq 19 with our hyperparameter naming
-        # Target-norm regularization: penalize squared deviation of mu's L2 norm
-        # from the token embedding manifold scale. This creates a basin of
-        # attraction at the right scale — pulls up when too small (prev fix went
-        # from norm=54 to 1.64, both off-manifold), pulls down when too large.
-        # Unlike the pure L2 penalty (which always pulls toward 0), this is stable.
         loss_mu_reg = (mu.norm(dim=-1) - self._embed_norm).pow(2).mean()
         total = (
             (1.0 / (2.0 * self.tau ** 2)) * loss_data
             + (1.0 / (2.0 * self.sigma ** 2)) * loss_obs
             + self.kl_weight * loss_kl
             + self.mu_reg_lambda * loss_mu_reg
+            + self.anchor_wt * loss_anchor
         )
 
         return {
@@ -488,6 +523,7 @@ class VFMv2(nn.Module):
             "loss_obs": loss_obs.detach(),
             "loss_kl": loss_kl.detach(),
             "loss_mu_reg": loss_mu_reg.detach(),
+            "loss_anchor": loss_anchor.detach(),
             "mu_norm": mu.detach().norm(dim=-1).mean(),
             "sigma_mean": log_sigma.detach().exp().mean(),
             "masked_top1_acc": masked_top1_acc.detach(),
@@ -612,6 +648,10 @@ class VFMv2(nn.Module):
         adapter_dtype = next(self.adapter.parameters()).dtype
         mu, _ = self.adapter(prompt_embeds.to(adapter_dtype), prompt_attention_mask, C)
         z = mu.to(prompt_embeds.dtype)  # smart-noise init for every position
+        # Anchor scores: [B, C] float — high = structurally important position.
+        # Predicted by adapter.anchor_head (trained with teacher-entropy GT).
+        _anc = getattr(self.adapter, '_last_anchor', None)
+        anchor_scores = _anc.squeeze(-1).to(prompt_ids.device) if _anc is not None else None
 
         current_state = z.clone()
         committed = torch.zeros(B, C, dtype=torch.bool, device=prompt_ids.device)
@@ -674,8 +714,14 @@ class VFMv2(nn.Module):
             else:
                 newly = (~committed) & (conf > threshold)
                 if not newly.any():
-                    masked_conf = conf.masked_fill(committed, -1.0)
-                    top = masked_conf.argmax(dim=-1)  # [B]
+                    # Anchor-guided fallback: prefer structurally important
+                    # positions (predicted by adapter.anchor_head) when no
+                    # position clears the confidence threshold.
+                    if anchor_scores is not None:
+                        combined = anchor_scores.sigmoid() + conf
+                        top = combined.masked_fill(committed, -1.0).argmax(dim=-1)
+                    else:
+                        top = conf.masked_fill(committed, -1.0).argmax(dim=-1)
                     newly = torch.zeros_like(committed)
                     newly[torch.arange(B, device=newly.device), top] = True
 

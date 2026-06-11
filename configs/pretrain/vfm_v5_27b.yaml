@@ -1,0 +1,62 @@
+# VFM v5 — Spherical Clifford adapter, fresh run
+#
+# Change vs v4a: mu_head output is L2-normalised to the embedding sphere.
+# The adapter only learns direction; scale is structurally fixed at embed_norm.
+# mu_reg_lambda removed — no longer needed.
+#
+# Launch:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#       .venv/bin/python tasks/train_vfm_v2.py \
+#       configs/pretrain/vfm_v5_27b.yaml
+
+model:
+  model_path: /home/johndpope/ds_offload/models/Qwen3.6-27B
+  attn_implementation: sdpa
+  freeze_llm: false
+  lora_resume_path: /home/johndpope/ds_offload/checkpoints/vfm_v2_27b_dual_refine/checkpoints/lora_step_12000
+  adapter_resume_path: null         # fresh adapter — spherical from step 0
+  dual_gpu: true
+  gpu1_mem: "13GiB"
+  gpu0_mem: "16GiB"
+
+vfm:
+  version: "5"
+  variational: false
+  refinement_training: false
+  adapter_layers: 2
+  adapter_heads: 8
+  adapter_dropout: 0.1
+  adapter_intermediate_size: 10240
+  max_completion_len: 512
+  tau: 1.0
+  sigma: 1.0
+  kl_weight_final: 0.0
+  kl_weight_warmup_steps: 0
+  ar_shift: true
+  num_seq_shifts: 16
+  num_channel_shifts: 0
+
+data:
+  train_path: /home/johndpope/ds_offload/trajectories/qwen3.6-27b-reasoning-500/data.jsonl
+  max_prompt_len: 256
+  max_completion_len: 512
+
+train:
+  output_dir: /home/johndpope/ds_offload/checkpoints/vfm_v5_27b
+  lr: 1e-4
+  warmup_steps: 20
+  weight_decay: 0.01
+  max_steps: 500
+  micro_batch_size: 1
+  global_batch_size: 1
+  use_8bit_adam: true
+  log_every: 10
+  save_every: 500
+  recon_every: 100
+  recon_num_probes: 2
+  recon_steps: 8
+  recon_threshold: 0.5
+  seed: 42
+  use_wandb: true
+  wandb_project: open-dllm-27b
+  wandb_name: vfm-v5-27b-spherical
