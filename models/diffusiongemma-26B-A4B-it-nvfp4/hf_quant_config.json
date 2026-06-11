@@ -1,0 +1,20 @@
+{
+    "producer": {
+        "name": "modelopt",
+        "version": "0.45.0.dev127+ga3a02ca5b.d20260608"
+    },
+    "quantization": {
+        "quant_algo": "NVFP4",
+        "kv_cache_quant_algo": "FP8",
+        "group_size": 16,
+        "exclude_modules": [
+            "lm_head",
+            "*embed_vision*",
+            "*mlp*",
+            "*router*",
+            "*self_attn*",
+            "*self_conditioning*",
+            "*vision_tower*"
+        ]
+    }
+}
